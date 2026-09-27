@@ -4,6 +4,7 @@ import urllib.request
 
 import pytest
 
+from vidshrink.config import Config
 from vidshrink.rclone import Rclone, RcloneError, free_port, serve_http, with_retries
 
 
@@ -104,3 +105,22 @@ def test_serve_http(rc):
     with serve_http(rc, free_port()) as base:
         url = base + urllib.parse.quote("Movies/A [1080p]/a.mkv")
         assert urllib.request.urlopen(url).read() == b"x" * 1000
+
+
+def test_stop_on_upload_limit_error_is_rate_limited():
+    # What --drive-stop-on-upload-limit logs (rclone 1.60 backend/drive) before giving up.
+    stderr = ("ERROR : gdrive root: Received upload limit error: googleapi: Error 403: "
+              "User rate limit exceeded., userRateLimitExceeded\n"
+              "ERROR : Fatal error received - not attempting retries\n")
+    assert RcloneError(1, stderr).rate_limited
+    assert RcloneError(1, "ERROR : x: Received upload limit error: googleapi: Error 403").rate_limited
+    assert not RcloneError(1, "ERROR : Fatal error received - not attempting retries").rate_limited
+
+
+def test_default_rclone_args_are_pinned_and_accepted(tmp_path):
+    args = Config().rclone_args
+    assert args == ("--drive-chunk-size", "64M", "--drive-use-trash=true",
+                    "--drive-stop-on-upload-limit", "--retries", "1")
+    (tmp_path / "v.mkv").write_bytes(b"x")
+    rc = Rclone(str(tmp_path) + "/", args)  # the installed rclone must accept every flag
+    assert [e["Path"] for e in rc.list_videos(["mkv"])] == ["v.mkv"]

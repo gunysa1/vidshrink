@@ -30,5 +30,9 @@ class Config:
     disk_reserve: int = 20_000_000_000
     disk_wait_secs: float = 600
     swap_retry_secs: float = 900
-    rclone_args: tuple[str, ...] = ("--drive-chunk-size", "64M")
+    # Pinned so the Drive behaviour the swap relies on can't drift with rclone.conf:
+    # deletes go to the trash, the 750 GB/day upload limit fails fast, and our own
+    # with_retries (not rclone's) owns retrying.
+    rclone_args: tuple[str, ...] = ("--drive-chunk-size", "64M", "--drive-use-trash=true",
+                                    "--drive-stop-on-upload-limit", "--retries", "1")
     probe_workers: int = 8

@@ -11,7 +11,10 @@ from typing import TypeVar
 
 T = TypeVar("T")
 TMP_SUFFIX = ".vidshrink-tmp.mkv"
-RATE_LIMIT_MARKERS = ("userRateLimitExceeded", "uploadLimitExceeded", "User rate limit exceeded")
+# "Received upload limit error" is what rclone 1.60 logs when --drive-stop-on-upload-limit
+# turns Drive's daily-limit 403 into a fatal error.
+RATE_LIMIT_MARKERS = ("userRateLimitExceeded", "uploadLimitExceeded", "User rate limit exceeded",
+                      "Received upload limit error")
 
 
 class RcloneError(Exception):
