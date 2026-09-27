@@ -192,3 +192,43 @@ def test_prepare_requeues_file_changed_since_scan(conn, cfg, env):
     r = db.get_by_path(conn, "Movies/a.mkv")
     assert (r["stage"], r["reason"]) == ("unprobed", "changed since scan")
     assert list(cfg.workdir.glob("*.src")) == [] and list(cfg.workdir.glob("*.mkv")) == []
+
+
+def test_failed_swap_is_retried_during_the_run(conn, cfg, env, monkeypatch):
+    root, worker = env
+    from vidshrink.rclone import RcloneError
+    worker.cfg.retry_attempts = 1
+    worker.cfg.swap_retry_secs = 0
+    real_move = worker.rclone.move
+    calls = []
+
+    def flaky_move(src, dst):
+        calls.append(src)
+        if len(calls) == 1:
+            raise RcloneError(1, "connection reset")
+        real_move(src, dst)
+
+    monkeypatch.setattr(worker.rclone, "move", flaky_move)
+    assert worker.run() == 2
+    assert sorted(p.name for p in (root / "Movies").iterdir()) == ["a.mkv", "b.mkv"]
+    assert len(db.rows_in(conn, "done")) == 2 and not db.rows_in(conn, "swapping")
+    assert len(calls) == 3
+
+
+def test_swap_retry_waits_for_interval(conn, cfg, env, monkeypatch):
+    root, worker = env
+    from vidshrink.rclone import RcloneError
+    worker.cfg.retry_attempts = 1
+    worker.clock = lambda: 1000.0  # time stands still: the 900 s interval never passes
+    real_move = worker.rclone.move
+    calls = []
+
+    def flaky_move(src, dst):
+        calls.append(src)
+        if len(calls) == 1:
+            raise RcloneError(1, "connection reset")
+        real_move(src, dst)
+
+    monkeypatch.setattr(worker.rclone, "move", flaky_move)
+    assert worker.run() == 1
+    assert len(db.rows_in(conn, "swapping")) == 1 and len(calls) == 2

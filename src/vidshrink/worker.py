@@ -58,8 +58,10 @@ def _lock(workdir: Path):
 class Worker:
     def __init__(self, conn, rclone: Rclone, cfg: Config, budget: Budget,
                  sleep: Callable[[float], None] = time.sleep,
-                 log: Callable[[str], None] = print):
+                 log: Callable[[str], None] = print,
+                 clock: Callable[[], float] = time.monotonic):
         self.conn = conn
+        self.clock = clock
         self.rclone = rclone
         self.cfg = cfg
         self.budget = budget
@@ -96,9 +98,13 @@ class Worker:
     # --- main loop ---------------------------------------------------------
     def run(self, limit: int | None = None, dry_run: bool = False) -> int:
         with _lock(self.cfg.workdir):
-            self.recover()
-            done = 0
+            done = self.recover(dry_run)
+            last_reconcile = self.clock()
             while limit is None or done < limit:
+                if (not dry_run and self.clock() - last_reconcile >= self.cfg.swap_retry_secs
+                        and db.rows_in(self.conn, "swapping")):
+                    done += self._reconcile_swaps()
+                    last_reconcile = self.clock()
                 ready = db.rows_in(self.conn, "ready")
                 if ready and self.budget.allows(ready[0]["out_size"]):
                     if self.upload_and_swap(ready[0], dry_run):
@@ -205,7 +211,7 @@ class Worker:
             self._swap(db.get(self.conn, vid))
         except (SwapError, RcloneError) as e:
             db.mark(self.conn, vid, "swapping", reason=f"swap: {e}"[:500])
-            self.log(f"SWAP FAILED, will retry on next start: {path}: {e}")
+            self.log(f"SWAP FAILED, will retry: {path}: {e}")
             return False
         return True
 
@@ -245,7 +251,7 @@ class Worker:
         scorer.rescore(self.conn, self.cfg)
         self.log(f"done: {row['final_path']} saved {(row['size'] - row['out_size']) / 1e9:.1f} GB")
 
-    def recover(self) -> None:
+    def recover(self, dry_run: bool = False) -> int:
         for row in db.rows_in(self.conn, "downloading", "encoding", "verifying"):
             self._fail(row, f"interrupted during {row['stage']}")
         for row in db.rows_in(self.conn, "uploading"):
@@ -257,14 +263,42 @@ class Worker:
                 self.log(f"could not remove {tmp}: {e}")
             stage = "ready" if self._out(row["id"]).exists() else "queued"
             db.mark(self.conn, row["id"], stage)
+        if dry_run:
+            pending = len(db.rows_in(self.conn, "swapping"))
+            if pending:
+                self.log(f"dry run: {pending} pending swaps left alone")
+            return 0
+        return self._reconcile_swaps()
+
+    def _reconcile_swaps(self) -> int:
+        """Finish or settle rows left in `swapping`; returns how many were completed."""
+        finished = 0
         for row in db.rows_in(self.conn, "swapping"):
             try:
                 self._swap(row)
+                finished += 1
             except SwapError as e:
-                db.mark(self.conn, row["id"], "failed", reason=f"swap: {e}"[:500])
-                self._cleanup(row["id"])
-                self.log(f"SWAP FAILED, needs attention: {row['path']}: {e}")
+                self._swap_failed(row, e)
             except RcloneError as e:
                 db.mark(self.conn, row["id"], "swapping", reason=f"swap: {e}"[:500])
                 self.log(f"swap could not be checked (rclone error), "
-                         f"will retry on next start: {row['path']}: {e}")
+                         f"will retry: {row['path']}: {e}")
+        return finished
+
+    def _swap_failed(self, row, e: SwapError) -> None:
+        try:
+            original_present = bool(self.rclone.entries(row["path"]))
+        except RcloneError as err:
+            db.mark(self.conn, row["id"], "swapping", reason=f"swap: {e}"[:500])
+            self.log(f"swap failed and original could not be checked, will retry: "
+                     f"{row['path']}: {e}; {err}")
+            return
+        if original_present:
+            db.mark(self.conn, row["id"], "failed", reason=f"swap: {e}"[:500])
+            self._cleanup(row["id"])
+            self.log(f"SWAP FAILED, original kept: {row['path']}: {e}")
+            return
+        # The original is already in Drive's trash; the local output may be the only copy.
+        db.mark(self.conn, row["id"], "swapping", reason=f"swap: needs attention: {e}"[:500])
+        self.log(f"!!! SWAP NEEDS ATTENTION: original of {row['path']} is gone and the "
+                 f"encode is not in place; keeping {self._out(row['id'])}: {e}")

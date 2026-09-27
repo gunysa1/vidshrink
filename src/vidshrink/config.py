@@ -28,5 +28,6 @@ class Config:
     disk_factor: float = 2.2
     disk_reserve: int = 20_000_000_000
     disk_wait_secs: float = 600
+    swap_retry_secs: float = 900
     rclone_args: tuple[str, ...] = ("--drive-chunk-size", "64M")
     probe_workers: int = 8

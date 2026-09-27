@@ -169,3 +169,29 @@ def test_swap_refuses_duplicate_names(conn, setup, monkeypatch, dup):
     assert sorted(p.name for p in root.iterdir()) == ["e.avi", "e.vidshrink-tmp.mkv"]
     assert (root / "e.avi").read_bytes() == b"old"
     assert db.get(conn, vid)["stage"] == "swapping"
+
+
+@pytest.mark.parametrize("final_content", [None, b"foreign content"])
+def test_swap_keeps_only_copy_when_original_gone(conn, cfg, setup, final_content):
+    # Original already trashed, temp file gone, final absent or not our encode:
+    # the local output may be the only good copy, so it must be kept.
+    root, worker, row = setup
+    if final_content is not None:
+        (root / "e.mkv").write_bytes(final_content)
+    vid = row("e.avi", "swapping", final_path="e.mkv", **SWAP_FIELDS)
+    (cfg.workdir / f"{vid}.out.mkv").write_bytes(NEW)
+    worker.recover()
+    r = db.get(conn, vid)
+    assert r["stage"] == "swapping" and r["reason"].startswith("swap: needs attention:")
+    assert (cfg.workdir / f"{vid}.out.mkv").read_bytes() == NEW
+
+
+def test_dry_run_leaves_pending_swaps_alone(conn, cfg, setup):
+    root, worker, row = setup
+    (root / "e.avi").write_bytes(b"old")
+    (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
+    vid = row("e.avi", "swapping", final_path="e.mkv", **SWAP_FIELDS)
+    assert worker.run(dry_run=True) == 0
+    assert (root / "e.avi").read_bytes() == b"old"
+    assert (root / "e.vidshrink-tmp.mkv").read_bytes() == NEW
+    assert db.get(conn, vid)["stage"] == "swapping"
