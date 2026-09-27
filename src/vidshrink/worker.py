@@ -229,4 +229,21 @@ class Worker:
         self.log(f"done: {row['final_path']} saved {(row['size'] - row['out_size']) / 1e9:.1f} GB")
 
     def recover(self) -> None:
-        pass  # Task 10
+        for row in db.rows_in(self.conn, "downloading", "encoding", "verifying"):
+            self._fail(row, f"interrupted during {row['stage']}")
+        for row in db.rows_in(self.conn, "uploading"):
+            tmp = tmp_path(row["path"])
+            try:
+                if self.rclone.exists(tmp):
+                    self.rclone.delete(tmp)
+            except RcloneError as e:
+                self.log(f"could not remove {tmp}: {e}")
+            stage = "ready" if self._out(row["id"]).exists() else "queued"
+            db.mark(self.conn, row["id"], stage)
+        for row in db.rows_in(self.conn, "swapping"):
+            try:
+                self._swap(row)
+            except (SwapError, RcloneError) as e:
+                db.mark(self.conn, row["id"], "failed", reason=f"swap: {e}"[:500])
+                self._cleanup(row["id"])
+                self.log(f"SWAP FAILED, needs attention: {row['path']}: {e}")
