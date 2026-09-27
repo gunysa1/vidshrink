@@ -47,7 +47,8 @@ def test_rescan_only_probes_changed(conn, cfg, make_clip):
 
     (root / "Movies" / "a.mkv").unlink()
     counts = scan(conn, rc, cfg, counting, log=lambda s: None)
-    assert counts["gone"] == 1 and calls == []
+    # Only the probe_failed file is tried again (I7); unchanged probed files are not.
+    assert counts["gone"] == 1 and calls == ["Movies/broken.mkv"]
     assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "gone"
 
 
@@ -100,3 +101,20 @@ def test_scan_skips_duplicate_names(conn, cfg, make_clip):
     rc.list_videos = real_list  # the duplicate was cleaned up on Drive
     scan(conn, rc, cfg, prober, log=lambda s: None)
     assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "queued"
+
+
+def test_rescan_retries_probe_failures(conn, cfg, make_clip):
+    root = setup_drive(cfg, make_clip)
+    rc = Rclone(cfg.remote)
+    local = local_prober(root)
+
+    def flaky(path, size):
+        if path == "Movies/a.mkv":
+            raise ProbeError("connection reset by peer")  # transient, file unchanged
+        return local(path, size)
+
+    scan(conn, rc, cfg, flaky, log=lambda s: None)
+    assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "probe_failed"
+    counts = scan(conn, rc, cfg, local, log=lambda s: None)
+    assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "queued"
+    assert counts["probed"] == 1 and counts["probe_failed"] == 1  # a.mkv now; broken.mkv again

@@ -32,7 +32,8 @@ def scan(conn, rclone: Rclone, cfg: Config, probe_fn: ProbeFn,
 
     counts = {"listed": len(entries), "gone": gone, "probed": 0, "probe_failed": 0, "excluded": 0}
     todo = []
-    for row in db.rows_in(conn, "unprobed"):
+    # probe_failed is retried every scan: most failures are transient (network, serve http).
+    for row in db.rows_in(conn, "unprobed", "probe_failed"):
         if any(row["path"].startswith(p) for p in cfg.excluded):
             db.mark(conn, row["id"], "skipped", reason="excluded folder")
             counts["excluded"] += 1
