@@ -58,3 +58,19 @@ def test_http_prober(cfg, make_clip):
     with serve_http(rc, free_port()) as base:
         p = http_prober(base)("a b [x].mkv", (root / "a b [x].mkv").stat().st_size)
     assert p.codec == "h264"
+
+
+def test_scan_catches_probe_exceptions(conn, cfg, make_clip):
+    root = setup_drive(cfg, make_clip)
+    local = local_prober(root)
+
+    def mixed_prober(path, size):
+        if path == "Movies/broken.mkv":
+            raise ValueError("bad width")
+        return local(path, size)
+
+    counts = scan(conn, Rclone(cfg.remote), cfg, mixed_prober, log=lambda s: None)
+    assert counts["probe_failed"] == 1  # broken.mkv raises ValueError
+    assert db.get_by_path(conn, "Movies/broken.mkv")["stage"] == "probe_failed"
+    assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "queued"
+    assert db.get_by_path(conn, "Movies/b.mkv")["stage"] == "skipped"

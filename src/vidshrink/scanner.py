@@ -42,7 +42,7 @@ def scan(conn, rclone: Rclone, cfg: Config, probe_fn: ProbeFn,
             try:
                 db.save_probe(conn, row["path"], fut.result().to_json())
                 counts["probed"] += 1
-            except ProbeError as e:
+            except (ProbeError, ValueError, TypeError, KeyError) as e:
                 db.mark(conn, row["id"], "probe_failed", reason=str(e)[:300])
                 counts["probe_failed"] += 1
             if n % 500 == 0:
