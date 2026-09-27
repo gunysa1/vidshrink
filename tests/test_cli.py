@@ -40,3 +40,13 @@ def test_status_report_lists_all_swapping_rows(cfg, conn):
     assert "Swaps waiting to be retried (2):" in report
     assert "Movies/b.mkv: swap: rclone timeout" in report
     assert "Movies/c.mkv: swap in progress or interrupted" in report
+
+
+def test_status_report_lists_dry_run_uploads(cfg, conn):
+    for path in ("Movies/a.mkv", "TV/S1/e.avi"):
+        db.upsert_listing(conn, path, 1_000_000_000, "2024-01-01T00:00:00Z")
+        db.mark(conn, db.get_by_path(conn, path)["id"], "dry_run")
+    report = status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))
+    assert "Dry-run uploads to review (2):" in report
+    assert "Movies/a.mkv -> Movies/a.vidshrink-tmp.mkv" in report
+    assert "TV/S1/e.avi -> TV/S1/e.vidshrink-tmp.mkv" in report

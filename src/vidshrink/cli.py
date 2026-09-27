@@ -10,7 +10,7 @@ from vidshrink.config import Config
 from vidshrink.probe import Probe
 from vidshrink.rclone import Rclone, free_port, serve_http
 from vidshrink.scanner import http_prober, scan
-from vidshrink.worker import Worker
+from vidshrink.worker import Worker, tmp_path
 
 
 def _log(msg: str) -> None:
@@ -53,6 +53,12 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
         lines.append(f"Swaps waiting to be retried ({len(swapping)}):")
         for row in sorted(swapping, key=lambda r: -r["updated_at"])[:10]:
             lines.append(f"  {row['path']}: {row['reason'] or 'swap in progress or interrupted'}")
+
+    dry = db.rows_in(conn, "dry_run")
+    if dry:
+        lines.append(f"Dry-run uploads to review ({len(dry)}):")
+        for row in sorted(dry, key=lambda r: r["path"]):
+            lines.append(f"  {row['path']} -> {tmp_path(row['path'])}")
 
     lines.append(f"Uploaded today ({budget.day()} Pacific): "
                  f"{budget.used() / 1e9:.0f} / {budget.limit / 1e9:.0f} GB")
