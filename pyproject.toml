@@ -20,3 +20,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The CLI end-to-end test exercises the real (non-test-tuned) disk-space check,
+# which needs ~20 GB free. Pytest's default tmp_path lives under the system
+# temp dir, which on this host is a small tmpfs; point it at the real disk
+# instead so the check sees the same free space vidshrink would see in
+# production.
+addopts = "--basetemp=.pytest-tmp"

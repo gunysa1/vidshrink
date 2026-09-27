@@ -1,0 +1,14 @@
+[Unit]
+Description=vidshrink: re-encode Google Drive videos to HEVC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/vidshrink/.venv/bin/vidshrink run
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target
