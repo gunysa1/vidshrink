@@ -28,6 +28,10 @@ def test_skip_reasons(cfg):
     assert "unsupported" in scorer.skip_reason("a.mkv", ok, replace(BASE, codec="vp9"), cfg)
     assert "dolby" in scorer.skip_reason("a.mkv", ok, replace(BASE, is_dv=True), cfg)
     assert "bitrate" in scorer.skip_reason("a.mkv", ok, replace(BASE, vbitrate=2e6), cfg)
+    for order in ("tt", "bb", "tb", "bt"):
+        assert scorer.skip_reason("a.mkv", ok, replace(BASE, field_order=order), cfg) == "interlaced"
+    for order in (None, "progressive", "unknown"):
+        assert scorer.skip_reason("a.mkv", ok, replace(BASE, field_order=order), cfg) is None
 
 
 def test_score_units():

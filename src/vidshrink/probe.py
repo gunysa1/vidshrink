@@ -25,6 +25,7 @@ class Probe:
     master_display: str | None
     max_cll: str | None
     streams: list[list[str]]
+    field_order: str | None = None  # last, with a default: older stored JSON lacks it
 
     @property
     def is_hdr(self) -> bool:
@@ -112,6 +113,7 @@ def parse_ffprobe(data: dict, size: int) -> Probe:
             [s["codec_type"], s.get("codec_name", ""), (s.get("tags") or {}).get("language", "und")]
             for s in streams if s.get("codec_type") in ("audio", "subtitle")
         ],
+        field_order=main.get("field_order"),
     )
 
 

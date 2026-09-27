@@ -1,3 +1,6 @@
+import json
+import subprocess
+
 import pytest
 
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
@@ -90,3 +93,33 @@ def test_run_ffprobe_handles_malformed_json(monkeypatch):
                         lambda *args, **kwargs: sp.CompletedProcess(args=[], returncode=0, stdout="{not json", stderr=""))
     with pytest.raises(ProbeError, match="bad ffprobe json"):
         run_ffprobe("x")
+
+
+def test_parse_field_order_of_main_stream():
+    base = {"format": {"format_name": "mpeg", "duration": "10.0"}}
+    streams = [
+        {"codec_type": "video", "codec_name": "mjpeg", "field_order": "progressive",
+         "disposition": {"attached_pic": 1}},
+        {"codec_type": "video", "codec_name": "mpeg2video", "width": 720, "height": 576,
+         "field_order": "tt"},
+    ]
+    assert parse_ffprobe(dict(base, streams=streams), size=1).field_order == "tt"
+    no_key = [{"codec_type": "video", "codec_name": "h264", "width": 640, "height": 360}]
+    assert parse_ffprobe(dict(base, streams=no_key), size=1).field_order is None
+
+
+def test_from_json_without_field_order():
+    # Probes stored before field_order existed must still load.
+    data = {"format": {"format_name": "matroska,webm", "duration": "100.0"}, "streams": [HDR_STREAM]}
+    stored = json.loads(parse_ffprobe(data, size=5).to_json())
+    stored.pop("field_order")
+    p = Probe.from_json(json.dumps(stored))
+    assert p.field_order is None and p.codec == "hevc"
+
+
+def test_run_ffprobe_reads_field_order(tmp_path):
+    clip = tmp_path / "i.mpg"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                    "-i", "testsrc2=size=320x240:rate=25:duration=1", "-vf", "setfield=tff",
+                    "-c:v", "mpeg2video", "-flags", "+ildct+ilme", str(clip)], check=True)
+    assert parse_ffprobe(run_ffprobe(str(clip)), clip.stat().st_size).field_order == "tt"

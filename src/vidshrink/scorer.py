@@ -8,6 +8,7 @@ LEGACY = {"mpeg1video", "mpeg2video", "vc1", "mpeg4", "msmpeg4v1", "msmpeg4v2",
           "msmpeg4v3", "wmv1", "wmv2", "wmv3"}
 DEFAULT_RATIO = {"h264": 0.55, "legacy": 0.70}
 DEFAULT_SPEED = {"sd": 0.5, "720p": 1.0, "1080p": 1.7, "4k": 6.5}
+INTERLACED = ("tt", "bb", "tb", "bt")
 BITRATE_FLOOR = {"sd": 0.8e6, "720p": 1.2e6, "1080p": 2.5e6, "4k": 8e6}
 
 
@@ -40,6 +41,8 @@ def skip_reason(path: str, size: int, probe: Probe, cfg: Config) -> str | None:
         return f"already efficient ({probe.codec})"
     if probe.is_dv:
         return "dolby vision"
+    if probe.field_order in INTERLACED:
+        return "interlaced"
     if codec_family(probe.codec) is None:
         return f"unsupported codec ({probe.codec})"
     res = resolution_class(probe.width, probe.height)
