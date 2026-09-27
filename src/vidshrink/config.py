@@ -23,6 +23,7 @@ class Config:
     rate_limit_block_secs: float = 6 * 3600
     max_ready: int = 2
     max_attempts: int = 2
+    max_consecutive_failures: int = 5
     retry_attempts: int = 5
     retry_base_delay: float = 5.0
     disk_factor: float = 2.2

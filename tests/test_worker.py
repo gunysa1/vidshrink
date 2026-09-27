@@ -232,3 +232,69 @@ def test_swap_retry_waits_for_interval(conn, cfg, env, monkeypatch):
     monkeypatch.setattr(worker.rclone, "move", flaky_move)
     assert worker.run() == 1
     assert len(db.rows_in(conn, "swapping")) == 1 and len(calls) == 2
+
+
+@pytest.mark.parametrize("missing", ["rclone", "ffmpeg", "ffprobe"])
+def test_missing_tool_stops_before_touching_rows(conn, env, monkeypatch, missing):
+    _, worker = env
+    from vidshrink import worker as worker_mod
+    real_which = shutil.which
+    monkeypatch.setattr(worker_mod.shutil, "which",
+                        lambda name: None if name == missing else real_which(name))
+    # An interrupted row would be failed by recover(); it must not even get that far.
+    db.mark(conn, db.get_by_path(conn, "Movies/a.mkv")["id"], "encoding")
+    before = [tuple(r) for r in conn.execute("SELECT * FROM videos ORDER BY id")]
+    with pytest.raises(RuntimeError, match=missing):
+        worker.run()
+    assert [tuple(r) for r in conn.execute("SELECT * FROM videos ORDER BY id")] == before
+
+
+def test_tool_vanishing_mid_run_crashes_without_burning_attempts(conn, env, monkeypatch):
+    _, worker = env
+    from vidshrink import worker as worker_mod
+
+    def gone(cmd, log_path):
+        raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
+
+    monkeypatch.setattr(worker_mod, "run_encode", gone)
+    with pytest.raises(FileNotFoundError):
+        worker.run()
+    rows = db.rows_in(conn, "queued")
+    assert len(rows) == 2 and all(r["attempts"] == 0 for r in rows)
+
+
+def test_run_stops_after_consecutive_failures(conn, env, monkeypatch):
+    _, worker = env
+    from vidshrink import worker as worker_mod
+    from vidshrink.encode import EncodeError
+    worker.cfg.max_attempts = 100
+    calls = []
+
+    def boom(cmd, log_path):
+        calls.append(1)
+        raise EncodeError("boom")
+
+    monkeypatch.setattr(worker_mod, "run_encode", boom)
+    assert worker.run() == 0
+    assert len(calls) == worker.cfg.max_consecutive_failures == 5
+    rows = db.rows_in(conn, "queued")
+    assert len(rows) == 2 and sum(r["attempts"] for r in rows) == 5
+
+
+def test_run_stops_after_consecutive_upload_failures(conn, env, monkeypatch):
+    root, worker = env
+    from vidshrink.rclone import RcloneError
+    worker.cfg.max_attempts = 100
+    worker.cfg.retry_attempts = 1
+    calls = []
+
+    def broken(local, path):
+        calls.append(path)
+        raise RcloneError(1, "connection reset")
+
+    monkeypatch.setattr(worker.rclone, "upload", broken)
+    assert worker.run() == 0
+    assert len(calls) == 5
+    # The encoded row keeps its output for later; the other was never started.
+    assert len(db.rows_in(conn, "ready")) == 1 and len(db.rows_in(conn, "queued")) == 1
+    assert sorted(p.name for p in (root / "Movies").iterdir()) == ["a.mkv", "b.mp4"]

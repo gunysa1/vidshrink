@@ -67,6 +67,7 @@ class Worker:
         self.budget = budget
         self.sleep = sleep
         self.log = log
+        self.failures = 0  # consecutive prepare/upload failures with no success between
 
     # --- work files -------------------------------------------------------
     def _src(self, vid: int) -> Path:
@@ -93,14 +94,26 @@ class Worker:
         self._cleanup(row["id"], keep_output=(retry_stage == "ready" and not final))
         stage = "failed" if final else retry_stage
         db.mark(self.conn, row["id"], stage, reason=reason[:500], attempts=attempts)
+        self.failures += 1
         self.log(f"{stage}: {row['path']}: {reason[:200]}")
+
+    def _check_tools(self) -> None:
+        for tool in (self.rclone.binary, "ffmpeg", "ffprobe"):
+            if shutil.which(tool) is None:
+                raise RuntimeError(f"required tool not found on PATH: {tool}")
 
     # --- main loop ---------------------------------------------------------
     def run(self, limit: int | None = None, dry_run: bool = False) -> int:
+        self._check_tools()
         with _lock(self.cfg.workdir):
             done = self.recover(dry_run)
+            self.failures = 0
             last_reconcile = self.clock()
             while limit is None or done < limit:
+                if self.failures >= self.cfg.max_consecutive_failures:
+                    self.log(f"!!! STOPPING: {self.failures} failures in a row with no success; "
+                             f"something is wrong beyond a single file (see reasons in status)")
+                    break
                 if (not dry_run and self.clock() - last_reconcile >= self.cfg.swap_retry_secs
                         and db.rows_in(self.conn, "swapping")):
                     done += self._reconcile_swaps()
@@ -164,6 +177,7 @@ class Worker:
                 self._cleanup(vid)
                 saved = 1 - out_size / row["size"]
                 db.mark(self.conn, vid, "not_worth_it", reason=f"only {saved:.0%} smaller")
+                self.failures = 0
                 self.log(f"not worth it: {path} ({saved:.0%})")
                 return
             md5 = _md5(out)
@@ -172,11 +186,18 @@ class Worker:
             db.mark(self.conn, vid, "failed", reason=str(e)[:500])
             self.log(f"failed: {path}: {e}")
             return
+        except FileNotFoundError:
+            # A tool (rclone/ffmpeg/ffprobe) vanished: not this file's fault, so crash
+            # without burning an attempt and leave the row to be picked up again.
+            self._cleanup(vid)
+            db.mark(self.conn, vid, "queued")
+            raise
         except (RcloneError, EncodeError, ProbeError, OSError) as e:
             self._fail(row, str(e))
             return
         self._cleanup(vid, keep_output=True)
         db.mark(self.conn, vid, "ready", out_size=out_size, out_md5=md5, final_path=final)
+        self.failures = 0
 
     def upload_and_swap(self, row, dry_run: bool) -> bool:
         vid, path = row["id"], row["path"]
@@ -202,6 +223,7 @@ class Worker:
                 pass
             self._fail(row, "checksum mismatch after upload", retry_stage="ready")
             return False
+        self.failures = 0
         if dry_run:
             self._cleanup(vid)
             db.mark(self.conn, vid, "dry_run", reason=f"uploaded as {tmp}")
