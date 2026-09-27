@@ -106,7 +106,7 @@ All must pass, otherwise the file is marked failed or `not_worth_it` and the ori
 
 ## Guardrails
 
-- **Upload budget:** at most 700 GB per Pacific-time day. When it's used up, the worker
+- **Upload budget:** at most 700 GB per Pacific-time day (assumed reset time; Google does not document it — if uploads hit `userRateLimitExceeded` early, the worker treats it as "budget exhausted" and backs off 6 h). When it's used up, the worker
   keeps encoding until 2 finished outputs are waiting, then sleeps until the reset.
 - **Retries:** download and upload retry with exponential backoff, up to 5 attempts.
   An encode or check that fails twice is marked `failed` permanently.
