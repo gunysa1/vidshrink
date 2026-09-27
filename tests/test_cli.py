@@ -2,7 +2,8 @@ import shutil
 from pathlib import Path
 
 from vidshrink import db
-from vidshrink.cli import main
+from vidshrink.budget import Budget
+from vidshrink.cli import main, status_report
 
 
 def test_scan_run_status_end_to_end(cfg, make_clip, capsys, monkeypatch):
@@ -24,3 +25,18 @@ def test_scan_run_status_end_to_end(cfg, make_clip, capsys, monkeypatch):
     assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "done"
     main(common + ["status"])
     assert "Saved so far" in capsys.readouterr().out
+
+
+def test_status_report_lists_all_swapping_rows(cfg, conn):
+    db.upsert_listing(conn, "Movies/b.mkv", 1_000_000_000, "2024-01-01T00:00:00Z")
+    vid1 = db.get_by_path(conn, "Movies/b.mkv")["id"]
+    db.mark(conn, vid1, "swapping", reason="swap: rclone timeout")
+
+    db.upsert_listing(conn, "Movies/c.mkv", 1_000_000_000, "2024-01-01T00:00:00Z")
+    vid2 = db.get_by_path(conn, "Movies/c.mkv")["id"]
+    db.mark(conn, vid2, "swapping")
+
+    report = status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))
+    assert "Swaps waiting to be retried (2):" in report
+    assert "Movies/b.mkv: swap: rclone timeout" in report
+    assert "Movies/c.mkv: swap in progress or interrupted" in report

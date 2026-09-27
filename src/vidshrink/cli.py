@@ -25,18 +25,21 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
     done = conn.execute("SELECT COUNT(*) n, SUM(size - out_size) s FROM videos WHERE stage='done'").fetchone()
     lines.append(f"Saved so far: {(done['s'] or 0) / 1e12:.2f} TB across {done['n']} files")
 
+    queued = db.rows_in(conn, "queued")
+    ratios = {f: scorer.ratio_for(conn, f) for f in scorer.DEFAULT_RATIO}
+    speeds = {r: scorer.speed_for(conn, r) for r in scorer.DEFAULT_SPEED}
     saved = hours = 0.0
-    for row in db.rows_in(conn, "queued"):
+    for row in queued:
         p = Probe.from_json(row["probe_json"])
         fam = scorer.codec_family(p.codec)
         res = scorer.resolution_class(p.width, p.height)
-        saved += row["size"] * scorer.ratio_for(conn, fam)
-        hours += p.duration * scorer.speed_for(conn, res) / 3600
+        saved += row["size"] * ratios[fam]
+        hours += p.duration * speeds[res] / 3600
     lines.append(f"Projected for the queue: {saved / 1e12:.2f} TB saved, "
                  f"{hours:,.0f} encode hours ({hours / 24 / 365:.1f} years)")
 
     lines.append("Top of queue (GB saved per encode hour):")
-    for row in db.rows_in(conn, "queued")[:10]:
+    for row in queued[:10]:
         lines.append(f"  {row['score']:7.2f}  {row['size'] / 1e9:6.1f} GB  {row['path']}")
 
     failed = db.rows_in(conn, "failed")
@@ -45,11 +48,11 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
         for row in sorted(failed, key=lambda r: -r["updated_at"])[:10]:
             lines.append(f"  {row['path']}: {row['reason']}")
 
-    swapping = [r for r in db.rows_in(conn, "swapping") if r["reason"] and r["reason"].startswith("swap:")]
+    swapping = db.rows_in(conn, "swapping")
     if swapping:
         lines.append(f"Swaps waiting to be retried ({len(swapping)}):")
         for row in sorted(swapping, key=lambda r: -r["updated_at"])[:10]:
-            lines.append(f"  {row['path']}: {row['reason']}")
+            lines.append(f"  {row['path']}: {row['reason'] or 'swap in progress or interrupted'}")
 
     lines.append(f"Uploaded today ({budget.day()} Pacific): "
                  f"{budget.used() / 1e9:.0f} / {budget.limit / 1e9:.0f} GB")
