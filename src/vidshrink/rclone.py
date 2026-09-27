@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TypeVar
 
 T = TypeVar("T")
+TMP_SUFFIX = ".vidshrink-tmp.mkv"
 RATE_LIMIT_MARKERS = ("userRateLimitExceeded", "uploadLimitExceeded", "User rate limit exceeded")
 
 
@@ -44,7 +45,8 @@ class Rclone:
         pattern = "*.{" + ",".join(extensions) + "}"
         out = self._run("lsjson", "-R", "--files-only", "--no-mimetype",
                         "--ignore-case", "--include", pattern, self.remote)
-        return json.loads(out)
+        # Our own upload temp files are not videos to shrink.
+        return [e for e in json.loads(out) if not e["Path"].endswith(TMP_SUFFIX)]
 
     def download(self, path: str, local: Path) -> None:
         self._run("copyto", self._p(path), str(local))
@@ -58,15 +60,19 @@ class Rclone:
     def move(self, src: str, dst: str) -> None:
         self._run("moveto", self._p(src), self._p(dst))
 
-    def exists(self, path: str) -> bool:
+    def entries(self, path: str) -> list[dict]:
+        """All files in path's folder named like path (Drive allows duplicate names)."""
         parent, name = posixpath.split(path)
         try:
             out = self._run("lsjson", "--files-only", "--no-mimetype", self._p(parent))
         except RcloneError as e:
             if e.code == 3 or "directory not found" in e.stderr:
-                return False
+                return []
             raise
-        return any(e["Name"] == name for e in json.loads(out))
+        return [e for e in json.loads(out) if e["Name"] == name]
+
+    def exists(self, path: str) -> bool:
+        return bool(self.entries(path))
 
     def md5(self, path: str) -> str | None:
         out = self._run("md5sum", self._p(path)).split()

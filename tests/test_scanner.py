@@ -74,3 +74,29 @@ def test_scan_catches_probe_exceptions(conn, cfg, make_clip):
     assert db.get_by_path(conn, "Movies/broken.mkv")["stage"] == "probe_failed"
     assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "queued"
     assert db.get_by_path(conn, "Movies/b.mkv")["stage"] == "skipped"
+
+
+def test_scan_skips_duplicate_names(conn, cfg, make_clip):
+    root = setup_drive(cfg, make_clip)
+    rc = Rclone(cfg.remote)
+    real_list = rc.list_videos
+    probed = []
+    local = local_prober(root)
+
+    def prober(path, size):
+        probed.append(path)
+        return local(path, size)
+
+    def with_dup(exts):
+        entries = real_list(exts)
+        return entries + [e for e in entries if e["Path"] == "Movies/a.mkv"]
+
+    rc.list_videos = with_dup
+    scan(conn, rc, cfg, prober, log=lambda s: None)
+    r = db.get_by_path(conn, "Movies/a.mkv")
+    assert (r["stage"], r["reason"]) == ("skipped", "duplicate name on Drive")
+    assert "Movies/a.mkv" not in probed
+
+    rc.list_videos = real_list  # the duplicate was cleaned up on Drive
+    scan(conn, rc, cfg, prober, log=lambda s: None)
+    assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "queued"

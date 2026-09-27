@@ -12,7 +12,7 @@ from vidshrink.budget import Budget
 from vidshrink.config import Config
 from vidshrink.encode import EncodeError, build_command, run_encode
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
-from vidshrink.rclone import Rclone, RcloneError, with_retries
+from vidshrink.rclone import TMP_SUFFIX, Rclone, RcloneError, with_retries
 from vidshrink.verify import compare, decode_errors
 
 
@@ -33,7 +33,7 @@ def final_path(path: str) -> str:
 
 
 def tmp_path(path: str) -> str:
-    return posixpath.splitext(path)[0] + ".vidshrink-tmp.mkv"
+    return posixpath.splitext(path)[0] + TMP_SUFFIX
 
 
 def _md5(path: Path) -> str:
@@ -137,6 +137,12 @@ class Worker:
             self.log(f"downloading {path} ({row['size'] / 1e9:.1f} GB)")
             db.mark(self.conn, vid, "downloading")
             self._retry(lambda: self.rclone.download(path, src))
+            if src.stat().st_size != row["size"]:
+                self._cleanup(vid)
+                db.mark(self.conn, vid, "unprobed", reason="changed since scan",
+                        probe_json=None, score=None)
+                self.log(f"changed since scan, will re-probe: {path}")
+                return
             self.log(f"encoding {path}")
             db.mark(self.conn, vid, "encoding")
             secs = run_encode(build_command(src, out, probe, self.cfg), self._logfile(vid))
@@ -203,15 +209,26 @@ class Worker:
             return False
         return True
 
+    def _one(self, path: str) -> dict | None:
+        found = self.rclone.entries(path)
+        if len(found) > 1:
+            raise SwapError(f"{len(found)} files named {path} on Drive")
+        return found[0] if found else None
+
     def _swap(self, row) -> None:
         path, final, tmp = row["path"], row["final_path"], tmp_path(row["path"])
-        if self.rclone.exists(tmp):
-            if final != path and self.rclone.exists(final):
+        if self._one(tmp):
+            if final != path and self._one(final):
                 raise SwapError(f"target {final} already exists")
-            if self.rclone.exists(path):
+            originals = self.rclone.entries(path)
+            if originals:
+                # Only delete the exact file that was downloaded and encoded.
+                if len(originals) != 1 or (originals[0]["Size"], originals[0]["ModTime"]) \
+                        != (row["size"], row["modtime"]):
+                    raise SwapError("original changed or duplicated; not deleting")
                 self._retry(lambda: self.rclone.delete(path))
             self._retry(lambda: self.rclone.move(tmp, final))
-        elif not (self.rclone.exists(final) and self.rclone.md5(final) == row["out_md5"]):
+        elif not (self._one(final) and self.rclone.md5(final) == row["out_md5"]):
             raise SwapError(f"{tmp} missing and {final} does not match the encode")
         self._finish(row)
 

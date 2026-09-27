@@ -7,7 +7,7 @@ from vidshrink import db
 from vidshrink.budget import Budget
 from vidshrink.probe import Probe
 from vidshrink.rclone import Rclone, RcloneError
-from vidshrink.worker import Worker
+from vidshrink.worker import SwapError, Worker
 
 PROBE = Probe(container="matroska,webm", duration=10.0, codec="h264", width=1920, height=1080,
               video_index=0, vbitrate=10e6, is_dv=False, color_primaries=None,
@@ -25,7 +25,11 @@ def setup(conn, cfg):
     cfg.workdir.mkdir(parents=True, exist_ok=True)
 
     def row(path, stage, **fields):
-        db.upsert_listing(conn, path, 1000, "t")
+        # Record the original as the scan would have seen it, so the swap's
+        # "is this still the file we encoded?" check matches the file on disk.
+        listed = worker.rclone.entries(path)
+        size, modtime = (listed[0]["Size"], listed[0]["ModTime"]) if listed else (1000, "t")
+        db.upsert_listing(conn, path, size, modtime)
         db.save_probe(conn, path, PROBE.to_json())
         vid = db.get_by_path(conn, path)["id"]
         db.mark(conn, vid, stage, **fields)
@@ -114,7 +118,7 @@ def test_swap_transient_rclone_error_stays_swapping(conn, cfg, setup, monkeypatc
     def raise_err(path):
         raise RcloneError(1, "connection reset")
 
-    monkeypatch.setattr(worker.rclone, "exists", raise_err)
+    monkeypatch.setattr(worker.rclone, "entries", raise_err)
     worker.recover()
 
     r = db.get(conn, vid)
@@ -145,3 +149,23 @@ def test_swap_target_taken_during_recovery(conn, setup):
     assert r["stage"] == "failed" and r["reason"].startswith("swap:")
     assert (root / "e.avi").read_bytes() == b"old original"
     assert (root / "e.mkv").read_bytes() == b"foreign content"
+
+
+@pytest.mark.parametrize("dup", ["e.avi", "e.vidshrink-tmp.mkv"])
+def test_swap_refuses_duplicate_names(conn, setup, monkeypatch, dup):
+    root, worker, row = setup
+    (root / "e.avi").write_bytes(b"old")
+    (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
+    vid = row("e.avi", "swapping", final_path="e.mkv", **SWAP_FIELDS)
+    real = worker.rclone.entries
+
+    def doubled(path):
+        found = real(path)
+        return found * 2 if path == dup else found
+
+    monkeypatch.setattr(worker.rclone, "entries", doubled)
+    with pytest.raises(SwapError):
+        worker._swap(db.get(conn, vid))
+    assert sorted(p.name for p in root.iterdir()) == ["e.avi", "e.vidshrink-tmp.mkv"]
+    assert (root / "e.avi").read_bytes() == b"old"
+    assert db.get(conn, vid)["stage"] == "swapping"

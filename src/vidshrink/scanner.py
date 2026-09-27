@@ -1,4 +1,5 @@
 import urllib.parse
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -24,6 +25,10 @@ def scan(conn, rclone: Rclone, cfg: Config, probe_fn: ProbeFn,
         for e in entries:
             db.upsert_listing(conn, e["Path"], e["Size"], e["ModTime"])
         gone = db.mark_gone(conn, (e["Path"] for e in entries))
+        # Drive allows several files with one name; we can't tell which one we'd replace.
+        dups = [p for p, n in Counter(e["Path"] for e in entries).items() if n > 1]
+        if db.mark_duplicates(conn, dups):
+            log(f"skipping {len(dups)} duplicate names: {dups[:5]}")
 
     counts = {"listed": len(entries), "gone": gone, "probed": 0, "probe_failed": 0, "excluded": 0}
     todo = []

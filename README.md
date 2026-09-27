@@ -23,6 +23,13 @@ uv venv .venv && uv pip install --python .venv/bin/python -e '.[dev]'
 
 ## Use
 
+Before the first live run, optionally list Drive's duplicate names (Drive allows several
+files with the same name in one folder; vidshrink skips those paths). This changes nothing:
+
+```bash
+rclone dedupe --dedupe-mode list gdrive:
+```
+
 ```bash
 .venv/bin/vidshrink scan                    # list + probe + rank (read-only on Drive)
 .venv/bin/vidshrink status                  # queue, projections, failures, today's upload

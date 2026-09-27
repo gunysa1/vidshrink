@@ -1,3 +1,4 @@
+import os
 import shutil
 from pathlib import Path
 
@@ -158,3 +159,36 @@ def test_disk_too_small_fails_permanently(conn, env):
     rows = db.rows_in(conn, "failed")
     assert len(rows) == 2 and all("disk" in r["reason"] for r in rows)
     assert not slept
+
+
+@pytest.mark.parametrize("change", ["size", "modtime"])
+def test_swap_refuses_when_original_changed(conn, env, change):
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    worker.prepare(row)
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    assert row["stage"] == "ready"
+    orig = root / "Movies" / "b.mp4"
+    if change == "size":
+        orig.write_bytes(b"a different file")
+    else:
+        st = orig.stat()
+        os.utime(orig, (st.st_atime, st.st_mtime - 3600))
+    content = orig.read_bytes()
+    assert worker.upload_and_swap(row, dry_run=False) is False
+    assert orig.read_bytes() == content
+    assert not (root / "Movies" / "b.mkv").exists()
+    r = db.get_by_path(conn, "Movies/b.mp4")
+    assert r["stage"] != "done" and "original changed or duplicated" in r["reason"]
+
+
+def test_prepare_requeues_file_changed_since_scan(conn, cfg, env):
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    with open(root / "Movies" / "a.mkv", "ab") as f:
+        f.write(b"x" * 10)  # grew after the scan recorded its size
+    worker.prepare(db.get_by_path(conn, "Movies/a.mkv"))
+    r = db.get_by_path(conn, "Movies/a.mkv")
+    assert (r["stage"], r["reason"]) == ("unprobed", "changed since scan")
+    assert list(cfg.workdir.glob("*.src")) == [] and list(cfg.workdir.glob("*.mkv")) == []

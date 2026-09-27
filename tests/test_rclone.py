@@ -33,6 +33,19 @@ def test_exists_and_md5(rc):
     assert rc.md5("Movies/A [1080p]/a.mkv") == hashlib.md5(b"x" * 1000).hexdigest()
 
 
+def test_entries_returns_all_matches(rc):
+    found = rc.entries("Movies/A [1080p]/a.mkv")
+    assert [(e["Name"], e["Size"]) for e in found] == [("a.mkv", 1000)]
+    assert found[0]["ModTime"]
+    assert rc.entries("Movies/A [1080p]/nope.mkv") == []
+    assert rc.entries("NoDir/a.mkv") == []
+
+
+def test_list_videos_ignores_vidshrink_tmp(rc, drive):
+    (drive / "Movies" / "A [1080p]" / "a.vidshrink-tmp.mkv").write_bytes(b"y")
+    assert [e["Path"] for e in rc.list_videos(["mkv"])] == ["Movies/A [1080p]/a.mkv"]
+
+
 def test_download_upload_move_delete(rc, tmp_path):
     local = tmp_path / "local.bin"
     rc.download("Movies/A [1080p]/a.mkv", local)

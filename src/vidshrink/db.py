@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 IN_PROGRESS = ("downloading", "encoding", "verifying", "uploading", "swapping")
+DUPLICATE_REASON = "duplicate name on Drive"
 _GONE_ELIGIBLE = ("unprobed", "probed", "queued", "skipped", "probe_failed")
 
 SCHEMA = """
@@ -86,6 +87,26 @@ def mark_gone(conn, seen: Iterable[str]) -> int:
         (time.time(), *_GONE_ELIGIBLE),
     )
     return cur.rowcount
+
+
+def mark_duplicates(conn, paths: Iterable[str]) -> int:
+    """Skip paths that name more than one file on Drive; un-skip ones that no longer do."""
+    dups = set(paths)
+    now = time.time()
+    marks = ",".join("?" * len(_GONE_ELIGIBLE))
+    n = 0
+    for path in dups:
+        n += conn.execute(
+            f"UPDATE videos SET stage='skipped', reason=?, score=NULL, updated_at=?"
+            f" WHERE path=? AND stage IN ({marks})",
+            (DUPLICATE_REASON, now, path, *_GONE_ELIGIBLE),
+        ).rowcount
+    for row in conn.execute("SELECT id, path FROM videos WHERE stage='skipped' AND reason=?",
+                            (DUPLICATE_REASON,)).fetchall():
+        if row["path"] not in dups:
+            conn.execute("UPDATE videos SET stage='unprobed', reason=NULL, probe_json=NULL,"
+                         " updated_at=? WHERE id=?", (now, row["id"]))
+    return n
 
 
 def save_probe(conn, path: str, probe_json: str) -> None:
