@@ -62,8 +62,10 @@ class Rclone:
         parent, name = posixpath.split(path)
         try:
             out = self._run("lsjson", "--files-only", "--no-mimetype", self._p(parent))
-        except RcloneError:
-            return False
+        except RcloneError as e:
+            if e.code == 3 or "directory not found" in e.stderr:
+                return False
+            raise
         return any(e["Name"] == name for e in json.loads(out))
 
     def md5(self, path: str) -> str | None:

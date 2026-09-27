@@ -131,3 +131,30 @@ def test_target_name_taken(conn, cfg, env):
     row = db.get_by_path(conn, "Movies/b.mp4")
     assert row["stage"] == "failed" and "exists" in row["reason"]
     assert (root / "Movies" / "b.mp4").exists()
+
+
+def test_swap_checks_target_again_and_stays_reconcilable(conn, cfg, env):
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    worker.prepare(row)
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    assert row["stage"] == "ready"
+    # A foreign file races in under the final name after prepare's own check passed.
+    (root / "Movies" / "b.mkv").write_bytes(b"someone else's file")
+    assert worker.upload_and_swap(row, dry_run=False) is False
+    assert (root / "Movies" / "b.mkv").read_bytes() == b"someone else's file"
+    assert (root / "Movies" / "b.mp4").exists()
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    assert row["stage"] == "swapping" and "exists" in row["reason"]
+
+
+def test_disk_too_small_fails_permanently(conn, env):
+    root, worker = env
+    worker.cfg.disk_reserve = 10**18
+    slept = []
+    worker.sleep = lambda s: slept.append(s)
+    assert worker.run() == 0
+    rows = db.rows_in(conn, "failed")
+    assert len(rows) == 2 and all("disk" in r["reason"] for r in rows)
+    assert not slept

@@ -24,6 +24,10 @@ class SwapError(Exception):
     pass
 
 
+class DiskTooSmall(Exception):
+    pass
+
+
 def final_path(path: str) -> str:
     return posixpath.splitext(path)[0] + ".mkv"
 
@@ -113,6 +117,9 @@ class Worker:
 
     def _wait_for_disk(self, size: int) -> None:
         need = self.cfg.disk_factor * size + self.cfg.disk_reserve
+        total = shutil.disk_usage(self.cfg.workdir).total
+        if need > total:
+            raise DiskTooSmall(f"needs {need / 1e9:.0f} GB disk, only {total / 1e9:.0f} GB total")
         while shutil.disk_usage(self.cfg.workdir).free < need:
             self.log(f"waiting for {need / 1e9:.0f} GB free disk")
             self.sleep(self.cfg.disk_wait_secs)
@@ -138,19 +145,24 @@ class Worker:
             out_probe = parse_ffprobe(run_ffprobe(str(out)), out_size)
             verdict = compare(probe, out_probe, row["size"], out_size,
                               self.cfg.min_saving, decode_errors(out))
+            if verdict.problems:
+                self._fail(row, "; ".join(verdict.problems))
+                return
+            if verdict.not_worth_it:
+                self._cleanup(vid)
+                saved = 1 - out_size / row["size"]
+                db.mark(self.conn, vid, "not_worth_it", reason=f"only {saved:.0%} smaller")
+                self.log(f"not worth it: {path} ({saved:.0%})")
+                return
+            md5 = _md5(out)
+        except DiskTooSmall as e:
+            self._cleanup(vid)
+            db.mark(self.conn, vid, "failed", reason=str(e)[:500])
+            self.log(f"failed: {path}: {e}")
+            return
         except (RcloneError, EncodeError, ProbeError, OSError) as e:
             self._fail(row, str(e))
             return
-        if verdict.problems:
-            self._fail(row, "; ".join(verdict.problems))
-            return
-        if verdict.not_worth_it:
-            self._cleanup(vid)
-            saved = 1 - out_size / row["size"]
-            db.mark(self.conn, vid, "not_worth_it", reason=f"only {saved:.0%} smaller")
-            self.log(f"not worth it: {path} ({saved:.0%})")
-            return
-        md5 = _md5(out)
         self._cleanup(vid, keep_output=True)
         db.mark(self.conn, vid, "ready", out_size=out_size, out_md5=md5, final_path=final)
 
@@ -186,14 +198,16 @@ class Worker:
         try:
             self._swap(db.get(self.conn, vid))
         except (SwapError, RcloneError) as e:
-            db.mark(self.conn, vid, "failed", reason=f"swap: {e}"[:500])
-            self.log(f"SWAP FAILED, needs attention: {path}: {e}")
+            db.mark(self.conn, vid, "swapping", reason=f"swap: {e}"[:500])
+            self.log(f"SWAP FAILED, will retry on next start: {path}: {e}")
             return False
         return True
 
     def _swap(self, row) -> None:
         path, final, tmp = row["path"], row["final_path"], tmp_path(row["path"])
         if self.rclone.exists(tmp):
+            if final != path and self.rclone.exists(final):
+                raise SwapError(f"target {final} already exists")
             if self.rclone.exists(path):
                 self._retry(lambda: self.rclone.delete(path))
             self._retry(lambda: self.rclone.move(tmp, final))
