@@ -60,3 +60,24 @@ def test_rescore_uses_learned_values(conn, cfg):
     db.learn(conn, "speed:1080p", 0.1)  # encodes much faster than guessed
     scorer.rescore(conn, cfg)
     assert db.get_by_path(conn, "a.mkv")["score"] > before
+
+
+def test_rescore_leaves_rows_that_moved_on(conn, cfg, monkeypatch):
+    # A worker (another process) takes rows between rescore's read and its update.
+    _add(conn, "h264.mkv", 5_000_000_000, BASE)
+    _add(conn, "hevc.mkv", 5_000_000_000, replace(BASE, codec="hevc"))
+    other = db.connect(cfg.db_path)
+    real_rows_in = db.rows_in
+
+    def racing(c, *stages):
+        rows = real_rows_in(c, *stages)
+        for r in rows:
+            db.mark(other, r["id"], "downloading")
+        return rows
+
+    monkeypatch.setattr(db, "rows_in", racing)
+    scorer.rescore(conn, cfg)
+    other.close()
+    for path in ("h264.mkv", "hevc.mkv"):
+        r = db.get_by_path(conn, path)
+        assert (r["stage"], r["score"], r["reason"]) == ("downloading", None, None)

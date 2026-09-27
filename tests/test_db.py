@@ -1,3 +1,7 @@
+import sqlite3
+
+import pytest
+
 from vidshrink import db
 
 
@@ -80,3 +84,13 @@ def test_transaction_rolls_back(conn):
     except RuntimeError:
         pass
     assert db.get_by_path(conn, "a.mkv") is None
+
+
+def test_transaction_takes_write_lock_up_front(conn, cfg):
+    other = sqlite3.connect(cfg.db_path, timeout=0)
+    try:
+        with db.transaction(conn):
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                other.execute("BEGIN IMMEDIATE")
+    finally:
+        other.close()

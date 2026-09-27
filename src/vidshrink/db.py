@@ -44,7 +44,9 @@ def connect(path: Path | str) -> sqlite3.Connection:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection):
-    conn.execute("BEGIN")
+    # IMMEDIATE: take the write lock up front so a read-then-write inside the
+    # transaction can't interleave with the other process (scan vs run).
+    conn.execute("BEGIN IMMEDIATE")
     try:
         yield
     except BaseException:
@@ -121,6 +123,17 @@ def mark(conn, vid: int, stage: str, **fields) -> None:
     fields["updated_at"] = time.time()
     cols = ", ".join(f"{k}=?" for k in fields)
     conn.execute(f"UPDATE videos SET {cols} WHERE id=?", (*fields.values(), vid))
+
+
+def mark_if(conn, vid: int, from_stages: Iterable[str], stage: str, **fields) -> bool:
+    """Like mark, but only while the row is still in one of from_stages."""
+    from_stages = tuple(from_stages)
+    fields["stage"] = stage
+    fields["updated_at"] = time.time()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    marks = ",".join("?" * len(from_stages))
+    return conn.execute(f"UPDATE videos SET {cols} WHERE id=? AND stage IN ({marks})",
+                        (*fields.values(), vid, *from_stages)).rowcount == 1
 
 
 def get(conn, vid: int):

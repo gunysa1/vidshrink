@@ -65,18 +65,22 @@ def score(size: int, probe: Probe, ratio: float, speed: float) -> float:
     return saved_gb / max(hours, 1e-6)
 
 
+RESCORABLE = ("probed", "queued")
+
+
 def rescore(conn, cfg: Config) -> None:
     ratios = {f: ratio_for(conn, f) for f in DEFAULT_RATIO}
     speeds = {r: speed_for(conn, r) for r in DEFAULT_SPEED}
-    rows = db.rows_in(conn, "probed", "queued")
+    rows = db.rows_in(conn, *RESCORABLE)
     with db.transaction(conn):
         for row in rows:
+            # Guarded: a concurrent worker may have taken the row since it was read.
             probe = Probe.from_json(row["probe_json"])
             reason = skip_reason(row["path"], row["size"], probe, cfg)
             if reason:
-                db.mark(conn, row["id"], "skipped", reason=reason, score=None)
+                db.mark_if(conn, row["id"], RESCORABLE, "skipped", reason=reason, score=None)
                 continue
             family = codec_family(probe.codec)
             res = resolution_class(probe.width, probe.height)
-            db.mark(conn, row["id"], "queued",
-                    score=score(row["size"], probe, ratios[family], speeds[res]))
+            db.mark_if(conn, row["id"], RESCORABLE, "queued",
+                       score=score(row["size"], probe, ratios[family], speeds[res]))
