@@ -47,10 +47,10 @@ def build_command(src: Path, out: Path, probe: Probe, cfg: Config) -> list[str]:
         "-map", "0", "-map", "-0:d",
         "-c", "copy",
         f"-c:v:{vi}", "libx265",
-        "-preset", cfg.preset,
-        "-crf", str(crf),
+        f"-preset:v:{vi}", cfg.preset,
+        f"-crf:v:{vi}", str(crf),
         f"-pix_fmt:v:{vi}", "yuv420p10le",
-        "-x265-params", x265_params(probe),
+        f"-x265-params:v:{vi}", x265_params(probe),
     ]
     subs = [s for s in probe.streams if s[0] == "subtitle"]
     for i, (_, codec, _) in enumerate(subs):

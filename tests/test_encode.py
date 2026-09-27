@@ -35,7 +35,7 @@ def test_command_uses_4k_crf_and_video_index(cfg, tmp_path):
     probe = replace(SDR, width=3840, height=2160, video_index=1)
     cmd = build_command(tmp_path / "s", tmp_path / "o.mkv", probe, cfg)
     assert cmd[cmd.index("-c:v:1") + 1] == "libx265"
-    assert cmd[cmd.index("-crf") + 1] == "24"
+    assert cmd[cmd.index("-crf:v:1") + 1] == "24"
 
 
 def _probe_file(path):
