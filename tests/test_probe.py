@@ -81,3 +81,12 @@ def test_run_ffprobe_fails_on_garbage(tmp_path):
     bad.write_bytes(b"not a video" * 100)
     with pytest.raises(ProbeError):
         run_ffprobe(str(bad))
+
+
+def test_run_ffprobe_handles_malformed_json(monkeypatch):
+    import subprocess as sp
+    import vidshrink.probe
+    monkeypatch.setattr(vidshrink.probe.subprocess, "run",
+                        lambda *args, **kwargs: sp.CompletedProcess(args=[], returncode=0, stdout="{not json", stderr=""))
+    with pytest.raises(ProbeError, match="bad ffprobe json"):
+        run_ffprobe("x")

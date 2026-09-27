@@ -124,4 +124,7 @@ def run_ffprobe(target: str) -> dict:
         raise ProbeError("ffprobe timed out") from None
     if res.returncode != 0:
         raise ProbeError(res.stderr.strip()[:300] or f"ffprobe exit {res.returncode}")
-    return json.loads(res.stdout)
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError as e:
+        raise ProbeError(f"bad ffprobe json: {e}") from None
