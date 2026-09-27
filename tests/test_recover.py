@@ -6,7 +6,7 @@ import pytest
 from vidshrink import db
 from vidshrink.budget import Budget
 from vidshrink.probe import Probe
-from vidshrink.rclone import Rclone
+from vidshrink.rclone import Rclone, RcloneError
 from vidshrink.worker import Worker
 
 PROBE = Probe(container="matroska,webm", duration=10.0, codec="h264", width=1920, height=1080,
@@ -102,3 +102,46 @@ def test_interrupted_upload(conn, cfg, setup):
     vid2 = row("f.mkv", "uploading", **SWAP_FIELDS)
     worker.recover()
     assert db.get(conn, vid2)["stage"] == "queued"
+
+
+def test_swap_transient_rclone_error_stays_swapping(conn, cfg, setup, monkeypatch):
+    root, worker, row = setup
+    (root / "e.avi").write_bytes(b"old")
+    (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
+    vid = row("e.avi", "swapping", final_path="e.mkv", **SWAP_FIELDS)
+    (cfg.workdir / f"{vid}.out.mkv").write_bytes(NEW)
+
+    def raise_err(path):
+        raise RcloneError(1, "connection reset")
+
+    monkeypatch.setattr(worker.rclone, "exists", raise_err)
+    worker.recover()
+
+    r = db.get(conn, vid)
+    assert r["stage"] == "swapping" and r["reason"].startswith("swap:")
+    assert (cfg.workdir / f"{vid}.out.mkv").exists()
+    assert (root / "e.avi").read_bytes() == b"old"
+    assert (root / "e.vidshrink-tmp.mkv").read_bytes() == NEW
+
+
+def test_swap_original_different_ext_only_tmp_present(conn, setup):
+    root, worker, row = setup
+    (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
+    vid = row("e.avi", "swapping", final_path="e.mkv", **SWAP_FIELDS)
+    worker.recover()
+    assert sorted(p.name for p in root.iterdir()) == ["e.mkv"]
+    assert (root / "e.mkv").read_bytes() == NEW
+    assert db.get(conn, vid)["stage"] == "done"
+
+
+def test_swap_target_taken_during_recovery(conn, setup):
+    root, worker, row = setup
+    (root / "e.avi").write_bytes(b"old original")
+    (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
+    (root / "e.mkv").write_bytes(b"foreign content")
+    vid = row("e.avi", "swapping", final_path="e.mkv", **SWAP_FIELDS)
+    worker.recover()
+    r = db.get(conn, vid)
+    assert r["stage"] == "failed" and r["reason"].startswith("swap:")
+    assert (root / "e.avi").read_bytes() == b"old original"
+    assert (root / "e.mkv").read_bytes() == b"foreign content"

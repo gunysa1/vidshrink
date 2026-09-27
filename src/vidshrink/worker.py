@@ -243,7 +243,11 @@ class Worker:
         for row in db.rows_in(self.conn, "swapping"):
             try:
                 self._swap(row)
-            except (SwapError, RcloneError) as e:
+            except SwapError as e:
                 db.mark(self.conn, row["id"], "failed", reason=f"swap: {e}"[:500])
                 self._cleanup(row["id"])
                 self.log(f"SWAP FAILED, needs attention: {row['path']}: {e}")
+            except RcloneError as e:
+                db.mark(self.conn, row["id"], "swapping", reason=f"swap: {e}"[:500])
+                self.log(f"swap could not be checked (rclone error), "
+                         f"will retry on next start: {row['path']}: {e}")
