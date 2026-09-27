@@ -1,0 +1,166 @@
+import sqlite3
+import time
+from collections.abc import Iterable
+from contextlib import contextmanager
+from pathlib import Path
+
+IN_PROGRESS = ("downloading", "encoding", "verifying", "uploading", "swapping")
+_GONE_ELIGIBLE = ("unprobed", "probed", "queued", "skipped", "probe_failed")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS videos (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    size INTEGER NOT NULL,
+    modtime TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT 'unprobed',
+    probe_json TEXT,
+    score REAL,
+    reason TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    out_size INTEGER,
+    out_md5 TEXT,
+    final_path TEXT,
+    encode_secs REAL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS videos_stage_score ON videos(stage, score DESC);
+CREATE TABLE IF NOT EXISTS learned (key TEXT PRIMARY KEY, total REAL NOT NULL, n INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS uploads (day TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
+def connect(path: Path | str) -> sqlite3.Connection:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, isolation_level=None, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript(SCHEMA)
+    return conn
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection):
+    conn.execute("BEGIN")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+def upsert_listing(conn, path: str, size: int, modtime: str) -> None:
+    row = conn.execute(
+        "SELECT size, modtime, stage, out_size FROM videos WHERE path=?", (path,)
+    ).fetchone()
+    now = time.time()
+    if row is None:
+        conn.execute(
+            "INSERT INTO videos (path, size, modtime, updated_at) VALUES (?, ?, ?, ?)",
+            (path, size, modtime, now),
+        )
+        return
+    if row["stage"] == "done" and row["out_size"] == size:
+        return
+    if row["stage"] in IN_PROGRESS or row["stage"] == "ready":
+        return
+    if (row["size"], row["modtime"]) != (size, modtime):
+        conn.execute(
+            "UPDATE videos SET size=?, modtime=?, stage='unprobed', probe_json=NULL,"
+            " score=NULL, reason=NULL, attempts=0, updated_at=? WHERE path=?",
+            (size, modtime, now, path),
+        )
+
+
+def mark_gone(conn, seen: Iterable[str]) -> int:
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS seen (path TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM seen")
+    conn.executemany("INSERT OR IGNORE INTO seen VALUES (?)", ((p,) for p in seen))
+    marks = ",".join("?" * len(_GONE_ELIGIBLE))
+    cur = conn.execute(
+        f"UPDATE videos SET stage='gone', updated_at=? WHERE stage IN ({marks})"
+        " AND path NOT IN (SELECT path FROM seen)",
+        (time.time(), *_GONE_ELIGIBLE),
+    )
+    return cur.rowcount
+
+
+def save_probe(conn, path: str, probe_json: str) -> None:
+    conn.execute(
+        "UPDATE videos SET probe_json=?, stage='probed', reason=NULL, updated_at=? WHERE path=?",
+        (probe_json, time.time(), path),
+    )
+
+
+def mark(conn, vid: int, stage: str, **fields) -> None:
+    fields["stage"] = stage
+    fields["updated_at"] = time.time()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE videos SET {cols} WHERE id=?", (*fields.values(), vid))
+
+
+def get(conn, vid: int):
+    return conn.execute("SELECT * FROM videos WHERE id=?", (vid,)).fetchone()
+
+
+def get_by_path(conn, path: str):
+    return conn.execute("SELECT * FROM videos WHERE path=?", (path,)).fetchone()
+
+
+def rows_in(conn, *stages: str) -> list:
+    marks = ",".join("?" * len(stages))
+    return conn.execute(
+        f"SELECT * FROM videos WHERE stage IN ({marks})"
+        " ORDER BY score IS NULL, score DESC, id",
+        stages,
+    ).fetchall()
+
+
+def next_queued(conn):
+    return conn.execute(
+        "SELECT * FROM videos WHERE stage='queued' ORDER BY score DESC, id LIMIT 1"
+    ).fetchone()
+
+
+def learn(conn, key: str, value: float) -> None:
+    conn.execute(
+        "INSERT INTO learned (key, total, n) VALUES (?, ?, 1)"
+        " ON CONFLICT(key) DO UPDATE SET total=total+excluded.total, n=n+1",
+        (key, value),
+    )
+
+
+def learned_mean(conn, key: str, default: float) -> float:
+    row = conn.execute("SELECT total, n FROM learned WHERE key=?", (key,)).fetchone()
+    if row is None:
+        return default
+    return (default + row["total"]) / (1 + row["n"])
+
+
+def kv_get(conn, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    return default if row is None else row["value"]
+
+
+def kv_set(conn, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES (?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def upload_bytes(conn, day: str) -> int:
+    row = conn.execute("SELECT bytes FROM uploads WHERE day=?", (day,)).fetchone()
+    return 0 if row is None else row["bytes"]
+
+
+def add_upload_bytes(conn, day: str, n: int) -> None:
+    conn.execute(
+        "INSERT INTO uploads (day, bytes) VALUES (?, ?)"
+        " ON CONFLICT(day) DO UPDATE SET bytes=bytes+excluded.bytes",
+        (day, n),
+    )
