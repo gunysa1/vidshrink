@@ -298,3 +298,21 @@ def test_run_stops_after_consecutive_upload_failures(conn, env, monkeypatch):
     # The encoded row keeps its output for later; the other was never started.
     assert len(db.rows_in(conn, "ready")) == 1 and len(db.rows_in(conn, "queued")) == 1
     assert sorted(p.name for p in (root / "Movies").iterdir()) == ["a.mkv", "b.mp4"]
+
+
+def test_checksum_mismatch_after_upload(conn, cfg, env, monkeypatch):
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    worker.prepare(db.get_by_path(conn, "Movies/b.mp4"))
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    assert row["stage"] == "ready"
+    out = cfg.workdir / f"{row['id']}.out.mkv"
+    output = out.read_bytes()
+    original = (root / "Movies" / "b.mp4").read_bytes()
+    monkeypatch.setattr(worker.rclone, "md5", lambda path: "0" * 32)
+    assert worker.upload_and_swap(row, dry_run=False) is False
+    assert sorted(p.name for p in (root / "Movies").iterdir()) == ["a.mkv", "b.mp4"]
+    assert (root / "Movies" / "b.mp4").read_bytes() == original
+    r = db.get_by_path(conn, "Movies/b.mp4")
+    assert (r["stage"], r["reason"], r["attempts"]) == ("ready", "checksum mismatch after upload", 1)
+    assert out.read_bytes() == output
