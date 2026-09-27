@@ -109,4 +109,8 @@ def serve_http(rclone: Rclone, port: int):
         yield f"http://127.0.0.1:{port}/"
     finally:
         proc.terminate()
-        proc.wait(timeout=10)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
