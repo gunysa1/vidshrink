@@ -1,0 +1,127 @@
+import json
+import posixpath
+import random
+import socket
+import subprocess
+import time
+from collections.abc import Callable, Sequence
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TypeVar
+
+T = TypeVar("T")
+TMP_SUFFIX = ".vidshrink-tmp.mkv"
+# "Received upload limit error" is what rclone 1.60 logs when --drive-stop-on-upload-limit
+# turns Drive's daily-limit 403 into a fatal error.
+RATE_LIMIT_MARKERS = ("userRateLimitExceeded", "uploadLimitExceeded", "User rate limit exceeded",
+                      "Received upload limit error")
+
+
+class RcloneError(Exception):
+    def __init__(self, code: int, stderr: str):
+        super().__init__(f"rclone exit {code}: {stderr.strip()[-500:]}")
+        self.code = code
+        self.stderr = stderr
+
+    @property
+    def rate_limited(self) -> bool:
+        return any(m in self.stderr for m in RATE_LIMIT_MARKERS)
+
+
+class Rclone:
+    def __init__(self, remote: str, extra_args: Sequence[str] = (), binary: str = "rclone"):
+        self.remote = remote
+        self.extra_args = list(extra_args)
+        self.binary = binary
+
+    def _p(self, path: str) -> str:
+        return self.remote + path
+
+    def _run(self, *args: str) -> str:
+        res = subprocess.run([self.binary, *args, *self.extra_args],
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RcloneError(res.returncode, res.stderr)
+        return res.stdout
+
+    def list_videos(self, extensions: Sequence[str]) -> list[dict]:
+        pattern = "*.{" + ",".join(extensions) + "}"
+        out = self._run("lsjson", "-R", "--files-only", "--no-mimetype",
+                        "--ignore-case", "--include", pattern, self.remote)
+        # Our own upload temp files are not videos to shrink.
+        return [e for e in json.loads(out) if not e["Path"].endswith(TMP_SUFFIX)]
+
+    def download(self, path: str, local: Path) -> None:
+        self._run("copyto", self._p(path), str(local))
+
+    def upload(self, local: Path, path: str) -> None:
+        self._run("copyto", str(local), self._p(path))
+
+    def delete(self, path: str) -> None:
+        self._run("deletefile", self._p(path))
+
+    def move(self, src: str, dst: str) -> None:
+        self._run("moveto", self._p(src), self._p(dst))
+
+    def entries(self, path: str) -> list[dict]:
+        """All files in path's folder named like path (Drive allows duplicate names)."""
+        parent, name = posixpath.split(path)
+        try:
+            out = self._run("lsjson", "--files-only", "--no-mimetype", self._p(parent))
+        except RcloneError as e:
+            if e.code == 3 or "directory not found" in e.stderr:
+                return []
+            raise
+        return [e for e in json.loads(out) if e["Name"] == name]
+
+    def exists(self, path: str) -> bool:
+        return bool(self.entries(path))
+
+    def md5(self, path: str) -> str | None:
+        out = self._run("md5sum", self._p(path)).split()
+        return out[0] if out else None
+
+
+def with_retries(fn: Callable[[], T], attempts: int, base_delay: float,
+                 sleep: Callable[[float], None] = time.sleep) -> T:
+    for i in range(attempts):
+        try:
+            return fn()
+        except RcloneError as e:
+            if e.rate_limited or i == attempts - 1:
+                raise
+            sleep(base_delay * 2 ** i + random.uniform(0, base_delay))
+    raise AssertionError("unreachable")
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@contextmanager
+def serve_http(rclone: Rclone, port: int):
+    proc = subprocess.Popen(
+        [rclone.binary, "serve", "http", rclone.remote, "--addr", f"127.0.0.1:{port}",
+         "--read-only", "--tpslimit", "10", *rclone.extra_args],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                break
+            except OSError:
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    raise RcloneError(proc.returncode or 1, "rclone serve http did not start")
+                time.sleep(0.2)
+        yield f"http://127.0.0.1:{port}/"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()

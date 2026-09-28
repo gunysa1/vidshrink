@@ -1,0 +1,28 @@
+[project]
+name = "vidshrink"
+version = "0.1.0"
+description = "Re-encode Google Drive videos to HEVC to save space"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+vidshrink = "vidshrink.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The CLI end-to-end test exercises the real (non-test-tuned) disk-space check,
+# which needs ~20 GB free. Pytest's default tmp_path lives under the system
+# temp dir, which on this host is a small tmpfs; point it at the real disk
+# instead so the check sees the same free space vidshrink would see in
+# production.
+addopts = "--basetemp=.pytest-tmp"
