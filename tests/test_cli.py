@@ -50,3 +50,12 @@ def test_status_report_lists_dry_run_uploads(cfg, conn):
     assert "Dry-run uploads to review (2):" in report
     assert "Movies/a.mkv -> Movies/a.vidshrink-tmp.mkv" in report
     assert "TV/S1/e.avi -> TV/S1/e.vidshrink-tmp.mkv" in report
+
+
+def test_status_shows_download_budget(conn, cfg):
+    downloads = Budget(conn, cfg.daily_download_limit, kind="download")
+    downloads.add(42 * 10**9)
+    out = status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))
+    assert "Downloaded today: 42 / 500 GB" in out and "PAUSED" not in out
+    downloads.block(3600)
+    assert "PAUSED" in status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))

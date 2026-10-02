@@ -316,3 +316,43 @@ def test_checksum_mismatch_after_upload(conn, cfg, env, monkeypatch):
     r = db.get_by_path(conn, "Movies/b.mp4")
     assert (r["stage"], r["reason"], r["attempts"]) == ("ready", "checksum mismatch after upload", 1)
     assert out.read_bytes() == output
+
+
+def test_download_budget_counts_downloads(conn, env):
+    _, worker = env
+    worker.run(limit=1)
+    row = db.rows_in(conn, "done")[0]
+    assert worker.download_budget.used() == row["size"]
+
+
+def test_download_budget_exhausted_waits_without_downloading(conn, env):
+    _, worker = env
+    worker.download_budget.add(worker.cfg.daily_download_limit)
+    slept = []
+
+    def sleep(s):
+        slept.append(s)
+        raise KeyboardInterrupt
+
+    worker.sleep = sleep
+    with pytest.raises(KeyboardInterrupt):
+        worker.run()
+    assert slept and slept[0] > 0
+    assert len(db.rows_in(conn, "queued")) == 2  # nothing downloaded
+
+
+def test_download_quota_error_blocks_downloads_without_burning_attempts(conn, env, monkeypatch):
+    from vidshrink.rclone import RcloneError
+    _, worker = env
+
+    def quota(path, local):
+        raise RcloneError(1, "googleapi: Error 403: The download quota for this file has "
+                             "been exceeded., downloadQuotaExceeded")
+
+    monkeypatch.setattr(worker.rclone, "download", quota)
+    worker.sleep = lambda s: (_ for _ in ()).throw(KeyboardInterrupt)
+    with pytest.raises(KeyboardInterrupt):
+        worker.run()
+    rows = db.rows_in(conn, "queued")
+    assert len(rows) == 2 and all(r["attempts"] == 0 for r in rows)
+    assert not worker.download_budget.allows(1)

@@ -8,7 +8,7 @@ from vidshrink import db, scorer
 from vidshrink.budget import Budget
 from vidshrink.config import Config
 from vidshrink.probe import Probe
-from vidshrink.rclone import Rclone, free_port, serve_http
+from vidshrink.rclone import Rclone, free_port, serve_http, served_stats
 from vidshrink.scanner import http_prober, scan
 from vidshrink.worker import Worker, tmp_path
 
@@ -62,6 +62,10 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
 
     lines.append(f"Uploaded today ({budget.day()} Pacific): "
                  f"{budget.used() / 1e9:.0f} / {budget.limit / 1e9:.0f} GB")
+    downloads = Budget(conn, cfg.daily_download_limit, budget.now, kind="download")
+    paused = " (PAUSED: Drive download quota hit)" if downloads.blocked() else ""
+    lines.append(f"Downloaded today: {downloads.used() / 1e9:.0f} / "
+                 f"{downloads.limit / 1e9:.0f} GB{paused}")
     return "\n".join(lines)
 
 
@@ -92,8 +96,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "scan":
         cfg = replace(cfg, probe_workers=args.workers)
-        with serve_http(rclone, free_port()) as url:
-            counts = scan(conn, rclone, cfg, http_prober(url), log=_log)
+        rc_port = free_port()
+        downloads = Budget(conn, cfg.daily_download_limit, kind="download")
+        with serve_http(rclone, free_port(), rc_port=rc_port, serve_args=cfg.serve_args) as url:
+            counts = scan(conn, rclone, cfg, http_prober(url), log=_log,
+                          download_budget=downloads, stats=lambda: served_stats(rc_port))
         _log(f"scan finished: {counts}")
     elif args.cmd == "run":
         n = Worker(conn, rclone, cfg, budget, log=_log).run(limit=args.limit, dry_run=args.dry_run)

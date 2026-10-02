@@ -59,12 +59,17 @@ class Worker:
     def __init__(self, conn, rclone: Rclone, cfg: Config, budget: Budget,
                  sleep: Callable[[float], None] = time.sleep,
                  log: Callable[[str], None] = print,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 download_budget: Budget | None = None):
         self.conn = conn
         self.clock = clock
         self.rclone = rclone
         self.cfg = cfg
         self.budget = budget
+        # Whole-file downloads count against Drive's daily download quota, which the
+        # Plex mount on the same account also needs.
+        self.download_budget = download_budget or Budget(
+            conn, cfg.daily_download_limit, budget.now, kind="download")
         self.sleep = sleep
         self.log = log
         self.failures = 0  # consecutive prepare/upload failures with no success between
@@ -124,14 +129,20 @@ class Worker:
                         done += 1
                     continue
                 row = db.next_queued(self.conn) if len(ready) < self.cfg.max_ready else None
-                if row is not None:
+                if row is not None and self.download_budget.allows(row["size"]):
                     self.prepare(row)
                     continue
-                if not ready:
+                if not ready and row is None:
                     break
-                wait = self.budget.seconds_until_reset()
-                self.log(f"upload budget used up; sleeping {wait / 3600:.1f} h")
-                self.sleep(wait)
+                waits = {}
+                if ready:
+                    waits["upload"] = self.budget.seconds_until_reset()
+                if row is not None:
+                    waits["download"] = self.download_budget.seconds_until_reset()
+                kind = min(waits, key=waits.get)
+                self.log(f"{' and '.join(waits)} budget used up; "
+                         f"sleeping {waits[kind] / 3600:.1f} h")
+                self.sleep(waits[kind])
             return done
 
     def _wait_for_disk(self, size: int) -> None:
@@ -156,6 +167,7 @@ class Worker:
             self.log(f"downloading {path} ({row['size'] / 1e9:.1f} GB)")
             db.mark(self.conn, vid, "downloading")
             self._retry(lambda: self.rclone.download(path, src))
+            self.download_budget.add(row["size"])
             if src.stat().st_size != row["size"]:
                 self._cleanup(vid)
                 db.mark(self.conn, vid, "unprobed", reason="changed since scan",
@@ -193,6 +205,14 @@ class Worker:
             db.mark(self.conn, vid, "queued")
             raise
         except (RcloneError, EncodeError, ProbeError, OSError) as e:
+            if isinstance(e, RcloneError) and e.download_quota:
+                # Not this file's fault: pause all downloads, keep the file queued.
+                self._cleanup(vid)
+                self.download_budget.block(self.cfg.download_block_secs)
+                db.mark(self.conn, vid, "queued")
+                self.log("Drive download quota exceeded; pausing downloads "
+                         f"for {self.cfg.download_block_secs / 3600:.0f} h")
+                return
             self._fail(row, str(e))
             return
         self._cleanup(vid, keep_output=True)

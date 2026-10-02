@@ -37,6 +37,23 @@ rclone dedupe --dedupe-mode list gdrive:
 .venv/bin/vidshrink run --limit 10          # replace 10 files
 ```
 
+
+## Drive download quota (shared with Plex)
+
+Google limits how much one account can download per day, and the Plex `rclone mount`
+uses the same account. vidshrink therefore caps its own downloads at
+`daily_download_limit` (500 GB per Pacific day by default):
+
+- `scan` reads only what ffprobe asks for (1 MB chunks, no read-ahead), measures the
+  bytes actually served, and stops when the cap is reached, leaving the rest for the
+  next scan.
+- `run` charges each whole-file download to the same cap and waits for the next day
+  when it is used up.
+- If Drive answers `downloadQuotaExceeded`, both stop downloading for 12 h.
+
+`vidshrink status` shows "Downloaded today". In September 2026 an uncapped scan used up
+the quota and locked Plex out for about a day.
+
 ## Service
 
 ```bash

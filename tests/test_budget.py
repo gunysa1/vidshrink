@@ -50,3 +50,16 @@ def test_block_overrides_budget(conn):
     assert b.seconds_until_reset() == 6 * 3600
     clock.t += 6 * 3600
     assert b.allows(1)
+
+
+def test_download_budget_is_separate_from_uploads(conn):
+    clock = Clock(noon())
+    up = Budget(conn, 100, clock)
+    down = Budget(conn, 50, clock, kind="download")
+    up.add(100)
+    assert down.used() == 0 and down.allows(50)
+    down.add(50)
+    assert up.used() == 100 and not down.allows(1)
+    down.block(3600)
+    assert down.seconds_until_reset() == 3600
+    assert up.seconds_until_reset() == 12 * 3600  # upload block untouched
