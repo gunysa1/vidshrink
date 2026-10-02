@@ -28,7 +28,8 @@ def setup_drive(cfg, make_clip):
 def test_scan_probes_scores_and_skips(conn, cfg, make_clip):
     root = setup_drive(cfg, make_clip)
     counts = scan(conn, Rclone(cfg.remote), cfg, local_prober(root), log=lambda s: None)
-    assert counts == {"listed": 4, "gone": 0, "probed": 2, "probe_failed": 1, "excluded": 1}
+    assert counts == {"listed": 4, "gone": 0, "probed": 2, "probe_failed": 1, "excluded": 1,
+                      "stopped": None}
     assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "queued"
     assert db.get_by_path(conn, "Movies/b.mkv")["stage"] == "skipped"
     assert db.get_by_path(conn, "Torrent/c.mkv")["stage"] == "skipped"
@@ -118,3 +119,65 @@ def test_rescan_retries_probe_failures(conn, cfg, make_clip):
     counts = scan(conn, rc, cfg, local, log=lambda s: None)
     assert db.get_by_path(conn, "Movies/a.mkv")["stage"] == "queued"
     assert counts["probed"] == 1 and counts["probe_failed"] == 1  # a.mkv now; broken.mkv again
+
+
+class FakeStats:
+    """Pretends each probe downloads `per_probe` bytes; optionally reports a quota error."""
+
+    def __init__(self, counter, per_probe, quota_after=None):
+        self.counter, self.per_probe, self.quota_after = counter, per_probe, quota_after
+
+    def __call__(self):
+        n = len(self.counter)
+        err = ("googleapi: Error 403: downloadQuotaExceeded"
+               if self.quota_after is not None and n >= self.quota_after else "")
+        return {"bytes": n * self.per_probe, "lastError": err}
+
+
+def counting_prober(root, calls):
+    inner = local_prober(root)
+
+    def probe(path, size):
+        calls.append(path)
+        return inner(path, size)
+    return probe
+
+
+def five_clips(cfg, make_clip):
+    root = Path(cfg.remote.rstrip("/"))
+    clip = make_clip("h264")
+    for i in range(5):
+        shutil.copy(clip, root / f"m{i}.mkv")
+    return root
+
+
+def test_scan_stops_at_download_budget(conn, cfg, make_clip):
+    from dataclasses import replace
+    from vidshrink.budget import Budget
+    root = five_clips(cfg, make_clip)
+    cfg = replace(cfg, scan_batch=1, probe_workers=1)
+    calls = []
+    budget = Budget(conn, 250, kind="download")
+    counts = scan(conn, Rclone(cfg.remote), cfg, counting_prober(root, calls),
+                  log=lambda s: None, download_budget=budget, stats=FakeStats(calls, 100))
+    assert len(calls) == 3  # 100, 200, then 300 > 250 stops before the 4th
+    assert counts["stopped"] == "download budget"
+    assert budget.used() == 300
+    assert len(db.rows_in(conn, "unprobed")) == 2  # left for the next scan
+    assert len(db.rows_in(conn, "queued")) == 3    # what was probed still gets ranked
+
+
+def test_scan_stops_and_blocks_on_download_quota(conn, cfg, make_clip):
+    from dataclasses import replace
+    from vidshrink.budget import Budget
+    root = five_clips(cfg, make_clip)
+    cfg = replace(cfg, scan_batch=1, probe_workers=1)
+    calls = []
+    budget = Budget(conn, 10**12, kind="download")
+    counts = scan(conn, Rclone(cfg.remote), cfg, counting_prober(root, calls),
+                  log=lambda s: None, download_budget=budget,
+                  stats=FakeStats(calls, 10, quota_after=2))
+    assert len(calls) == 2
+    assert counts["stopped"] == "download quota"
+    assert not budget.allows(1)
+    assert budget.seconds_until_reset() > 11 * 3600

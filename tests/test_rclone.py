@@ -124,3 +124,34 @@ def test_default_rclone_args_are_pinned_and_accepted(tmp_path):
     (tmp_path / "v.mkv").write_bytes(b"x")
     rc = Rclone(str(tmp_path) + "/", args)  # the installed rclone must accept every flag
     assert [e["Path"] for e in rc.list_videos(["mkv"])] == ["v.mkv"]
+
+
+def test_download_quota_detection():
+    err = RcloneError(1, "googleapi: Error 403: The download quota for this file has been "
+                         "exceeded., downloadQuotaExceeded")
+    assert err.download_quota and not err.rate_limited
+    assert not RcloneError(1, "connection reset").download_quota
+
+
+def test_serve_http_reports_served_bytes(rc):
+    from vidshrink.rclone import served_stats
+    rc_port = free_port()
+    with serve_http(rc, free_port(), rc_port=rc_port) as base:
+        req = urllib.request.Request(base + urllib.parse.quote("Movies/A [1080p]/a.mkv"),
+                                     headers={"Range": "bytes=0-99"})
+        assert len(urllib.request.urlopen(req).read()) == 100
+        stats = served_stats(rc_port)
+    assert stats["bytes"] == 100
+    assert "downloadQuotaExceeded" not in stats.get("lastError", "")
+
+
+def test_with_retries_does_not_retry_download_quota():
+    calls = []
+
+    def fn():
+        calls.append(1)
+        raise RcloneError(1, "Error 403: downloadQuotaExceeded")
+
+    with pytest.raises(RcloneError):
+        with_retries(fn, attempts=5, base_delay=0, sleep=lambda s: None)
+    assert len(calls) == 1

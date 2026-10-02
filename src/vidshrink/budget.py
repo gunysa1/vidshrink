@@ -9,25 +9,34 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 
 
 class Budget:
-    def __init__(self, conn, limit: int, now: Callable[[], float] = time.time):
+    """Bytes per Pacific day against a limit, for uploads or downloads (kept apart)."""
+
+    def __init__(self, conn, limit: int, now: Callable[[], float] = time.time,
+                 kind: str = "upload"):
         self.conn = conn
         self.limit = limit
         self.now = now
+        self.kind = kind
+        self._prefix = "" if kind == "upload" else f"{kind}:"
+        self._block_key = "blocked_until" if kind == "upload" else f"{kind}_blocked_until"
 
     def day(self) -> str:
         return datetime.fromtimestamp(self.now(), PACIFIC).date().isoformat()
 
     def used(self) -> int:
-        return db.upload_bytes(self.conn, self.day())
+        return db.upload_bytes(self.conn, self._prefix + self.day())
 
     def add(self, n: int) -> None:
-        db.add_upload_bytes(self.conn, self.day(), n)
+        db.add_upload_bytes(self.conn, self._prefix + self.day(), n)
 
     def block(self, seconds: float) -> None:
-        db.kv_set(self.conn, "blocked_until", str(self.now() + seconds))
+        db.kv_set(self.conn, self._block_key, str(self.now() + seconds))
 
     def _blocked_until(self) -> float:
-        return float(db.kv_get(self.conn, "blocked_until", "0"))
+        return float(db.kv_get(self.conn, self._block_key, "0"))
+
+    def blocked(self) -> bool:
+        return self.now() < self._blocked_until()
 
     def allows(self, n: int) -> bool:
         if self.now() < self._blocked_until():

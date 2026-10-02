@@ -4,6 +4,7 @@ import random
 import socket
 import subprocess
 import time
+import urllib.request
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,6 +12,8 @@ from typing import TypeVar
 
 T = TypeVar("T")
 TMP_SUFFIX = ".vidshrink-tmp.mkv"
+# Drive's daily download quota (shared with anything else on the account, e.g. Plex).
+DOWNLOAD_QUOTA_MARKER = "downloadQuotaExceeded"
 # "Received upload limit error" is what rclone 1.60 logs when --drive-stop-on-upload-limit
 # turns Drive's daily-limit 403 into a fatal error.
 RATE_LIMIT_MARKERS = ("userRateLimitExceeded", "uploadLimitExceeded", "User rate limit exceeded",
@@ -26,6 +29,10 @@ class RcloneError(Exception):
     @property
     def rate_limited(self) -> bool:
         return any(m in self.stderr for m in RATE_LIMIT_MARKERS)
+
+    @property
+    def download_quota(self) -> bool:
+        return DOWNLOAD_QUOTA_MARKER in self.stderr
 
 
 class Rclone:
@@ -88,7 +95,7 @@ def with_retries(fn: Callable[[], T], attempts: int, base_delay: float,
         try:
             return fn()
         except RcloneError as e:
-            if e.rate_limited or i == attempts - 1:
+            if e.rate_limited or e.download_quota or i == attempts - 1:
                 raise
             sleep(base_delay * 2 ** i + random.uniform(0, base_delay))
     raise AssertionError("unreachable")
@@ -101,10 +108,14 @@ def free_port() -> int:
 
 
 @contextmanager
-def serve_http(rclone: Rclone, port: int):
+def serve_http(rclone: Rclone, port: int, rc_port: int | None = None,
+               serve_args: Sequence[str] = ()):
+    """Read-only HTTP view of the remote. With rc_port, rclone's stats (bytes served,
+    last error) can be read with served_stats(rc_port)."""
+    rc = ["--rc", "--rc-addr", f"127.0.0.1:{rc_port}", "--rc-no-auth"] if rc_port else []
     proc = subprocess.Popen(
         [rclone.binary, "serve", "http", rclone.remote, "--addr", f"127.0.0.1:{port}",
-         "--read-only", "--tpslimit", "10", *rclone.extra_args],
+         "--read-only", "--tpslimit", "10", *serve_args, *rc, *rclone.extra_args],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
@@ -125,3 +136,12 @@ def serve_http(rclone: Rclone, port: int):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+def served_stats(rc_port: int) -> dict:
+    """rclone core/stats of a serve_http started with rc_port: 'bytes' read from the
+    remote so far and 'lastError'."""
+    req = urllib.request.Request(f"http://127.0.0.1:{rc_port}/core/stats", data=b"{}",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())

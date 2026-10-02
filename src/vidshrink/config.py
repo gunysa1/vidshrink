@@ -21,6 +21,10 @@ class Config:
     min_saving: float = 0.20
     daily_upload_limit: int = 700_000_000_000
     rate_limit_block_secs: float = 6 * 3600
+    # Drive's daily download quota is shared with the Plex mount on the same account;
+    # stay well under it. A downloadQuotaExceeded error pauses downloads for 12 h.
+    daily_download_limit: int = 500_000_000_000
+    download_block_secs: float = 12 * 3600
     max_ready: int = 2
     max_attempts: int = 2
     max_consecutive_failures: int = 5
@@ -35,4 +39,8 @@ class Config:
     # with_retries (not rclone's) owns retrying.
     rclone_args: tuple[str, ...] = ("--drive-chunk-size", "64M", "--drive-use-trash=true",
                                     "--drive-stop-on-upload-limit", "--retries", "1")
-    probe_workers: int = 8
+    probe_workers: int = 4
+    scan_batch: int = 100
+    # serve http reads only what ffprobe asks for (defaults buffer 16M / chunk 128M).
+    serve_args: tuple[str, ...] = ("--buffer-size", "0", "--vfs-read-chunk-size", "1M",
+                                   "--vfs-read-chunk-size-limit", "1M")
