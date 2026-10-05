@@ -9,6 +9,7 @@ from vidshrink import db, scorer
 from vidshrink.budget import Budget
 from vidshrink.config import Config
 from vidshrink.encode import EncodeError, build_command, run_encode
+from vidshrink.jobs import BUSY_STAGES, PC_SEEN_KEY, JobStore
 from vidshrink.paths import final_path, md5_file, tmp_path  # re-exported for callers/tests
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
 from vidshrink.rclone import Rclone, RcloneError, with_retries
@@ -55,6 +56,7 @@ class Worker:
             conn, cfg.daily_download_limit, budget.now, kind="download")
         self.sleep = sleep
         self.log = log
+        self.jobs = JobStore(conn, cfg, rclone, now=budget.now, log=log)
         self.failures = 0  # consecutive prepare/upload failures with no success between
 
     # --- work files -------------------------------------------------------
@@ -93,6 +95,60 @@ class Worker:
             if shutil.which(tool) is None:
                 raise RuntimeError(f"required tool not found on PATH: {tool}")
 
+    def _pc_active(self) -> bool:
+        seen = float(db.kv_get(self.conn, PC_SEEN_KEY, "0"))
+        return self.budget.now() - seen < self.cfg.pc_absent_days * 86400
+
+    def _next_job(self):
+        """Best queued row for the server, leaving long jobs to the PC while it's
+        around, and skipping rows that share a final_path/tmp_path stem with another
+        row currently busy (so the two can't race over the same remote file)."""
+        pc_active = self._pc_active()
+        busy = {final_path(r["path"]) for r in db.rows_in(self.conn, *BUSY_STAGES)}
+        for row in self.conn.execute(
+                "SELECT * FROM videos WHERE stage='queued' ORDER BY score DESC, id LIMIT 500"):
+            if final_path(row["path"]) in busy:
+                continue
+            if pc_active:
+                probe = Probe.from_json(row["probe_json"])
+                if not probe.is_hdr and \
+                        scorer.expected_hours(self.conn, probe) > self.cfg.pc_handover_hours:
+                    continue
+            return row
+        return None
+
+    def _finish_remote(self, row) -> bool:
+        """Verify a PC upload on Drive against its report, then swap like our own."""
+        vid, tmp = row["id"], tmp_path(row["path"])
+        try:
+            found = self.rclone.entries(tmp)
+            ok = (len(found) == 1 and found[0]["Size"] == row["out_size"]
+                  and self.rclone.md5(tmp) == row["out_md5"])
+        except RcloneError as e:
+            self.log(f"could not check PC upload {tmp}, will retry: {e}")
+            return False
+        if not ok:
+            try:
+                if found:
+                    self.rclone.delete(tmp)
+            except RcloneError:
+                pass
+            self._fail(row, "PC upload on Drive doesn't match what the PC reported")
+            return False
+        db.mark(self.conn, vid, "swapping")
+        try:
+            self._swap(db.get(self.conn, vid))
+        except (SwapError, RcloneError) as e:
+            db.mark(self.conn, vid, "swapping", reason=f"swap: {e}"[:500])
+            self.log(f"SWAP FAILED, will retry: {row['path']}: {e}")
+            return False
+        self.failures = 0
+        return True
+
+    def _pc_holds_work(self) -> bool:
+        return bool(db.rows_in(self.conn, "leased", "remote_ready")) or (
+            self._pc_active() and db.next_queued(self.conn) is not None)
+
     # --- main loop ---------------------------------------------------------
     def run(self, limit: int | None = None, dry_run: bool = False) -> int:
         self._check_tools()
@@ -109,17 +165,27 @@ class Worker:
                         and db.rows_in(self.conn, "swapping")):
                     done += self._reconcile_swaps()
                     last_reconcile = self.clock()
+                self.jobs.expire_leases()
+                if not dry_run:
+                    remote = db.rows_in(self.conn, "remote_ready")
+                    if remote:
+                        if self._finish_remote(remote[0]):
+                            done += 1
+                        continue
                 ready = db.rows_in(self.conn, "ready")
                 if ready and self.budget.allows(ready[0]["out_size"]):
                     if self.upload_and_swap(ready[0], dry_run):
                         done += 1
                     continue
-                row = db.next_queued(self.conn) if len(ready) < self.cfg.max_ready else None
+                row = self._next_job() if len(ready) < self.cfg.max_ready else None
                 if row is not None and self.download_budget.allows(row["size"]):
                     self.prepare(row)
                     continue
                 if not ready and row is None:
-                    break
+                    if dry_run or not self._pc_holds_work():
+                        break
+                    self.sleep(self.cfg.idle_poll_secs)
+                    continue
                 waits = {}
                 if ready:
                     waits["upload"] = self.budget.seconds_until_reset()
@@ -151,7 +217,9 @@ class Worker:
                 return
             self._wait_for_disk(row["size"])
             self.log(f"downloading {path} ({row['size'] / 1e9:.1f} GB)")
-            db.mark(self.conn, vid, "downloading")
+            if not db.mark_if(self.conn, vid, ("queued",), "downloading", encoder="x265"):
+                self.log(f"skipping {path}: no longer queued (leased to another worker?)")
+                return
             self._retry(lambda: self.rclone.download(path, src))
             self.download_budget.add(row["size"])
             if src.stat().st_size != row["size"]:

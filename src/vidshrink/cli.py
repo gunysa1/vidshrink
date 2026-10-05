@@ -7,6 +7,7 @@ from pathlib import Path
 from vidshrink import db, scorer
 from vidshrink.budget import Budget
 from vidshrink.config import Config
+from vidshrink.jobs import PC_SEEN_KEY
 from vidshrink.probe import Probe
 from vidshrink.rclone import Rclone, free_port, serve_http, served_stats
 from vidshrink.scanner import http_prober, scan
@@ -59,6 +60,22 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
         lines.append(f"Dry-run uploads to review ({len(dry)}):")
         for row in sorted(dry, key=lambda r: r["path"]):
             lines.append(f"  {row['path']} -> {tmp_path(row['path'])}")
+
+    leased = db.rows_in(conn, "leased")
+    if leased:
+        lines.append(f"With the PC ({len(leased)}):")
+        for row in leased:
+            left = max(0, (row["lease_until"] or 0) - budget.now()) / 60
+            lines.append(f"  {row['path']} ({row['worker']}, lease {left:.0f} min left)")
+    remote = db.rows_in(conn, "remote_ready")
+    if remote:
+        lines.append(f"PC results waiting for the server ({len(remote)}):")
+        for row in remote:
+            lines.append(f"  {row['path']}")
+    seen = db.kv_get(conn, PC_SEEN_KEY)
+    if seen:
+        ago = (budget.now() - float(seen)) / 3600
+        lines.append(f"PC last seen: {ago:.1f} h ago")
 
     lines.append(f"Uploaded today ({budget.day()} Pacific): "
                  f"{budget.used() / 1e9:.0f} / {budget.limit / 1e9:.0f} GB")
