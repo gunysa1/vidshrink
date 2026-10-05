@@ -5,8 +5,12 @@ from contextlib import contextmanager
 from pathlib import Path
 
 IN_PROGRESS = ("downloading", "encoding", "verifying", "uploading", "swapping")
+REMOTE_STAGES = ("leased", "remote_ready")
 DUPLICATE_REASON = "duplicate name on Drive"
 _GONE_ELIGIBLE = ("unprobed", "probed", "queued", "skipped", "probe_failed")
+# Columns added after the first release; connect() adds any that are missing.
+MIGRATIONS = (("worker", "TEXT"), ("lease_until", "REAL"), ("encoder", "TEXT"),
+              ("remote_md5", "TEXT"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
@@ -39,6 +43,10 @@ def connect(path: Path | str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(videos)")}
+    for name, kind in MIGRATIONS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE videos ADD COLUMN {name} {kind}")
     return conn
 
 
@@ -68,7 +76,7 @@ def upsert_listing(conn, path: str, size: int, modtime: str) -> None:
         return
     if row["stage"] == "done" and row["out_size"] == size:
         return
-    if row["stage"] in IN_PROGRESS or row["stage"] == "ready":
+    if row["stage"] in IN_PROGRESS or row["stage"] in REMOTE_STAGES or row["stage"] == "ready":
         return
     if (row["size"], row["modtime"]) != (size, modtime):
         conn.execute(

@@ -1,6 +1,4 @@
 import fcntl
-import hashlib
-import posixpath
 import shutil
 import time
 from collections.abc import Callable
@@ -11,8 +9,9 @@ from vidshrink import db, scorer
 from vidshrink.budget import Budget
 from vidshrink.config import Config
 from vidshrink.encode import EncodeError, build_command, run_encode
+from vidshrink.paths import final_path, md5_file, tmp_path  # re-exported for callers/tests
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
-from vidshrink.rclone import TMP_SUFFIX, Rclone, RcloneError, with_retries
+from vidshrink.rclone import Rclone, RcloneError, with_retries
 from vidshrink.verify import compare, decode_errors
 
 
@@ -26,22 +25,6 @@ class SwapError(Exception):
 
 class DiskTooSmall(Exception):
     pass
-
-
-def final_path(path: str) -> str:
-    return posixpath.splitext(path)[0] + ".mkv"
-
-
-def tmp_path(path: str) -> str:
-    return posixpath.splitext(path)[0] + TMP_SUFFIX
-
-
-def _md5(path: Path) -> str:
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        while chunk := f.read(8 << 20):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 @contextmanager
@@ -195,7 +178,7 @@ class Worker:
                 self.failures = 0
                 self.log(f"not worth it: {path} ({saved:.0%})")
                 return
-            md5 = _md5(out)
+            md5 = md5_file(out)
         except DiskTooSmall as e:
             self._cleanup(vid)
             db.mark(self.conn, vid, "failed", reason=str(e)[:500])
