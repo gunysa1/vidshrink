@@ -13,6 +13,10 @@ from vidshrink.rclone import Rclone, RcloneError
 
 PC_SEEN_KEY = "pc_last_seen"
 NO_WORK_RETRY_SECS = 600.0
+# Rows in any of these stages occupy a final_path/tmp_path stem; a queued row that
+# shares a stem with one of them (same basename, different extension) can't be
+# claimed yet, since the two would race over the same remote final_path/tmp_path.
+BUSY_STAGES = db.IN_PROGRESS + ("ready",) + db.REMOTE_STAGES
 
 
 class LeaseLost(Exception):
@@ -33,11 +37,42 @@ class JobStore:
     def _seen(self) -> None:
         db.kv_set(self.conn, PC_SEEN_KEY, str(self.now()))
 
-    def _leased_by(self, job_id: int, worker: str):
+    def _leased_by(self, job_id: int, worker: str, now: float):
+        """The row, iff it is validly leased by worker right now (stage, worker AND an
+        unexpired lease_until all hold); otherwise LeaseLost."""
         row = db.get(self.conn, job_id)
-        if row is None or row["stage"] != "leased" or row["worker"] != worker:
+        if (row is None or row["stage"] != "leased" or row["worker"] != worker
+                or row["lease_until"] is None or row["lease_until"] < now):
             raise LeaseLost(f"job {job_id} is not leased by {worker}")
         return row
+
+    def _is_leased_by(self, job_id: int, worker: str, now: float) -> bool:
+        try:
+            self._leased_by(job_id, worker, now)
+            return True
+        except LeaseLost:
+            return False
+
+    def _update_leased(self, job_id: int, worker: str, now: float, fields: dict) -> bool:
+        """Write fields iff the row is still validly leased by worker right now. The
+        WHERE clause re-checks the lease itself, so this is safe even without a
+        surrounding transaction (though callers that also read the row first should
+        still wrap both in one db.transaction for a consistent snapshot)."""
+        fields = {**fields, "updated_at": now}
+        cols = ", ".join(f"{k}=?" for k in fields)
+        return self.conn.execute(
+            f"UPDATE videos SET {cols} WHERE id=? AND stage='leased' AND worker=?"
+            " AND lease_until>=?",
+            (*fields.values(), job_id, worker, now),
+        ).rowcount == 1
+
+    def _mark_leased_or_raise(self, job_id: int, worker: str, now: float, stage: str,
+                              fields: dict) -> None:
+        if not self._update_leased(job_id, worker, now, {**fields, "stage": stage}):
+            raise LeaseLost(f"job {job_id} is not leased by {worker}")
+
+    def _busy_final_paths(self) -> set:
+        return {final_path(r["path"]) for r in db.rows_in(self.conn, *BUSY_STAGES)}
 
     def _candidates(self, encoder: str) -> list:
         scored = []
@@ -54,8 +89,11 @@ class JobStore:
         self.expire_leases()
         if self.downloads.blocked():
             return {"job": None, "retry_after": self.downloads.seconds_until_reset()}
+        busy = self._busy_final_paths()
         for row in self._candidates(encoder):
             final = final_path(row["path"])
+            if final in busy:
+                continue  # another row owns this final_path/tmp_path stem right now
             if final != row["path"] and self.rclone.exists(final):
                 db.mark_if(self.conn, row["id"], ("queued",), "failed",
                            reason=f"target {final} already exists")
@@ -80,68 +118,80 @@ class JobStore:
 
     def heartbeat(self, job_id: int, worker: str) -> dict:
         self._seen()
-        if not self._is_leased_by(job_id, worker):
-            return {"cancel": True}
-        db.mark_if(self.conn, job_id, ("leased",), "leased",
-                   lease_until=self.now() + self.cfg.lease_secs)
-        return {"cancel": False}
-
-    def _is_leased_by(self, job_id: int, worker: str) -> bool:
-        try:
-            self._leased_by(job_id, worker)
-            return True
-        except LeaseLost:
-            return False
+        now = self.now()
+        with db.transaction(self.conn):
+            ok = self._is_leased_by(job_id, worker, now) and self._update_leased(
+                job_id, worker, now, {"lease_until": now + self.cfg.lease_secs})
+        return {"cancel": not ok}
 
     def report(self, job_id: int, worker: str, outcome: str, **data) -> None:
         self._seen()
-        row = self._leased_by(job_id, worker)
-        clear = {"worker": None, "lease_until": None}
-        if outcome == "uploaded":
-            db.mark(self.conn, job_id, "remote_ready", out_size=int(data["out_size"]),
-                    out_md5=data["out_md5"], encode_secs=float(data["encode_secs"]),
-                    reason=None, **clear)
-            self.uploads.add(int(data["out_size"]))
-        elif outcome == "failed":
-            attempts = row["attempts"] + 1
-            stage = "failed" if attempts >= self.cfg.max_attempts else "queued"
-            db.mark(self.conn, job_id, stage, attempts=attempts,
-                    reason=f"PC: {data.get('reason', '')}"[:500], **clear)
-        elif outcome == "not_worth_it":
-            db.mark(self.conn, job_id, "not_worth_it", reason=str(data.get("reason", ""))[:500],
-                    **clear)
-        elif outcome == "changed":
-            db.mark(self.conn, job_id, "unprobed", reason="changed since scan",
-                    probe_json=None, score=None, **clear)
-        elif outcome == "download_quota":
-            self.downloads.block(self.cfg.download_block_secs)
-            db.mark(self.conn, job_id, "queued", **clear)
-            self.log("PC hit Drive's download quota; downloads paused for everyone")
-        else:
-            raise ValueError(f"unknown outcome {outcome!r}")
+        now = self.now()
+        with db.transaction(self.conn):
+            row = self._leased_by(job_id, worker, now)
+            clear = {"worker": None, "lease_until": None}
+            if outcome == "uploaded":
+                self._mark_leased_or_raise(job_id, worker, now, "remote_ready", {
+                    "out_size": int(data["out_size"]), "out_md5": data["out_md5"],
+                    "encode_secs": float(data["encode_secs"]), "reason": None, **clear})
+                self.uploads.add(int(data["out_size"]))
+            elif outcome == "failed":
+                attempts = row["attempts"] + 1
+                stage = "failed" if attempts >= self.cfg.max_attempts else "queued"
+                self._mark_leased_or_raise(job_id, worker, now, stage, {
+                    "attempts": attempts,
+                    "reason": f"PC: {data.get('reason', '')}"[:500], **clear})
+            elif outcome == "not_worth_it":
+                self._mark_leased_or_raise(job_id, worker, now, "not_worth_it", {
+                    "reason": str(data.get("reason", ""))[:500], **clear})
+            elif outcome == "changed":
+                self._mark_leased_or_raise(job_id, worker, now, "unprobed", {
+                    "reason": "changed since scan", "probe_json": None, "score": None,
+                    **clear})
+            elif outcome == "download_quota":
+                self.downloads.block(self.cfg.download_block_secs)
+                self._mark_leased_or_raise(job_id, worker, now, "queued", clear)
+                self.log("PC hit Drive's download quota; downloads paused for everyone")
+            else:
+                raise ValueError(f"unknown outcome {outcome!r}")
         self.log(f"{worker} reported {outcome}: {row['path']}")
 
     def release(self, job_id: int, worker: str) -> None:
         self._seen()
-        row = self._leased_by(job_id, worker)
-        db.mark(self.conn, job_id, "queued", worker=None, lease_until=None)
+        now = self.now()
+        with db.transaction(self.conn):
+            row = self._leased_by(job_id, worker, now)
+            self._mark_leased_or_raise(job_id, worker, now, "queued",
+                                       {"worker": None, "lease_until": None})
         self.log(f"{worker} released: {row['path']}")
 
+    def _requeue_if_still_expired(self, job_id: int, now: float) -> bool:
+        """Guarded requeue of a lease that looked expired as of `now`. False if the
+        lease was renewed (or the row moved on) since whoever is calling this read the
+        row, in which case nothing is touched."""
+        with db.transaction(self.conn):
+            return self.conn.execute(
+                "UPDATE videos SET stage='queued', worker=NULL, lease_until=NULL,"
+                " updated_at=? WHERE id=? AND stage='leased' AND lease_until < ?",
+                (now, job_id, now),
+            ).rowcount == 1
+
     def expire_leases(self) -> int:
+        now = self.now()
         expired = self.conn.execute(
-            "SELECT * FROM videos WHERE stage='leased' AND lease_until < ?", (self.now(),)
+            "SELECT * FROM videos WHERE stage='leased' AND lease_until < ?", (now,)
         ).fetchall()
         n = 0
         for row in expired:
+            if not self._requeue_if_still_expired(row["id"], now):
+                continue  # renewed since the SELECT above; leave it alone
+            n += 1
+            self.log(f"lease expired ({row['worker']}): {row['path']}")
             tmp = tmp_path(row["path"])
             try:
                 if self.rclone.exists(tmp):
                     self.rclone.delete(tmp)
             except RcloneError as e:
+                # Already requeued; the next claim's upload overwrites the tmp anyway.
                 self.log(f"lease expired but {tmp} could not be removed yet: {e}")
-                continue  # try again on the next sweep
-            if db.mark_if(self.conn, row["id"], ("leased",), "queued", worker=None,
-                          lease_until=None):
-                n += 1
-                self.log(f"lease expired ({row['worker']}): {row['path']}")
         return n

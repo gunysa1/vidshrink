@@ -168,3 +168,54 @@ def test_expire_leases_removes_tmp_and_requeues(conn, cfg, store):
     assert not (root / "a.vidshrink-tmp.mkv").exists()
     row = db.get(conn, vid)
     assert (row["stage"], row["attempts"]) == ("queued", 0)
+
+
+def test_heartbeat_after_expiry_cancels_without_reviving(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    original_lease_until = db.get(conn, vid)["lease_until"]
+    store.clock.t += 1801
+    assert store.heartbeat(vid, "pc") == {"cancel": True}
+    row = db.get(conn, vid)
+    assert row["stage"] == "leased" and row["lease_until"] == original_lease_until
+
+
+def test_report_and_release_after_expiry_raise(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.clock.t += 1801
+    with pytest.raises(LeaseLost):
+        store.report(vid, "pc", "uploaded", out_size=1, out_md5="x", encode_secs=1.0)
+    with pytest.raises(LeaseLost):
+        store.release(vid, "pc")
+    row = db.get(conn, vid)
+    assert row["stage"] == "leased"  # untouched by either failed call
+
+
+def test_expire_leases_skips_lease_renewed_since_select(conn, cfg, store):
+    root = Path(cfg.remote.rstrip("/"))
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    (root / "a.vidshrink-tmp.mkv").write_bytes(b"partial")
+    # The time a stale SELECT snapshot would have seen this lease as already expired.
+    stale_now = store.clock.t + 1801
+    # A renewal happens (e.g. the PC's heartbeat) after that snapshot but before the
+    # guarded requeue runs against it.
+    store.clock.t += 2
+    store.heartbeat(vid, "pc")
+    assert store._requeue_if_still_expired(vid, stale_now) is False
+    row = db.get(conn, vid)
+    assert (row["stage"], row["worker"]) == ("leased", "pc")
+    assert (root / "a.vidshrink-tmp.mkv").exists()
+
+
+def test_claim_skips_same_stem_collision(conn, store):
+    avi = add(conn, "Movies/a.avi")
+    db.mark(conn, avi, "encoding")
+    mp4 = add(conn, "Movies/a.mp4")
+    r = store.claim("pc")
+    assert r["job"] is None
+    assert db.get(conn, mp4)["stage"] == "queued"
+    db.mark(conn, avi, "done")
+    r2 = store.claim("pc")
+    assert r2["job"]["id"] == mp4

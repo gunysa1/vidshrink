@@ -3,7 +3,9 @@ name = "vidshrink"
 version = "0.1.0"
 description = "Re-encode Google Drive videos to HEVC to save space"
 requires-python = ">=3.11"
-dependencies = []
+# zoneinfo (used by budget.py for America/Los_Angeles) has no tz database on Windows;
+# tzdata supplies one there. No effect on Linux, which keeps the server stdlib-only.
+dependencies = ["tzdata; sys_platform == 'win32'"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
