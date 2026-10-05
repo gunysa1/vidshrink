@@ -1,8 +1,15 @@
 """Leases encode jobs to remote workers (the PC). The server's DB stays the source of
 truth; only the server verifies uploads and replaces originals."""
+import hmac
 import json
+import os
+import secrets
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 from vidshrink import db, scorer
 from vidshrink.budget import Budget
@@ -195,3 +202,116 @@ class JobStore:
                 # Already requeued; the next claim's upload overwrites the tmp anyway.
                 self.log(f"lease expired but {tmp} could not be removed yet: {e}")
         return n
+
+
+class JobServiceError(Exception):
+    pass
+
+
+def load_or_create_token(path: Path) -> str:
+    path = Path(path)
+    if path.exists():
+        return path.read_text().strip()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    return token
+
+
+def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer:
+    expected = f"Bearer {token}".encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # keep journald quiet; JobStore logs events
+            pass
+
+        def _send(self, code: int, body: dict) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _authorized(self) -> bool:
+            got = self.headers.get("Authorization", "").encode()
+            if hmac.compare_digest(got, expected):
+                return True
+            self._send(401, {"error": "unauthorized"})
+            return False
+
+        def do_GET(self):
+            if not self._authorized():
+                return
+            if self.path == "/health":
+                self._send(200, {"ok": True})
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if not self._authorized():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if self.path == "/claim":
+                    self._send(200, store.claim(body["worker"], body.get("encoder", "nvenc")))
+                elif self.path == "/heartbeat":
+                    self._send(200, store.heartbeat(int(body["id"]), body["worker"]))
+                elif self.path == "/report":
+                    extra = {k: v for k, v in body.items() if k not in ("id", "worker", "outcome")}
+                    store.report(int(body["id"]), body["worker"], body["outcome"], **extra)
+                    self._send(200, {"ok": True})
+                elif self.path == "/release":
+                    store.release(int(body["id"]), body["worker"])
+                    self._send(200, {"ok": True})
+                else:
+                    self._send(404, {"error": "not found"})
+            except LeaseLost as e:
+                self._send(409, {"error": str(e)})
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
+                self._send(400, {"error": f"bad request: {e}"})
+            except Exception as e:  # keep serving; the PC retries
+                store.log(f"job service error on {self.path}: {e!r}")
+                self._send(500, {"error": repr(e)})
+
+    return HTTPServer((host, port), Handler)
+
+
+class JobClient:
+    def __init__(self, base_url: str, token: str, timeout: float = 30):
+        self.base = base_url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    def _call(self, method: str, path: str, body: dict | None = None) -> dict:
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers={
+            "Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            if e.code == 409:
+                raise LeaseLost(detail) from None
+            raise JobServiceError(f"HTTP {e.code} on {path}: {detail}") from None
+        except (urllib.error.URLError, OSError) as e:
+            raise JobServiceError(f"cannot reach job service at {self.base}: {e}") from None
+
+    def health(self) -> dict:
+        return self._call("GET", "/health")
+
+    def claim(self, worker: str, encoder: str = "nvenc") -> dict:
+        return self._call("POST", "/claim", {"worker": worker, "encoder": encoder})
+
+    def heartbeat(self, job_id: int, worker: str) -> dict:
+        return self._call("POST", "/heartbeat", {"id": job_id, "worker": worker})
+
+    def report(self, job_id: int, worker: str, outcome: str, **data) -> None:
+        self._call("POST", "/report", {"id": job_id, "worker": worker, "outcome": outcome, **data})
+
+    def release(self, job_id: int, worker: str) -> None:
+        self._call("POST", "/release", {"id": job_id, "worker": worker})
