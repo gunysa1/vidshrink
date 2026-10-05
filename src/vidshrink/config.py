@@ -34,6 +34,14 @@ class Config:
     disk_reserve: int = 20_000_000_000
     disk_wait_secs: float = 600
     swap_retry_secs: float = 900
+    # PC worker / job service (see docs/superpowers/specs/2026-10-05-pc-worker-design.md)
+    lease_secs: float = 1800
+    pc_handover_hours: float = 6.0
+    pc_absent_days: float = 3.0
+    idle_poll_secs: float = 60
+    serve_host: str = "0.0.0.0"
+    serve_port: int = 8765
+    token_path: Path = HOME / "serve.token"
     # Pinned so the Drive behaviour the swap relies on can't drift with rclone.conf:
     # deletes go to the trash, the 750 GB/day upload limit fails fast, and our own
     # with_retries (not rclone's) owns retrying.
