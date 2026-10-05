@@ -1,10 +1,14 @@
 import subprocess
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from vidshrink import db
 from vidshrink.config import Config
+from vidshrink.jobs import JobStore, make_server
+from vidshrink.rclone import Rclone, free_port
 
 
 @pytest.fixture
@@ -30,6 +34,32 @@ def conn(cfg):
     c = db.connect(cfg.db_path)
     yield c
     c.close()
+
+
+@pytest.fixture
+def job_service(cfg):
+    """HTTP job service running in a background thread with its own connection."""
+    TOKEN = "s3cret"
+    port = free_port()
+    ready_event = threading.Event()
+    server_holder = {}  # Use dict to allow closure to write to it
+
+    def run_server():
+        # Open connection in the server thread (not shared)
+        conn = db.connect(cfg.db_path)
+        store = JobStore(conn, cfg, Rclone(cfg.remote), log=lambda m: None)
+        server = make_server(store, TOKEN, "127.0.0.1", port)
+        server_holder['server'] = server
+        ready_event.set()
+        server.serve_forever()
+
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
+    ready_event.wait()
+    yield SimpleNamespace(url=f"http://127.0.0.1:{port}", token=TOKEN)
+    server_holder['server'].shutdown()
+    server_holder['server'].server_close()
+    t.join(timeout=5)
 
 
 SRT = "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,500 --> 00:00:02,500\nworld\n"

@@ -208,15 +208,23 @@ class JobServiceError(Exception):
     pass
 
 
+REQUEST_TIMEOUT_SECS = 30
+MAX_REQUEST_BODY_BYTES = 1 << 20  # 1 MiB
+
+
 def load_or_create_token(path: Path) -> str:
     path = Path(path)
     if path.exists():
         return path.read_text().strip()
     path.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_urlsafe(32)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(token + "\n")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token + "\n")
+    except FileExistsError:
+        # Another process created it first; read and return its token
+        return path.read_text().strip()
     return token
 
 
@@ -224,6 +232,8 @@ def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer
     expected = f"Bearer {token}".encode()
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = REQUEST_TIMEOUT_SECS
+
         def log_message(self, fmt, *args):  # keep journald quiet; JobStore logs events
             pass
 
@@ -255,6 +265,9 @@ def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
+                if length > MAX_REQUEST_BODY_BYTES:
+                    self._send(413, {"error": "payload too large"})
+                    return
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/claim":
                     self._send(200, store.claim(body["worker"], body.get("encoder", "nvenc")))
