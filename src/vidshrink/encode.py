@@ -1,4 +1,5 @@
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -17,6 +18,26 @@ MATRICES = {"gbr", "bt709", "fcc", "bt470bg", "smpte170m", "smpte240m", "ycgco",
 
 class EncodeError(Exception):
     pass
+
+
+class EncodeCancelled(Exception):
+    pass
+
+
+def _input_args(src: Path, probe: Probe) -> list[str]:
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error"]
+    if probe.container.startswith("avi"):
+        cmd += ["-fflags", "+genpts"]
+    return cmd + ["-i", str(src), "-map", "0", "-map", "-0:d", "-c", "copy"]
+
+
+def _output_args(out: Path, probe: Probe) -> list[str]:
+    cmd = []
+    subs = [s for s in probe.streams if s[0] == "subtitle"]
+    for i, (_, codec, _) in enumerate(subs):
+        if codec == "mov_text":
+            cmd += [f"-c:s:{i}", "srt"]
+    return cmd + ["-max_muxing_queue_size", "4096", str(out)]
 
 
 def x265_params(probe: Probe) -> str:
@@ -39,25 +60,14 @@ def x265_params(probe: Probe) -> str:
 def build_command(src: Path, out: Path, probe: Probe, cfg: Config) -> list[str]:
     vi = probe.video_index
     crf = cfg.crf_4k if resolution_class(probe.width, probe.height) == "4k" else cfg.crf
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error"]
-    if probe.container.startswith("avi"):
-        cmd += ["-fflags", "+genpts"]
-    cmd += [
-        "-i", str(src),
-        "-map", "0", "-map", "-0:d",
-        "-c", "copy",
+    video = [
         f"-c:v:{vi}", "libx265",
         f"-preset:v:{vi}", cfg.preset,
         f"-crf:v:{vi}", str(crf),
         f"-pix_fmt:v:{vi}", "yuv420p10le",
         f"-x265-params:v:{vi}", x265_params(probe),
     ]
-    subs = [s for s in probe.streams if s[0] == "subtitle"]
-    for i, (_, codec, _) in enumerate(subs):
-        if codec == "mov_text":
-            cmd += [f"-c:s:{i}", "srt"]
-    cmd += ["-max_muxing_queue_size", "4096", str(out)]
-    return cmd
+    return _input_args(src, probe) + video + _output_args(out, probe)
 
 
 def run_encode(cmd: list[str], log_path: Path) -> float:
@@ -67,4 +77,43 @@ def run_encode(cmd: list[str], log_path: Path) -> float:
     if res.returncode != 0:
         tail = log_path.read_text(errors="replace")[-500:]
         raise EncodeError(f"ffmpeg exit {res.returncode}: {tail}")
+    return time.monotonic() - start
+
+
+def build_nvenc_command(src: Path, out: Path, probe: Probe, cq: int) -> list[str]:
+    vi = probe.video_index
+    video = [
+        f"-c:v:{vi}", "hevc_nvenc",
+        f"-preset:v:{vi}", "p7",
+        f"-tune:v:{vi}", "hq",
+        f"-profile:v:{vi}", "main10",
+        f"-pix_fmt:v:{vi}", "p010le",
+        f"-rc:v:{vi}", "vbr",
+        f"-cq:v:{vi}", str(cq),
+        f"-b:v:{vi}", "0",
+        f"-spatial-aq:v:{vi}", "1",
+        f"-temporal-aq:v:{vi}", "1",
+        f"-rc-lookahead:v:{vi}", "32",
+        f"-bf:v:{vi}", "4",
+        f"-b_ref_mode:v:{vi}", "middle",
+    ]
+    return _input_args(src, probe) + video + _output_args(out, probe)
+
+
+def run_encode_cancellable(cmd: list[str], log_path: Path, cancel: threading.Event) -> float:
+    start = time.monotonic()
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+        while True:
+            try:
+                code = proc.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel.is_set():
+                    proc.kill()
+                    proc.wait()
+                    raise EncodeCancelled("encode cancelled") from None
+    if code != 0:
+        tail = log_path.read_text(errors="replace")[-500:]
+        raise EncodeError(f"ffmpeg exit {code}: {tail}")
     return time.monotonic() - start
