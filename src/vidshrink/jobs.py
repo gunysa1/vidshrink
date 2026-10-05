@@ -265,8 +265,9 @@ def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length > MAX_REQUEST_BODY_BYTES:
-                    self._send(413, {"error": "payload too large"})
+                if length < 0 or length > MAX_REQUEST_BODY_BYTES:
+                    code = 400 if length < 0 else 413
+                    self._send(code, {"error": "payload too large" if code == 413 else "bad request: invalid content length"})
                     return
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/claim":

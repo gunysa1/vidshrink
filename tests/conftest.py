@@ -43,22 +43,39 @@ def job_service(cfg):
     port = free_port()
     ready_event = threading.Event()
     server_holder = {}  # Use dict to allow closure to write to it
+    exception_holder = {}  # Capture exceptions from thread
 
     def run_server():
-        # Open connection in the server thread (not shared)
-        conn = db.connect(cfg.db_path)
-        store = JobStore(conn, cfg, Rclone(cfg.remote), log=lambda m: None)
-        server = make_server(store, TOKEN, "127.0.0.1", port)
-        server_holder['server'] = server
-        ready_event.set()
-        server.serve_forever()
+        try:
+            # Open connection in the server thread (not shared)
+            conn = db.connect(cfg.db_path)
+            store = JobStore(conn, cfg, Rclone(cfg.remote), log=lambda m: None)
+            server = make_server(store, TOKEN, "127.0.0.1", port)
+            server_holder['server'] = server
+            server_holder['conn'] = conn
+            ready_event.set()
+            server.serve_forever()
+        except Exception as e:
+            exception_holder['error'] = e
+            ready_event.set()  # Signal that we're done (with error)
+        finally:
+            # Close connection when serve_forever returns
+            if 'conn' in server_holder:
+                server_holder['conn'].close()
 
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
-    ready_event.wait()
+    if not ready_event.wait(timeout=10):
+        raise RuntimeError("job_service fixture: server did not start within 10 seconds")
+    if 'error' in exception_holder:
+        raise RuntimeError(f"job_service fixture: server thread failed: {exception_holder['error']}") from exception_holder['error']
+
     yield SimpleNamespace(url=f"http://127.0.0.1:{port}", token=TOKEN)
-    server_holder['server'].shutdown()
-    server_holder['server'].server_close()
+
+    # Safe teardown when server may not have been created
+    if 'server' in server_holder:
+        server_holder['server'].shutdown()
+        server_holder['server'].server_close()
     t.join(timeout=5)
 
 

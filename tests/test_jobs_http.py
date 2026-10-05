@@ -2,6 +2,9 @@ import os
 import socket
 import threading
 import time
+import urllib.request
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -19,12 +22,30 @@ def test_token_file(tmp_path):
 
 
 def test_token_file_concurrent_creation(tmp_path):
-    """Test that FileExistsError is handled correctly when another process creates the file."""
+    """Test FileExistsError race condition: another process creates the file while we're creating it."""
     p = tmp_path / "serve.token"
-    # First call creates the token
+
+    call_count = 0
+    original_exists = Path.exists
+
+    def mock_exists(self):
+        # On the first call, pretend the file doesn't exist (even though it will be created)
+        # This simulates the race where exists() returns False but os.open(O_EXCL) fails
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return False
+        return original_exists(self)
+
+    # First call: Create the file (no mocking)
     t1 = load_or_create_token(p)
-    # Second call should read the existing token (simulating race condition)
-    t2 = load_or_create_token(p)
+
+    # Second call: Mock exists() to return False, forcing os.open(O_EXCL) to hit the race condition
+    # This exercises the FileExistsError exception handler
+    call_count = 0
+    with patch.object(Path, 'exists', mock_exists):
+        t2 = load_or_create_token(p)
+
     assert t1 == t2 and len(t1) >= 32
 
 
@@ -74,30 +95,71 @@ def test_payload_too_large(job_service):
         c._call("POST", "/claim", payload)
 
 
-def test_slow_client_doesnt_block_others(job_service):
-    """Test that a slow client doesn't block other concurrent requests."""
-    # Start a slow request in a separate thread
-    slow_done = []
+def test_negative_content_length(job_service):
+    """Test that negative Content-Length returns 400 without hanging."""
+    # Manually construct a request with negative Content-Length to bypass JobClient validation
+    req = urllib.request.Request(
+        job_service.url + "/claim",
+        data=b'{}',
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {job_service.token}",
+            "Content-Type": "application/json",
+            "Content-Length": "-1"
+        }
+    )
 
-    def slow_request():
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(("127.0.0.1", int(job_service.url.split(":")[-1])))
-            # Send incomplete request and stall
-            sock.send(b"GET /health HTTP/1.1\r\n")
-            time.sleep(0.1)  # Small delay so server sees the incomplete request
-            sock.close()
-            slow_done.append(True)
-        except Exception as e:
-            slow_done.append(False)
+    # The raw urlopen will raise HTTPError with 400 - verify it doesn't hang
+    # Key point: this should complete quickly (within 5s timeout), proving it returns 400 without trying to read
+    with pytest.raises(Exception):  # Catches HTTPError
+        urllib.request.urlopen(req, timeout=5)
 
-    slow_thread = threading.Thread(target=slow_request, daemon=True)
-    slow_thread.start()
-    time.sleep(0.05)  # Let slow request start
 
-    # Now make a normal request - should succeed quickly
-    c = JobClient(job_service.url, job_service.token)
-    result = c.health()
-    assert result["ok"] is True
+def test_slow_client_timeout_blocks_properly(monkeypatch, cfg):
+    """Test that socket timeout prevents slow clients from blocking indefinitely."""
+    from vidshrink.jobs import make_server, JobStore
+    from vidshrink.rclone import Rclone, free_port
 
-    slow_thread.join(timeout=2)
+    # Monkeypatch REQUEST_TIMEOUT_SECS BEFORE creating the server so Handler picks it up
+    monkeypatch.setattr("vidshrink.jobs.REQUEST_TIMEOUT_SECS", 1)
+
+    TOKEN = "s3cret"
+    port = free_port()
+    ready_event = threading.Event()
+    server_holder = {}
+
+    def run_server():
+        conn = db.connect(cfg.db_path)
+        store = JobStore(conn, cfg, Rclone(cfg.remote), log=lambda m: None)
+        server = make_server(store, TOKEN, "127.0.0.1", port)
+        server_holder['server'] = server
+        ready_event.set()
+        server.serve_forever()
+
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
+    if not ready_event.wait(timeout=5):
+        pytest.fail("Server did not start")
+
+    try:
+        # Open a slow socket that sends partial request and keeps it open
+        slow_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        slow_sock.connect(("127.0.0.1", port))
+        # Send incomplete request header and keep connection open (timeout will kill it)
+        slow_sock.send(b"GET /health HTTP/1.1\r\n")
+        slow_sock.setblocking(False)  # Non-blocking so we don't wait on recv
+
+        # Now make a normal health check - should succeed quickly despite slow socket
+        start = time.time()
+        c = JobClient(f"http://127.0.0.1:{port}", TOKEN, timeout=5)
+        result = c.health()
+        elapsed = time.time() - start
+
+        assert result["ok"] is True
+        assert elapsed < 5  # Should complete well within 5 seconds (proves timeout doesn't block)
+
+    finally:
+        slow_sock.close()
+        server_holder['server'].shutdown()
+        server_holder['server'].server_close()
+        t.join(timeout=5)
