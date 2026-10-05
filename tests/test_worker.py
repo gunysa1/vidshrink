@@ -356,3 +356,18 @@ def test_download_quota_error_blocks_downloads_without_burning_attempts(conn, en
     rows = db.rows_in(conn, "queued")
     assert len(rows) == 2 and all(r["attempts"] == 0 for r in rows)
     assert not worker.download_budget.allows(1)
+
+
+def test_missing_non_tool_file_fails_the_file_instead_of_crashing(conn, cfg, env, monkeypatch):
+    # e.g. ffmpeg exits 0 but writes no output: this file's problem, not a missing tool,
+    # so it must not crash the service (which would re-download it on every restart).
+    _, worker = env
+    from vidshrink import worker as worker_mod
+
+    def no_output(cmd, log_path):
+        raise FileNotFoundError(2, "No such file or directory", str(cfg.workdir / "1.out.mkv"))
+
+    monkeypatch.setattr(worker_mod, "run_encode", no_output)
+    assert worker.run() == 0  # returns normally
+    rows = db.rows_in(conn, "failed")
+    assert len(rows) == 2 and all(r["attempts"] == 2 for r in rows)

@@ -102,8 +102,11 @@ class Worker:
         self.failures += 1
         self.log(f"{stage}: {row['path']}: {reason[:200]}")
 
+    def _tools(self) -> tuple[str, ...]:
+        return (self.rclone.binary, "ffmpeg", "ffprobe")
+
     def _check_tools(self) -> None:
-        for tool in (self.rclone.binary, "ffmpeg", "ffprobe"):
+        for tool in self._tools():
             if shutil.which(tool) is None:
                 raise RuntimeError(f"required tool not found on PATH: {tool}")
 
@@ -198,7 +201,12 @@ class Worker:
             db.mark(self.conn, vid, "failed", reason=str(e)[:500])
             self.log(f"failed: {path}: {e}")
             return
-        except FileNotFoundError:
+        except FileNotFoundError as e:
+            if e.filename not in self._tools():
+                # A missing work file (e.g. ffmpeg exited 0 without output) is this
+                # file's problem; crashing would re-download it on every restart.
+                self._fail(row, str(e))
+                return
             # A tool (rclone/ffmpeg/ffprobe) vanished: not this file's fault, so crash
             # without burning an attempt and leave the row to be picked up again.
             self._cleanup(vid)
