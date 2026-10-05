@@ -9,7 +9,7 @@ import pytest
 from vidshrink import db
 from vidshrink.budget import Budget
 from vidshrink.encode import run_encode_cancellable
-from vidshrink.jobs import JobClient, JobServiceError, JobStore, make_server
+from vidshrink.jobs import JobClient, JobServiceError, JobStore, LeaseLost, make_server
 from vidshrink.paths import md5_file
 from vidshrink.pc_worker import PCConfig, PCWorker, load_pc_config
 from vidshrink.probe import parse_ffprobe, run_ffprobe
@@ -208,18 +208,30 @@ def test_local_fault_during_job_releases_and_stops(conn, setup):
     assert (row["stage"], row["attempts"]) == ("queued", 0)
 
 
-def test_unexpected_exception_in_job_releases_and_continues(conn, setup):
+def test_unexpected_exception_in_job_releases_and_continues(conn, setup, monkeypatch):
     root, pc, store = setup
+    calls = {"n": 0}
 
     def boom(src, out, probe, log_path, cancel):
+        calls["n"] += 1
         raise RuntimeError("kaboom")
 
     pc.encode = boom
+    released = []
+    orig_release = pc.client.release
+
+    def spy_release(job_id, worker):
+        released.append(job_id)
+        return orig_release(job_id, worker)
+
+    monkeypatch.setattr(pc.client, "release", spy_release)
     t = run_in_thread(pc)
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    assert wait_for(lambda: calls["n"] >= 1)
+    assert wait_for(lambda: released == [vid])  # the release actually happened
     assert wait_for(lambda: db.get(conn, vid)["stage"] == "queued"
                     and db.get(conn, vid)["attempts"] == 0)
-    assert t.is_alive()  # the loop survived the bug and kept going
+    assert wait_for(lambda: calls["n"] >= 2)  # the loop survived and claimed it again
     pc.stop(now=True)
     t.join(10)
     assert not t.is_alive()
@@ -248,10 +260,14 @@ def test_report_retries_on_server_blip(conn, setup, monkeypatch):
 
 def test_stop_now_during_upload_releases_and_cleans_tmp(conn, setup, monkeypatch):
     root, pc, store = setup
+    tmp_on_remote = root / "Movies" / "a.vidshrink-tmp.mkv"
 
-    # A deterministic stand-in for a slow transfer: blocks, polling `cancel` the
-    # way Rclone._run does, until Stop now fires, then raises TransferCancelled.
+    # A deterministic stand-in for a slow transfer: actually copies the file to
+    # the remote tmp path first (as a real upload would, even a partial one),
+    # then blocks, polling `cancel` the way Rclone._run does, until Stop now
+    # fires, then raises TransferCancelled.
     def slow_upload(local, path, cancel=None):
+        shutil.copy(local, tmp_on_remote)
         for _ in range(200):
             if cancel is not None and cancel.is_set():
                 raise TransferCancelled("cancelled")
@@ -260,14 +276,14 @@ def test_stop_now_during_upload_releases_and_cleans_tmp(conn, setup, monkeypatch
 
     monkeypatch.setattr(pc.rclone, "upload", slow_upload)
     t = run_in_thread(pc)
-    assert wait_for(lambda: pc.stage == "uploading", timeout=30)
+    assert wait_for(lambda: tmp_on_remote.exists(), timeout=30)
     pc.stop(now=True)
     t.join(15)
     assert not t.is_alive()
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
     row = db.get(conn, vid)
     assert (row["stage"], row["attempts"]) == ("queued", 0)
-    assert not (root / "Movies" / "a.vidshrink-tmp.mkv").exists()
+    assert not tmp_on_remote.exists()
 
 
 def test_rate_limited_upload_is_reported_upload_limited(conn, setup, monkeypatch):
@@ -284,6 +300,134 @@ def test_rate_limited_upload_is_reported_upload_limited(conn, setup, monkeypatch
     t.join(10)
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
     assert (db.get(conn, vid)["stage"], db.get(conn, vid)["attempts"]) == ("queued", 0)
+
+
+def test_ambiguous_uploaded_then_retry_succeeds_idempotently_tmp_kept(conn, setup, monkeypatch):
+    """The first 'uploaded' call actually commits server-side (the real report()
+    runs), but the PC never sees the response (simulated: it raises right after).
+    The retry must succeed idempotently (the server-side idempotency from item A)
+    and the tmp must NOT be deleted."""
+    root, pc, store = setup
+    tmp_on_remote = root / "Movies" / "a.vidshrink-tmp.mkv"
+    orig_report = pc.client.report
+    calls = {"n": 0}
+
+    def flaky(job_id, worker, outcome, **data):
+        if outcome != "uploaded":
+            return orig_report(job_id, worker, outcome, **data)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            orig_report(job_id, worker, outcome, **data)  # really commits server-side
+            raise JobServiceError("dropped connection after commit", status=None)
+        return orig_report(job_id, worker, outcome, **data)
+
+    monkeypatch.setattr(pc.client, "report", flaky)
+    t = run_in_thread(pc)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+    pc.stop(now=True)
+    t.join(10)
+    assert calls["n"] >= 2
+    assert tmp_on_remote.exists()
+    row = db.get(conn, vid)
+    assert row["out_md5"] == md5_file(tmp_on_remote)
+
+
+def test_ambiguous_uploaded_then_lease_lost_tmp_not_deleted(conn, setup, monkeypatch):
+    """An ambiguous failure (we don't know if the server committed) followed by a
+    definite LeaseLost must NOT delete the tmp: the earlier ambiguity means a
+    definite-looking 409 doesn't prove it's safe (the server may have actually
+    accepted the first attempt and moved on for an unrelated reason by the time
+    the second one lands)."""
+    root, pc, store = setup
+    tmp_on_remote = root / "Movies" / "a.vidshrink-tmp.mkv"
+    calls = {"n": 0}
+
+    def flaky(job_id, worker, outcome, **data):
+        if outcome != "uploaded":
+            raise AssertionError("unexpected outcome in this test")
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise JobServiceError("dropped connection, unknown outcome", status=None)
+        raise LeaseLost("someone else has it now")
+
+    monkeypatch.setattr(pc.client, "report", flaky)
+    t = run_in_thread(pc)
+    assert wait_for(lambda: tmp_on_remote.exists(), timeout=30)
+    assert wait_for(lambda: calls["n"] >= 2, timeout=30)
+    pc.stop(now=True)
+    t.join(10)
+    assert tmp_on_remote.exists()  # never deleted despite the later LeaseLost
+
+
+def test_stop_now_during_transfer_retry_releases_not_failed(conn, setup, monkeypatch):
+    root, pc, store = setup
+    pc.cfg.retry_base_delay = 5.0  # long enough that Stop now clearly lands mid-wait
+    attempts = {"n": 0}
+
+    def flaky_download(path, local, cancel=None):
+        attempts["n"] += 1
+        raise RcloneError(1, "connection reset by peer")
+
+    monkeypatch.setattr(pc.rclone, "download", flaky_download)
+    outcomes = []
+    orig_report = pc.client.report
+
+    def spy(job_id, worker, outcome, **data):
+        outcomes.append(outcome)
+        return orig_report(job_id, worker, outcome, **data)
+
+    monkeypatch.setattr(pc.client, "report", spy)
+    t = run_in_thread(pc)
+    assert wait_for(lambda: attempts["n"] >= 1)
+    pc.stop(now=True)
+    t.join(10)
+    assert not t.is_alive()
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    row = db.get(conn, vid)
+    assert (row["stage"], row["attempts"]) == ("queued", 0)
+    assert "failed" not in outcomes
+
+
+def test_poison_job_reported_failed_on_second_unexpected_error(conn, setup):
+    root, pc, store = setup
+    calls = {"n": 0}
+
+    def boom(src, out, probe, log_path, cancel):
+        calls["n"] += 1
+        raise TypeError("always broken")
+
+    pc.encode = boom
+    t = run_in_thread(pc)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    assert wait_for(lambda: calls["n"] >= 1)
+    assert wait_for(lambda: db.get(conn, vid)["stage"] == "queued"
+                    and db.get(conn, vid)["attempts"] == 0)  # first: released
+    assert wait_for(lambda: calls["n"] >= 2)
+    assert wait_for(lambda: db.get(conn, vid)["attempts"] == 1)  # second: reported failed
+    assert db.get(conn, vid)["stage"] == "queued"  # max_attempts=2, so still queued
+    pc.stop(now=True)
+    t.join(10)
+    assert not t.is_alive()
+
+
+def test_rate_limited_download_is_transient_not_upload_limited(conn, setup, monkeypatch):
+    root, pc, store = setup
+    pc.cfg.idle_secs = 0.1  # fast backoff for the test
+
+    def limited(path, local, cancel=None):
+        raise RcloneError(1, "googleapi: Error 403: User rate limit exceeded.,"
+                          " userRateLimitExceeded")
+
+    monkeypatch.setattr(pc.rclone, "download", limited)
+    t = run_in_thread(pc)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    assert wait_for(lambda: db.get(conn, vid)["stage"] == "queued"
+                    and db.get(conn, vid)["attempts"] == 0)
+    assert not store.uploads.blocked()
+    pc.stop(now=True)
+    t.join(10)
+    assert not t.is_alive()
 
 
 def test_ffmpeg_dir_added_to_path_once(monkeypatch):

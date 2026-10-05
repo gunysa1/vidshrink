@@ -99,6 +99,10 @@ class PCWorker:
         self._stop_after = threading.Event()
         self._wake = threading.Event()  # wakes an idle wait promptly on either stop mode
         self._current_cancel: threading.Event | None = None  # the running job's cancel, if any
+        # Consecutive unexpected (catch-all) errors per job id, in memory: a job that
+        # keeps raising something we didn't anticipate gets released once, then
+        # reported failed (poison-job guard) rather than released forever.
+        self._unexpected_counts: dict[int, int] = {}
         if cfg.ffmpeg_dir:
             # Prepend once, idempotently: run() may be called more than once per
             # process (e.g. restarted after a fix), and a growing PATH is a sign
@@ -162,24 +166,46 @@ class PCWorker:
                     self.log(f"stopping: local fault: {e}")
                     return
                 except Exception as e:
-                    # Never let a bug in one job take the whole worker down: log it,
-                    # hand the job back un-penalised, and keep going.
-                    tb = "".join(traceback.format_exception_only(type(e), e)).strip()
-                    self.log(f"unexpected error on job {job.get('id')}: {tb}")
-                    try:
-                        self.client.release(job["id"], self.cfg.worker_name)
-                    except Exception:
-                        pass
-                    if self._stop_now.wait(self.cfg.idle_secs):
-                        break
+                    self._handle_unexpected(job, e)
                 self.state = "idle"
         finally:
             self.state = "stopped"
             self.stage = ""
 
+    def _handle_unexpected(self, job: dict, e: Exception) -> None:
+        """Never let a bug in one job take the whole worker down. The first time a
+        given job id raises something we didn't anticipate, release it un-penalised
+        (could be a one-off). If the SAME job id does it again right after being
+        re-claimed, it's a poison job: report it failed (burns an attempt, so the
+        server's max_attempts eventually parks it) instead of releasing forever."""
+        job_id = job.get("id")
+        tb = "".join(traceback.format_exception_only(type(e), e)).strip()
+        count = self._unexpected_counts.get(job_id, 0) + 1
+        self._unexpected_counts[job_id] = count
+        if count >= 2:
+            self.log(f"job {job_id} failed unexpectedly {count} times in a row, "
+                     f"reporting failed: {tb}")
+            self._unexpected_counts.pop(job_id, None)
+            try:
+                self._retry_job_call(lambda: self.client.report(
+                    job_id, self.cfg.worker_name, "failed", reason=tb[:500]))
+            except (LeaseLost, JobServiceError):
+                pass
+        else:
+            self.log(f"unexpected error on job {job_id} (will release): {tb}")
+            try:
+                self.client.release(job_id, self.cfg.worker_name)
+            except (LeaseLost, JobServiceError):
+                pass
+        self._wake.wait(self.cfg.idle_secs)
+        self._wake.clear()
+
     def _retry(self, fn, cancel: threading.Event):
         """Retry an rclone transfer with backoff, like rclone.with_retries, but
-        aborts (no new attempt) once Stop now fires during the wait."""
+        aborts (no new attempt) once Stop now or a server cancel fires during the
+        wait -- and when that happens, raises _Abandon (not the RcloneError), so
+        the job is released rather than reported failed: this is an operator/server
+        stop, not a video problem."""
         for i in range(self.cfg.retry_attempts):
             try:
                 return fn()
@@ -188,9 +214,20 @@ class PCWorker:
                     raise
                 delay = self.cfg.retry_base_delay * 2 ** i + random.uniform(
                     0, self.cfg.retry_base_delay)
-                if self._stop_now.wait(delay) or cancel.is_set():
-                    raise
+                if self._wait_or_cancelled(delay, cancel):
+                    raise _Abandon() from e
         raise AssertionError("unreachable")
+
+    def _wait_or_cancelled(self, delay: float, cancel: threading.Event) -> bool:
+        """Wait up to delay seconds, waking early on Stop now or the per-job
+        cancel; returns True iff woken early by either."""
+        end = time.monotonic() + delay
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._stop_now.wait(min(remaining, 0.2)) or cancel.is_set():
+                return True
 
     def _retry_job_call(self, fn):
         """Retry a job-service call on a transient JobServiceError (no status, or
@@ -237,6 +274,46 @@ class PCWorker:
         except JobServiceError as e:
             self.log(f"could not report {outcome} for {job['path']}: {e}")
 
+    def _report_uploaded(self, job: dict, jid: int, path: str, tmp: str, out_size: int,
+                         md5: str, secs: float) -> None:
+        """Report the completed upload, retrying on a transient JobServiceError.
+        Once ANY attempt in this call has failed ambiguously (status None, 5xx,
+        timeout, or a connection error -- i.e. we don't know if the server actually
+        committed it), a later LeaseLost no longer proves the tmp is safe to
+        delete: the server may have accepted our first attempt and already moved
+        the row on (report() is idempotent for exactly this retry), so deleting
+        the tmp then would destroy the only copy of a successful upload. Only an
+        UNAMBIGUOUS LeaseLost on the very first attempt (no prior ambiguity) means
+        it's safe to clean up our own tmp."""
+        ambiguous = False
+        for i in range(self.cfg.retry_attempts):
+            try:
+                self.client.report(jid, self.cfg.worker_name, "uploaded",
+                                   out_size=out_size, out_md5=md5, encode_secs=secs)
+                self.done += 1
+                self.log(f"uploaded {tmp} ({out_size / 1e9:.1f} GB)")
+                return
+            except LeaseLost:
+                if not ambiguous:
+                    self._delete_tmp_if_ours(job, tmp, md5)
+                else:
+                    self.log(f"lease lost reporting uploaded after an earlier "
+                             f"ambiguous failure; leaving {tmp} for the server to "
+                             f"reconcile: {job['path']}")
+                return
+            except JobServiceError as e:
+                ambiguous = True
+                transient = e.status is None or e.status >= 500
+                if not transient or i == self.cfg.retry_attempts - 1:
+                    self.log(f"could not report uploaded for {path}: {e}; "
+                             f"leaving {tmp} for the server/lease expiry to reconcile")
+                    return
+                if self._stop_now.wait(self.cfg.retry_base_delay * 2 ** i):
+                    self.log(f"stop now while retrying the uploaded report; leaving "
+                             f"{tmp} for the server/lease expiry to reconcile: "
+                             f"{job['path']}")
+                    return
+
     def _safe_tmp(self, job: dict, tmp: str) -> bool:
         """Defense in depth: never touch a remote path that isn't provably the
         tmp file this job owns."""
@@ -248,9 +325,11 @@ class PCWorker:
     def _do_job(self, job: dict) -> None:
         jid = job["id"]
         cancel = threading.Event()
+        # Publish before checking: if stop() is called between these two lines, it
+        # still sees (and sets) THIS job's cancel, instead of a stale or absent one.
+        self._current_cancel = cancel
         if self._stop_now.is_set():
             cancel.set()
-        self._current_cancel = cancel
         src = self.cfg.workdir / f"{jid}.src"
         out = self.cfg.workdir / f"{jid}.out.mkv"
         log_path = self.cfg.workdir / f"{jid}.log"
@@ -296,24 +375,24 @@ class PCWorker:
                 self._report(job, "failed", reason="checksum mismatch after upload")
                 return
             self._check(cancel)
-            try:
-                self._retry_job_call(lambda: self.client.report(
-                    jid, self.cfg.worker_name, "uploaded", out_size=out_size,
-                    out_md5=md5, encode_secs=secs))
-                self.done += 1
-                self.log(f"uploaded {tmp} ({out_size / 1e9:.1f} GB)")
-            except LeaseLost:
-                self._delete_tmp_if_ours(job, tmp, md5)
-            except JobServiceError as e:
-                self.log(f"could not report uploaded for {path}: {e}")
+            self._report_uploaded(job, jid, path, tmp, out_size, md5, secs)
         except (_Abandon, EncodeCancelled, TransferCancelled):
             self._abandon(job, tmp if uploading else None, md5,
                           guarded=server_cancelled.is_set())
         except RcloneError as e:
-            if e.rate_limited:
-                if uploading:
-                    self._delete_tmp_if_ours(job, tmp, md5)
+            if e.rate_limited and uploading:
+                self._delete_tmp_if_ours(job, tmp, md5)
                 self._report(job, "upload_limited")
+            elif e.rate_limited:
+                # Surprising on a download (the limit is normally hit on upload),
+                # but still not this video's fault: release and back off like any
+                # other transient blip, without burning an attempt or touching any
+                # tmp (nothing was uploaded yet).
+                self.log(f"rate limited during download (unexpected); releasing "
+                         f"and backing off: {job['path']}")
+                self._abandon(job, None, None, guarded=server_cancelled.is_set())
+                self._wake.wait(self.cfg.idle_secs)
+                self._wake.clear()
             elif e.download_quota:
                 self._report(job, "download_quota")
             else:

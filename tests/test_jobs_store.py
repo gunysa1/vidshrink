@@ -114,6 +114,29 @@ def test_report_uploaded(conn, store):
     assert store.uploads.used() == 2_000_000_000
 
 
+def test_report_uploaded_is_idempotent_on_retry(conn, store):
+    """A PC that retries an ambiguous "uploaded" report (the first commit succeeded
+    server-side but the response was lost) must not get LeaseLost and must not be
+    charged the upload budget a second time."""
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    md5 = "a" * 32
+    store.report(vid, "pc", "uploaded", out_size=2_000_000_000, out_md5=md5, encode_secs=600.0)
+    assert store.uploads.used() == 2_000_000_000
+    store.report(vid, "pc", "uploaded", out_size=2_000_000_000, out_md5=md5, encode_secs=600.0)
+    assert store.uploads.used() == 2_000_000_000  # not charged twice
+    row = db.get(conn, vid)
+    assert (row["stage"], row["out_md5"]) == ("remote_ready", md5)
+
+
+def test_report_uploaded_different_md5_after_remote_ready_raises(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "uploaded", out_size=10, out_md5="a" * 32, encode_secs=1.0)
+    with pytest.raises(LeaseLost):
+        store.report(vid, "pc", "uploaded", out_size=10, out_md5="b" * 32, encode_secs=1.0)
+
+
 def test_report_uploaded_rejects_invalid_md5(conn, store):
     vid = add(conn, "a.mkv")
     store.claim("pc")

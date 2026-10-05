@@ -60,21 +60,26 @@ class Rclone:
             return res.stdout
         # Cancellable path: poll so Stop now / a server cancel can interrupt a
         # transfer within about CANCEL_GRACE_SECS instead of waiting it out.
+        # Must poll via communicate(), not wait(): rclone can write more to
+        # stdout/stderr than the OS pipe buffer holds (its own progress/verbose
+        # output on stderr, easily), and wait() never drains those pipes -- once
+        # the child blocks on a full pipe, wait() blocks forever with it. Calling
+        # communicate(timeout=...) repeatedly after a TimeoutExpired is the
+        # documented-safe way to poll while still draining both pipes.
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         while True:
             try:
-                proc.wait(timeout=0.5)
+                out, err = proc.communicate(timeout=0.5)
                 break
             except subprocess.TimeoutExpired:
                 if cancel.is_set():
                     proc.terminate()  # Windows-safe: no signals, terminate()/kill() only
                     try:
-                        proc.wait(timeout=CANCEL_GRACE_SECS)
+                        out, err = proc.communicate(timeout=CANCEL_GRACE_SECS)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-                        proc.wait()
+                        out, err = proc.communicate()
                     raise TransferCancelled("transfer cancelled") from None
-        out, err = proc.communicate()
         if proc.returncode != 0:
             raise RcloneError(proc.returncode, err)
         return out

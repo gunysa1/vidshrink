@@ -168,6 +168,41 @@ def test_no_cancel_arg_behaves_as_before(rc, tmp_path):
     assert rc.exists("y.mkv")
 
 
+def test_cancellable_run_does_not_deadlock_on_large_stderr(tmp_path):
+    # Regression test: the cancellable path used to poll with proc.wait(), which
+    # never drains stdout/stderr. A child that writes more than the OS pipe
+    # buffer (commonly 64 KiB) to a PIPE it never reads back blocks on write()
+    # once the buffer fills, and wait() then blocks forever waiting for an exit
+    # that can't happen -- a deadlock. Guarded by running it on a thread and
+    # joining with a timeout, so a regression fails the test instead of hanging
+    # the whole suite.
+    script = tmp_path / "noisy.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stderr.write('x' * 200_000)\n"
+        "sys.exit(1)\n"
+    )
+    script.chmod(0o755)
+    rc = Rclone("remote:", binary=str(script))
+    result = {}
+
+    def go():
+        try:
+            rc._run(cancel=threading.Event())
+        except RcloneError as e:
+            result["error"] = e
+        except Exception as e:  # pragma: no cover - would indicate a different bug
+            result["unexpected"] = e
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(10)
+    assert not t.is_alive(), "cancellable _run hung (pipe deadlock?)"
+    assert isinstance(result.get("error"), RcloneError)
+    assert result["error"].code == 1
+
+
 def test_with_retries_does_not_retry_download_quota():
     calls = []
 

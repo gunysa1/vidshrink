@@ -142,6 +142,24 @@ class JobStore:
         self._seen()
         now = self.now()
         with db.transaction(self.conn):
+            if outcome == "uploaded":
+                # Idempotent: if a PC's earlier "uploaded" attempt actually committed
+                # here but the response never made it back (dropped connection, 5xx,
+                # timeout), its retry must not raise LeaseLost (the lease is already
+                # cleared by the first attempt) and must not charge the upload budget
+                # a second time. We only recognize this as the *same* upload: same
+                # worker, same reported md5 -- otherwise something is genuinely wrong
+                # and it's safer to raise.
+                existing = db.get(self.conn, job_id)
+                if existing is not None and existing["stage"] == "remote_ready" \
+                        and existing["worker"] == worker:
+                    if existing["out_md5"] == data.get("out_md5"):
+                        self.log(f"{worker} re-reported uploaded (already recorded): "
+                                 f"{existing['path']}")
+                        return
+                    raise LeaseLost(
+                        f"job {job_id} is already remote_ready for {worker} with a "
+                        "different md5")
             row = self._leased_by(job_id, worker, now)
             clear = {"worker": None, "lease_until": None}
             if outcome == "uploaded":
@@ -151,7 +169,10 @@ class JobStore:
                         f"invalid uploaded report: out_size={out_size} out_md5={out_md5!r}")
                 self._mark_leased_or_raise(job_id, worker, now, "remote_ready", {
                     "out_size": out_size, "out_md5": out_md5,
-                    "encode_secs": float(data["encode_secs"]), "reason": None, **clear})
+                    "encode_secs": float(data["encode_secs"]), "reason": None,
+                    # Keep `worker` (don't clear it) so a retried duplicate report of
+                    # this same success can still be recognized as idempotent above.
+                    "worker": worker, "lease_until": None})
                 self.uploads.add(out_size)
             elif outcome == "failed":
                 attempts = row["attempts"] + 1
