@@ -8,6 +8,9 @@ LEGACY = {"mpeg1video", "mpeg2video", "vc1", "mpeg4", "msmpeg4v1", "msmpeg4v2",
           "msmpeg4v3", "wmv1", "wmv2", "wmv3"}
 DEFAULT_RATIO = {"h264": 0.55, "legacy": 0.70}
 DEFAULT_SPEED = {"sd": 0.5, "720p": 1.0, "1080p": 1.7, "4k": 6.5}
+ENCODERS = ("x265", "nvenc")
+NVENC_RATIO_FACTOR = 0.85
+DEFAULT_SPEED_NVENC = {"sd": 0.05, "720p": 0.08, "1080p": 0.15, "4k": 0.5}
 INTERLACED = ("tt", "bb", "tb", "bt")
 BITRATE_FLOOR = {"sd": 0.8e6, "720p": 1.2e6, "1080p": 2.5e6, "4k": 8e6}
 
@@ -51,12 +54,40 @@ def skip_reason(path: str, size: int, probe: Probe, cfg: Config) -> str | None:
     return None
 
 
-def ratio_for(conn, family: str) -> float:
-    return db.learned_mean(conn, f"ratio:{family}", DEFAULT_RATIO[family])
+def _key(base: str, encoder: str) -> str:
+    # x265 keeps the original keys so existing learned data stays valid.
+    return base if encoder == "x265" else f"{base}:{encoder}"
 
 
-def speed_for(conn, res: str) -> float:
-    return db.learned_mean(conn, f"speed:{res}", DEFAULT_SPEED[res])
+def ratio_for(conn, family: str, encoder: str = "x265") -> float:
+    default = DEFAULT_RATIO[family] * (NVENC_RATIO_FACTOR if encoder == "nvenc" else 1.0)
+    return db.learned_mean(conn, _key(f"ratio:{family}", encoder), default)
+
+
+def speed_for(conn, res: str, encoder: str = "x265") -> float:
+    defaults = DEFAULT_SPEED_NVENC if encoder == "nvenc" else DEFAULT_SPEED
+    return db.learned_mean(conn, _key(f"speed:{res}", encoder), defaults[res])
+
+
+def learn_result(conn, probe: Probe, size: int, out_size: int, encode_secs: float | None,
+                 encoder: str) -> None:
+    family = codec_family(probe.codec)
+    if family:
+        db.learn(conn, _key(f"ratio:{family}", encoder), 1 - out_size / size)
+    if encode_secs:
+        res = resolution_class(probe.width, probe.height)
+        db.learn(conn, _key(f"speed:{res}", encoder), encode_secs / probe.duration)
+
+
+def expected_hours(conn, probe: Probe, encoder: str = "x265") -> float:
+    res = resolution_class(probe.width, probe.height)
+    return probe.duration * speed_for(conn, res, encoder) / 3600
+
+
+def encoder_score(conn, size: int, probe: Probe, encoder: str) -> float:
+    family = codec_family(probe.codec)
+    res = resolution_class(probe.width, probe.height)
+    return score(size, probe, ratio_for(conn, family, encoder), speed_for(conn, res, encoder))
 
 
 def score(size: int, probe: Probe, ratio: float, speed: float) -> float:

@@ -275,12 +275,8 @@ class Worker:
         self._cleanup(row["id"])
         db.mark(self.conn, row["id"], "done", reason=None)
         probe = Probe.from_json(row["probe_json"])
-        family = scorer.codec_family(probe.codec)
-        if family:
-            db.learn(self.conn, f"ratio:{family}", 1 - row["out_size"] / row["size"])
-        if row["encode_secs"]:
-            res = scorer.resolution_class(probe.width, probe.height)
-            db.learn(self.conn, f"speed:{res}", row["encode_secs"] / probe.duration)
+        scorer.learn_result(self.conn, probe, row["size"], row["out_size"],
+                            row["encode_secs"], row["encoder"] or "x265")
         scorer.rescore(self.conn, self.cfg)
         self.log(f"done: {row['final_path']} saved {(row['size'] - row['out_size']) / 1e9:.1f} GB")
 
