@@ -10,7 +10,7 @@ from vidshrink.budget import Budget
 from vidshrink.config import Config
 from vidshrink.encode import EncodeError, build_command, run_encode
 from vidshrink.jobs import BUSY_STAGES, PC_SEEN_KEY, JobStore
-from vidshrink.paths import final_path, md5_file, tmp_path  # re-exported for callers/tests
+from vidshrink.paths import final_path, is_valid_md5, md5_file, tmp_path  # re-exported for callers/tests
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
 from vidshrink.rclone import Rclone, RcloneError, with_retries
 from vidshrink.verify import compare, decode_errors
@@ -58,6 +58,8 @@ class Worker:
         self.log = log
         self.jobs = JobStore(conn, cfg, rclone, now=budget.now, log=log)
         self.failures = 0  # consecutive prepare/upload failures with no success between
+        self._remote_fail_at = None  # self.clock() of the last remote_ready check we couldn't
+        # complete (RcloneError), so we don't hammer Drive every loop iteration for it
 
     # --- work files -------------------------------------------------------
     def _src(self, vid: int) -> Path:
@@ -78,13 +80,15 @@ class Worker:
     def _retry(self, fn):
         return with_retries(fn, self.cfg.retry_attempts, self.cfg.retry_base_delay, self.sleep)
 
-    def _fail(self, row, reason: str, retry_stage: str = "queued") -> None:
+    def _fail(self, row, reason: str, retry_stage: str = "queued",
+              count_failure: bool = True) -> None:
         attempts = row["attempts"] + 1
         final = attempts >= self.cfg.max_attempts
         self._cleanup(row["id"], keep_output=(retry_stage == "ready" and not final))
         stage = "failed" if final else retry_stage
         db.mark(self.conn, row["id"], stage, reason=reason[:500], attempts=attempts)
-        self.failures += 1
+        if count_failure:
+            self.failures += 1
         self.log(f"{stage}: {row['path']}: {reason[:200]}")
 
     def _tools(self) -> tuple[str, ...]:
@@ -120,9 +124,12 @@ class Worker:
     def _finish_remote(self, row) -> bool:
         """Verify a PC upload on Drive against its report, then swap like our own."""
         vid, tmp = row["id"], tmp_path(row["path"])
+        # Defense in depth: the PC's own report should already be sane (jobs.py
+        # validates it on the way in), but never trust it enough to swap on its say alone.
+        report_valid = is_valid_md5(row["out_md5"]) and (row["out_size"] or 0) > 0
         try:
             found = self.rclone.entries(tmp)
-            ok = (len(found) == 1 and found[0]["Size"] == row["out_size"]
+            ok = (report_valid and len(found) == 1 and found[0]["Size"] == row["out_size"]
                   and self.rclone.md5(tmp) == row["out_md5"])
         except RcloneError as e:
             self.log(f"could not check PC upload {tmp}, will retry: {e}")
@@ -133,8 +140,13 @@ class Worker:
                     self.rclone.delete(tmp)
             except RcloneError:
                 pass
-            self._fail(row, "PC upload on Drive doesn't match what the PC reported")
+            # Not this worker's failure (the PC's), so it shouldn't trip the
+            # consecutive-failure breaker that stops the server's own encoding.
+            self._fail(row, "PC upload on Drive doesn't match what the PC reported",
+                      count_failure=False)
             return False
+        if not row["final_path"]:
+            db.mark(self.conn, vid, "remote_ready", final_path=final_path(row["path"]))
         db.mark(self.conn, vid, "swapping")
         try:
             self._swap(db.get(self.conn, vid))
@@ -168,10 +180,20 @@ class Worker:
                 self.jobs.expire_leases()
                 if not dry_run:
                     remote = db.rows_in(self.conn, "remote_ready")
-                    if remote:
+                    if remote and (self._remote_fail_at is None
+                                    or self.clock() - self._remote_fail_at
+                                    >= self.cfg.idle_poll_secs):
                         if self._finish_remote(remote[0]):
                             done += 1
-                        continue
+                            self._remote_fail_at = None
+                            continue
+                        if db.get(self.conn, remote[0]["id"])["stage"] == "remote_ready":
+                            # Couldn't even check Drive (RcloneError): don't hammer it
+                            # every loop iteration, and get on with the server's own
+                            # work instead of spinning on this row.
+                            self._remote_fail_at = self.clock()
+                        else:
+                            continue
                 ready = db.rows_in(self.conn, "ready")
                 if ready and self.budget.allows(ready[0]["out_size"]):
                     if self.upload_and_swap(ready[0], dry_run):
@@ -213,12 +235,25 @@ class Worker:
         src, out = self._src(vid), self._out(vid)
         try:
             if final != path and self.rclone.exists(final):
-                db.mark(self.conn, vid, "failed", reason=f"target {final} already exists")
+                db.mark_if(self.conn, vid, ("queued",), "failed",
+                          reason=f"target {final} already exists")
                 return
             self._wait_for_disk(row["size"])
             self.log(f"downloading {path} ({row['size'] / 1e9:.1f} GB)")
-            if not db.mark_if(self.conn, vid, ("queued",), "downloading", encoder="x265"):
-                self.log(f"skipping {path}: no longer queued (leased to another worker?)")
+            # Atomic: re-check the busy-stem guard and switch to downloading in one
+            # transaction, so a lease or another row's progress can't slip in between
+            # the check and the mark (requirement A: no double assignment).
+            with db.transaction(self.conn):
+                busy = {final_path(r["path"]) for r in db.rows_in(self.conn, *BUSY_STAGES)
+                        if r["id"] != vid}
+                if final in busy:
+                    started = False
+                else:
+                    started = db.mark_if(self.conn, vid, ("queued",), "downloading",
+                                         encoder="x265")
+            if not started:
+                self.log(f"skipping {path}: no longer queued or its target is busy "
+                         f"(leased to another worker?)")
                 return
             self._retry(lambda: self.rclone.download(path, src))
             self.download_budget.add(row["size"])
@@ -249,7 +284,7 @@ class Worker:
             md5 = md5_file(out)
         except DiskTooSmall as e:
             self._cleanup(vid)
-            db.mark(self.conn, vid, "failed", reason=str(e)[:500])
+            db.mark_if(self.conn, vid, ("queued",), "failed", reason=str(e)[:500])
             self.log(f"failed: {path}: {e}")
             return
         except FileNotFoundError as e:
@@ -327,6 +362,11 @@ class Worker:
         if self._one(tmp):
             if final != path and self._one(final):
                 raise SwapError(f"target {final} already exists")
+            # Defense in depth, right before the point of no return (deleting the
+            # original): re-verify the upload we're about to promote still matches
+            # the encode we actually verified, in case it changed since.
+            if self.rclone.md5(tmp) != row["out_md5"]:
+                raise SwapError("tmp no longer matches the verified encode; not deleting")
             originals = self.rclone.entries(path)
             if originals:
                 # Only delete the exact file that was downloaded and encoded.

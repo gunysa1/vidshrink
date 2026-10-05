@@ -14,7 +14,7 @@ from pathlib import Path
 from vidshrink import db, scorer
 from vidshrink.budget import Budget
 from vidshrink.config import Config
-from vidshrink.paths import final_path, tmp_path
+from vidshrink.paths import final_path, is_valid_md5, tmp_path
 from vidshrink.probe import Probe
 from vidshrink.rclone import Rclone, RcloneError
 
@@ -108,11 +108,16 @@ class JobStore:
             if not self.downloads.allows(row["size"]):
                 return {"job": None, "retry_after": self.downloads.seconds_until_reset()}
             with db.transaction(self.conn):
-                taken = db.mark_if(self.conn, row["id"], ("queued",), "leased", worker=worker,
-                                   encoder=encoder, final_path=final, reason=None,
-                                   lease_until=self.now() + self.cfg.lease_secs)
-                if taken:
-                    self.downloads.add(row["size"])
+                # Re-check right before claiming: another row may have taken this
+                # final_path/tmp_path stem since the busy set above was computed.
+                if final in self._busy_final_paths():
+                    taken = False
+                else:
+                    taken = db.mark_if(self.conn, row["id"], ("queued",), "leased",
+                                       worker=worker, encoder=encoder, final_path=final,
+                                       reason=None, lease_until=self.now() + self.cfg.lease_secs)
+                    if taken:
+                        self.downloads.add(row["size"])
             if not taken:
                 continue
             self.log(f"leased to {worker}: {row['path']}")
@@ -138,10 +143,14 @@ class JobStore:
             row = self._leased_by(job_id, worker, now)
             clear = {"worker": None, "lease_until": None}
             if outcome == "uploaded":
+                out_size, out_md5 = int(data["out_size"]), data["out_md5"]
+                if out_size <= 0 or not is_valid_md5(out_md5):
+                    raise ValueError(
+                        f"invalid uploaded report: out_size={out_size} out_md5={out_md5!r}")
                 self._mark_leased_or_raise(job_id, worker, now, "remote_ready", {
-                    "out_size": int(data["out_size"]), "out_md5": data["out_md5"],
+                    "out_size": out_size, "out_md5": out_md5,
                     "encode_secs": float(data["encode_secs"]), "reason": None, **clear})
-                self.uploads.add(int(data["out_size"]))
+                self.uploads.add(out_size)
             elif outcome == "failed":
                 attempts = row["attempts"] + 1
                 stage = "failed" if attempts >= self.cfg.max_attempts else "queued"

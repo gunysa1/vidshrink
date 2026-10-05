@@ -56,7 +56,7 @@ def test_round_trip(conn, job_service):
     job = c.claim("pc")["job"]
     assert job["id"] == vid
     assert c.heartbeat(vid, "pc") == {"cancel": False}
-    c.report(vid, "pc", "uploaded", out_size=10, out_md5="abc", encode_secs=1.5)
+    c.report(vid, "pc", "uploaded", out_size=10, out_md5="a" * 32, encode_secs=1.5)
     assert db.get(conn, vid)["stage"] == "remote_ready"
 
 
@@ -79,6 +79,15 @@ def test_unknown_outcome_is_400(conn, job_service):
     c.claim("pc")
     with pytest.raises(JobServiceError, match="400"):
         c.report(vid, "pc", "exploded")
+
+
+def test_invalid_uploaded_report_is_400(conn, job_service):
+    vid = add(conn, "a.mkv")
+    c = JobClient(job_service.url, job_service.token)
+    c.claim("pc")
+    with pytest.raises(JobServiceError, match="400"):
+        c.report(vid, "pc", "uploaded", out_size=10, out_md5="not-hex", encode_secs=1.0)
+    assert db.get(conn, vid)["stage"] == "leased"
 
 
 def test_no_work(job_service):

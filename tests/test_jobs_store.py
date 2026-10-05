@@ -106,11 +106,28 @@ def test_heartbeat_extends_and_cancels(conn, store):
 def test_report_uploaded(conn, store):
     vid = add(conn, "a.mkv")
     store.claim("pc")
-    store.report(vid, "pc", "uploaded", out_size=2_000_000_000, out_md5="abc", encode_secs=600.0)
+    md5 = "a" * 32
+    store.report(vid, "pc", "uploaded", out_size=2_000_000_000, out_md5=md5, encode_secs=600.0)
     row = db.get(conn, vid)
     assert (row["stage"], row["out_size"], row["out_md5"], row["encode_secs"]) == \
-        ("remote_ready", 2_000_000_000, "abc", 600.0)
+        ("remote_ready", 2_000_000_000, md5, 600.0)
     assert store.uploads.used() == 2_000_000_000
+
+
+def test_report_uploaded_rejects_invalid_md5(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    with pytest.raises(ValueError):
+        store.report(vid, "pc", "uploaded", out_size=10, out_md5="not-hex", encode_secs=1.0)
+    assert db.get(conn, vid)["stage"] == "leased"  # untouched
+
+
+def test_report_uploaded_rejects_non_positive_size(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    with pytest.raises(ValueError):
+        store.report(vid, "pc", "uploaded", out_size=0, out_md5="a" * 32, encode_secs=1.0)
+    assert db.get(conn, vid)["stage"] == "leased"  # untouched
 
 
 def test_report_failed_twice_marks_failed(conn, store):

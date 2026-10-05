@@ -9,9 +9,9 @@ from vidshrink import db, scorer
 from vidshrink.budget import Budget
 from vidshrink.jobs import PC_SEEN_KEY
 from vidshrink.probe import parse_ffprobe, run_ffprobe
-from vidshrink.rclone import Rclone
+from vidshrink.rclone import Rclone, RcloneError
 from vidshrink.scanner import scan
-from vidshrink.worker import Worker
+from vidshrink.worker import SwapError, Worker
 
 PC_OUT = b"encoded on the PC"
 PC_MD5 = hashlib.md5(PC_OUT).hexdigest()
@@ -58,6 +58,104 @@ def test_server_rejects_mismatched_pc_result(conn, env):
     assert not (root / "Movies" / "a.vidshrink-tmp.mkv").exists()
     row = db.get(conn, vid)
     assert (row["stage"], row["attempts"]) == ("queued", 1)
+    # A PC-side upload mismatch is the PC's failure, not the server's; it must not
+    # trip the server's own consecutive-failure breaker.
+    assert worker.failures == 0
+
+
+@pytest.mark.parametrize("bad_md5,bad_size", [("not-32-hex-chars", None), (None, 0)])
+def test_finish_remote_rejects_invalid_report_fields(conn, env, bad_md5, bad_size):
+    """Minor: a missing/non-32-hex out_md5 or non-positive out_size is treated as a
+    mismatch even if it happens to match what's on Drive by coincidence."""
+    root, worker = env
+    md5 = bad_md5 if bad_md5 is not None else PC_MD5
+    vid = as_remote_ready(conn, root, md5=md5)
+    if bad_size is not None:
+        db.mark(conn, vid, "remote_ready", out_size=bad_size)
+    worker._finish_remote(db.get(conn, vid))
+    assert (root / "Movies" / "a.mkv").read_bytes() != PC_OUT
+    assert not (root / "Movies" / "a.vidshrink-tmp.mkv").exists()
+    assert db.get(conn, vid)["stage"] == "queued"
+
+
+def test_swap_refuses_when_tmp_no_longer_matches_out_md5(conn, env):
+    """Requirement 1(i): defense in depth in _swap itself -- even if something got
+    past _finish_remote's own check, _swap must re-verify right before deleting the
+    original."""
+    root, worker = env
+    row = db.get_by_path(conn, "Movies/a.mkv")
+    original = (root / "Movies" / "a.mkv").read_bytes()
+    tampered = b"tampered after verification"
+    (root / "Movies" / "a.vidshrink-tmp.mkv").write_bytes(tampered)
+    db.mark(conn, row["id"], "swapping", out_size=len(tampered),
+            out_md5=hashlib.md5(b"something else entirely").hexdigest(),
+            final_path="Movies/a.mkv", encode_secs=1.0)
+    with pytest.raises(SwapError):
+        worker._swap(db.get(conn, row["id"]))
+    assert (root / "Movies" / "a.mkv").read_bytes() == original
+    assert (root / "Movies" / "a.vidshrink-tmp.mkv").exists()
+    assert db.get(conn, row["id"])["stage"] != "done"
+
+
+def test_prepare_leaves_row_queued_if_its_stem_becomes_busy(conn, env, make_clip):
+    """Requirement 1(ii): a row whose final_path becomes busy (another row with the
+    same stem gets leased) after _next_job() returned it must be left queued, with
+    nothing downloaded, when prepare() re-checks atomically. Uses two rows whose
+    shared final_path ("Movies/x.mkv") doesn't already exist on Drive, so this
+    exercises the busy-stem race rather than the unrelated "target already exists"
+    check."""
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    # Extensions on the two source files, not their actual container -- ffprobe reads
+    # the real content, so this is enough to create a same-stem, non-mkv collision.
+    shutil.copy(make_clip("x1", container="mp4"), root / "Movies" / "x.avi")
+    shutil.copy(make_clip("x2", container="mp4"), root / "Movies" / "x.mov")
+    rc = Rclone(worker.cfg.remote)
+    scan(conn, rc, worker.cfg, lambda p, s: parse_ffprobe(run_ffprobe(str(root / p)), s),
+         log=lambda s: None)
+
+    avi_row = db.get_by_path(conn, "Movies/x.avi")
+    mov_row_snapshot = db.get_by_path(conn, "Movies/x.mov")  # as _next_job() would see it
+    assert mov_row_snapshot["stage"] == "queued"
+    assert not worker.rclone.exists("Movies/x.mkv")
+
+    # Another row claims the shared stem (Movies/x.mkv) after _next_job() returned
+    # the mov row but before prepare() got to switch it to downloading.
+    db.mark(conn, avi_row["id"], "leased", worker="pc", lease_until=time.time() + 600)
+
+    worker.prepare(mov_row_snapshot)
+
+    after = db.get(conn, mov_row_snapshot["id"])
+    assert after["stage"] == "queued"
+    assert not worker._src(mov_row_snapshot["id"]).exists()
+
+
+def test_run_does_not_hot_loop_on_remote_check_errors(conn, env, make_clip):
+    """Requirement 2: a RcloneError while checking a remote_ready row on Drive must
+    not be retried every loop iteration; the server should get on with its own
+    queued work instead."""
+    root, worker = env
+    shutil.copy(make_clip("b"), root / "Movies" / "b.mkv")
+    rc = Rclone(worker.cfg.remote)
+    scan(conn, rc, worker.cfg, lambda p, s: parse_ffprobe(run_ffprobe(str(root / p)), s),
+         log=lambda s: None)
+    as_remote_ready(conn, root)
+
+    tmp = "Movies/a.vidshrink-tmp.mkv"
+    real_entries = worker.rclone.entries
+    calls = []
+
+    def flaky_entries(path):
+        calls.append(path)
+        if path == tmp:
+            raise RcloneError(1, "simulated check failure")
+        return real_entries(path)
+
+    worker.rclone.entries = flaky_entries
+    done = worker.run(limit=1)
+    assert done == 1
+    assert db.get_by_path(conn, "Movies/b.mkv")["stage"] == "done"
+    assert calls.count(tmp) <= 2
 
 
 def test_handover_leaves_long_jobs_to_the_pc(conn, env):
