@@ -96,6 +96,8 @@ class JobStore:
         self.expire_leases()
         if self.downloads.blocked():
             return {"job": None, "retry_after": self.downloads.seconds_until_reset()}
+        if self.uploads.blocked():
+            return {"job": None, "retry_after": self.uploads.seconds_until_reset()}
         busy = self._busy_final_paths()
         for row in self._candidates(encoder):
             final = final_path(row["path"])
@@ -168,6 +170,10 @@ class JobStore:
                 self.downloads.block(self.cfg.download_block_secs)
                 self._mark_leased_or_raise(job_id, worker, now, "queued", clear)
                 self.log("PC hit Drive's download quota; downloads paused for everyone")
+            elif outcome == "upload_limited":
+                self.uploads.block(self.cfg.rate_limit_block_secs)
+                self._mark_leased_or_raise(job_id, worker, now, "queued", clear)
+                self.log("PC hit Drive's upload limit; uploads paused for everyone")
             else:
                 raise ValueError(f"unknown outcome {outcome!r}")
         self.log(f"{worker} reported {outcome}: {row['path']}")
@@ -214,7 +220,14 @@ class JobStore:
 
 
 class JobServiceError(Exception):
-    pass
+    """`status` is the HTTP status code when known (e.g. 400, 500), or None for a
+    connection failure (couldn't reach the service at all) — both are used by
+    callers to decide whether a retry is worth it: None/5xx is transient, a 4xx
+    (other than 409, which raises LeaseLost instead) is not."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 REQUEST_TIMEOUT_SECS = 30
@@ -320,7 +333,7 @@ class JobClient:
             detail = e.read().decode(errors="replace")[:300]
             if e.code == 409:
                 raise LeaseLost(detail) from None
-            raise JobServiceError(f"HTTP {e.code} on {path}: {detail}") from None
+            raise JobServiceError(f"HTTP {e.code} on {path}: {detail}", status=e.code) from None
         except (urllib.error.URLError, OSError) as e:
             raise JobServiceError(f"cannot reach job service at {self.base}: {e}") from None
 

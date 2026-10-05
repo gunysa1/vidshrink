@@ -156,6 +156,17 @@ def test_report_not_worth_it_changed_and_quota(conn, store):
     assert store.downloads.blocked()
 
 
+def test_report_upload_limited_blocks_uploads_and_requeues(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "upload_limited")
+    row = db.get(conn, vid)
+    assert (row["stage"], row["attempts"], row["worker"]) == ("queued", 0, None)
+    assert store.uploads.blocked()
+    r = store.claim("pc")
+    assert r["job"] is None and r["retry_after"] > 0
+
+
 def test_report_from_wrong_worker(conn, store):
     vid = add(conn, "a.mkv")
     store.claim("pc")

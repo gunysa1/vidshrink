@@ -3,6 +3,7 @@ import posixpath
 import random
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -12,12 +13,18 @@ from typing import TypeVar
 
 T = TypeVar("T")
 TMP_SUFFIX = ".vidshrink-tmp.mkv"
+# How long a cancelled transfer gets to exit after terminate() before kill().
+CANCEL_GRACE_SECS = 5.0
 # Drive's daily download quota (shared with anything else on the account, e.g. Plex).
 DOWNLOAD_QUOTA_MARKER = "downloadQuotaExceeded"
 # "Received upload limit error" is what rclone 1.60 logs when --drive-stop-on-upload-limit
 # turns Drive's daily-limit 403 into a fatal error.
 RATE_LIMIT_MARKERS = ("userRateLimitExceeded", "uploadLimitExceeded", "User rate limit exceeded",
                       "Received upload limit error")
+
+
+class TransferCancelled(Exception):
+    """A download/upload was cancelled (Stop now / server cancel) before it finished."""
 
 
 class RcloneError(Exception):
@@ -44,12 +51,33 @@ class Rclone:
     def _p(self, path: str) -> str:
         return self.remote + path
 
-    def _run(self, *args: str) -> str:
-        res = subprocess.run([self.binary, *args, *self.extra_args],
-                             capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RcloneError(res.returncode, res.stderr)
-        return res.stdout
+    def _run(self, *args: str, cancel: threading.Event | None = None) -> str:
+        cmd = [self.binary, *args, *self.extra_args]
+        if cancel is None:
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise RcloneError(res.returncode, res.stderr)
+            return res.stdout
+        # Cancellable path: poll so Stop now / a server cancel can interrupt a
+        # transfer within about CANCEL_GRACE_SECS instead of waiting it out.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while True:
+            try:
+                proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel.is_set():
+                    proc.terminate()  # Windows-safe: no signals, terminate()/kill() only
+                    try:
+                        proc.wait(timeout=CANCEL_GRACE_SECS)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    raise TransferCancelled("transfer cancelled") from None
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            raise RcloneError(proc.returncode, err)
+        return out
 
     def list_videos(self, extensions: Sequence[str]) -> list[dict]:
         pattern = "*.{" + ",".join(extensions) + "}"
@@ -58,11 +86,11 @@ class Rclone:
         # Our own upload temp files are not videos to shrink.
         return [e for e in json.loads(out) if not e["Path"].endswith(TMP_SUFFIX)]
 
-    def download(self, path: str, local: Path) -> None:
-        self._run("copyto", self._p(path), str(local))
+    def download(self, path: str, local: Path, cancel: threading.Event | None = None) -> None:
+        self._run("copyto", self._p(path), str(local), cancel=cancel)
 
-    def upload(self, local: Path, path: str) -> None:
-        self._run("copyto", str(local), self._p(path))
+    def upload(self, local: Path, path: str, cancel: threading.Event | None = None) -> None:
+        self._run("copyto", str(local), self._p(path), cancel=cancel)
 
     def delete(self, path: str) -> None:
         self._run("deletefile", self._p(path))

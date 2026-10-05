@@ -1,11 +1,14 @@
 import hashlib
+import threading
+import time
 import urllib.parse
 import urllib.request
 
 import pytest
 
 from vidshrink.config import Config
-from vidshrink.rclone import Rclone, RcloneError, free_port, serve_http, with_retries
+from vidshrink.rclone import (Rclone, RcloneError, TransferCancelled, free_port, serve_http,
+                              with_retries)
 
 
 @pytest.fixture
@@ -143,6 +146,26 @@ def test_serve_http_reports_served_bytes(rc):
         stats = served_stats(rc_port)
     assert stats["bytes"] == 100
     assert "downloadQuotaExceeded" not in stats.get("lastError", "")
+
+
+def test_cancel_interrupts_transfer(rc, tmp_path):
+    local = tmp_path / "big.bin"
+    local.write_bytes(b"x" * (20 * 1024 * 1024))
+    slow = Rclone(rc.remote, ("--bwlimit", "1M"))
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    start = time.monotonic()
+    with pytest.raises(TransferCancelled):
+        slow.upload(local, "slow.mkv", cancel=cancel)
+    assert time.monotonic() - start < 10
+
+
+def test_no_cancel_arg_behaves_as_before(rc, tmp_path):
+    # cancel=None (the default) must not change behaviour at all.
+    local = tmp_path / "x.bin"
+    local.write_bytes(b"y" * 100)
+    rc.upload(local, "y.mkv", cancel=None)
+    assert rc.exists("y.mkv")
 
 
 def test_with_retries_does_not_retry_download_quota():
