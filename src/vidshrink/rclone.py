@@ -11,6 +11,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TypeVar
 
+from vidshrink import procflags
+from vidshrink.procflags import TEXT_KWARGS
+
 T = TypeVar("T")
 TMP_SUFFIX = ".vidshrink-tmp.mkv"
 # How long a cancelled transfer gets to exit after terminate() before kill().
@@ -54,7 +57,8 @@ class Rclone:
     def _run(self, *args: str, cancel: threading.Event | None = None) -> str:
         cmd = [self.binary, *args, *self.extra_args]
         if cancel is None:
-            res = subprocess.run(cmd, capture_output=True, text=True)
+            res = subprocess.run(cmd, capture_output=True, **TEXT_KWARGS,
+                                 **procflags.spawn_kwargs())
             if res.returncode != 0:
                 raise RcloneError(res.returncode, res.stderr)
             return res.stdout
@@ -66,7 +70,10 @@ class Rclone:
         # the child blocks on a full pipe, wait() blocks forever with it. Calling
         # communicate(timeout=...) repeatedly after a TimeoutExpired is the
         # documented-safe way to poll while still draining both pipes.
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Own process group/session: a Ctrl-C in the PC worker's console must not
+        # kill rclone behind our back; we stop it ourselves and release the job.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                **TEXT_KWARGS, **procflags.spawn_kwargs(new_group=True))
         while True:
             try:
                 out, err = proc.communicate(timeout=0.5)
@@ -149,7 +156,7 @@ def serve_http(rclone: Rclone, port: int, rc_port: int | None = None,
     proc = subprocess.Popen(
         [rclone.binary, "serve", "http", rclone.remote, "--addr", f"127.0.0.1:{port}",
          "--read-only", "--tpslimit", "10", *serve_args, *rc, *rclone.extra_args],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **procflags.spawn_kwargs(),
     )
     try:
         deadline = time.monotonic() + 30

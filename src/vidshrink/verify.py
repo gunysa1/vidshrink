@@ -2,6 +2,9 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from vidshrink import procflags
+from vidshrink.procflags import TEXT_KWARGS
+
 from vidshrink.probe import Probe
 
 
@@ -37,7 +40,7 @@ def decode_errors(path: Path) -> str:
     res = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", str(path),
          "-map", "0:v", "-map", "0:a?", "-f", "null", "-"],
-        capture_output=True, text=True,
+        capture_output=True, **TEXT_KWARGS, **procflags.spawn_kwargs(),
     )
     err = res.stderr.strip()
     if res.returncode != 0 and not err:

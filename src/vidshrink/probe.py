@@ -2,6 +2,9 @@ import json
 import subprocess
 from dataclasses import asdict, dataclass
 
+from vidshrink import procflags
+from vidshrink.procflags import TEXT_KWARGS
+
 HDR_TRANSFERS = ("smpte2084", "arib-std-b67")
 
 
@@ -121,7 +124,8 @@ def run_ffprobe(target: str) -> dict:
     cmd = ["ffprobe", "-v", "error", "-print_format", "json",
            "-show_format", "-show_streams", target]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        res = subprocess.run(cmd, capture_output=True, timeout=300, **TEXT_KWARGS,
+                             **procflags.spawn_kwargs())
     except subprocess.TimeoutExpired:
         raise ProbeError("ffprobe timed out") from None
     if res.returncode != 0:

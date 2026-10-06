@@ -7,7 +7,9 @@ from collections.abc import Callable
 from pathlib import Path
 from statistics import mean
 
+from vidshrink import procflags
 from vidshrink.encode import EncodeError
+from vidshrink.procflags import TEXT_KWARGS
 from vidshrink.probe import Probe
 
 
@@ -19,7 +21,8 @@ def vmaf(distorted: Path, reference: Path, threads: int = 4) -> float:
         res = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
                               "-i", str(distorted.resolve()), "-i", str(reference.resolve()),
                               "-lavfi", graph, "-f", "null", "-"],
-                             capture_output=True, text=True, cwd=d)
+                             capture_output=True, cwd=d, **TEXT_KWARGS,
+                             **procflags.spawn_kwargs())
         if res.returncode != 0:
             raise EncodeError(f"vmaf failed: {res.stderr[-300:]}")
         log = Path(d) / "vmaf.json"
@@ -31,7 +34,7 @@ def cut_sample(src: Path, out: Path, probe: Probe, seconds: int = 60) -> None:
     res = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error",
                           "-ss", f"{start:.1f}", "-i", str(src), "-t", str(seconds),
                           "-map", f"0:v:{probe.video_index}", "-c", "copy", str(out)],
-                         capture_output=True, text=True)
+                         capture_output=True, **TEXT_KWARGS, **procflags.spawn_kwargs())
     if res.returncode != 0:
         raise EncodeError(f"cut failed: {res.stderr[-300:]}")
 

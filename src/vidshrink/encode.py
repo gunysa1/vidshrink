@@ -3,6 +3,7 @@ import threading
 import time
 from pathlib import Path
 
+from vidshrink import procflags
 from vidshrink.config import Config
 from vidshrink.probe import Probe
 from vidshrink.scorer import resolution_class
@@ -73,9 +74,10 @@ def build_command(src: Path, out: Path, probe: Probe, cfg: Config) -> list[str]:
 def run_encode(cmd: list[str], log_path: Path) -> float:
     start = time.monotonic()
     with open(log_path, "w") as log:
-        res = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+        res = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                             **procflags.spawn_kwargs())
     if res.returncode != 0:
-        tail = log_path.read_text(errors="replace")[-500:]
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-500:]
         raise EncodeError(f"ffmpeg exit {res.returncode}: {tail}")
     return time.monotonic() - start
 
@@ -103,7 +105,10 @@ def build_nvenc_command(src: Path, out: Path, probe: Probe, cq: int) -> list[str
 def run_encode_cancellable(cmd: list[str], log_path: Path, cancel: threading.Event) -> float:
     start = time.monotonic()
     with open(log_path, "w") as log:
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+        # Own process group/session: Ctrl-C in the console reaches only us; we kill
+        # ffmpeg ourselves on cancel and release the job.
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                **procflags.spawn_kwargs(new_group=True))
         while True:
             try:
                 code = proc.wait(timeout=1)
@@ -114,6 +119,6 @@ def run_encode_cancellable(cmd: list[str], log_path: Path, cancel: threading.Eve
                     proc.wait()
                     raise EncodeCancelled("encode cancelled") from None
     if code != 0:
-        tail = log_path.read_text(errors="replace")[-500:]
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-500:]
         raise EncodeError(f"ffmpeg exit {code}: {tail}")
     return time.monotonic() - start
