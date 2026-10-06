@@ -1,9 +1,12 @@
 """Tray icon for the PC worker: Start / Stop now / Stop after this file / Status / Exit."""
 import atexit
+import posixpath
 import threading
 from collections.abc import Callable
 
 COLORS = {"off": (128, 128, 128), "working": (40, 170, 70), "finishing": (230, 160, 30)}
+# Windows rejects a notification-area tooltip longer than this (NOTIFYICONDATA.szTip).
+TITLE_MAX = 127
 
 
 class TrayController:
@@ -11,7 +14,6 @@ class TrayController:
         self.make_worker = make_worker
         self.worker = None
         self.thread: threading.Thread | None = None
-        self.session_done = 0
 
     @property
     def state(self) -> str:
@@ -39,13 +41,35 @@ class TrayController:
         if self.thread is not None:
             self.thread.join(30)
 
-    def status_text(self) -> str:
+    def status_text(self, short: bool = False) -> str:
+        """Full status for the menu; short=True names only the file (not its folder),
+        for the size-limited icon tooltip."""
         if self.state == "off":
             done = self.worker.done if self.worker else 0
-            return f"Off — {done} file(s) this session"
-        w = self.worker
-        current = w.current_path if w.current_path else "—"
-        return f"{self.state.title()}: {w.stage or 'waiting'} — {current} ({w.done} done)"
+            text = f"Off — {done} file(s) this session"
+        else:
+            w = self.worker
+            current = w.current_path if w.current_path else "—"
+            if short and w.current_path:
+                current = posixpath.basename(current)
+            text = f"{self.state.title()}: {w.stage or 'waiting'} — {current} ({w.done} done)"
+        dl = getattr(self.worker, "download_today", None) if self.worker else None
+        if dl:
+            used, limit = dl
+            text += f" · DL today {used / 1e9:.0f}/{limit / 1e9:.0f} GB"
+        return text
+
+
+def tray_title(title: str, controller: TrayController) -> str:
+    return f"{title}: {controller.status_text(short=True)}"[:TITLE_MAX]
+
+
+def tick(refresh: Callable, icon, log: Callable[[str], None] = print) -> None:
+    """One ticker step: a failed refresh is logged, never allowed to kill the ticker."""
+    try:
+        refresh(icon)
+    except Exception as e:
+        log(f"tray refresh failed: {e!r}")
 
 
 def _icon_image(color):
@@ -60,7 +84,7 @@ def run_tray(controller: TrayController, title: str = "vidshrink") -> None:
 
     def refresh(icon):
         icon.icon = _icon_image(COLORS[controller.state])
-        icon.title = f"{title}: {controller.status_text()}"
+        icon.title = tray_title(title, controller)
         icon.update_menu()
 
     def act(fn):
@@ -94,7 +118,7 @@ def run_tray(controller: TrayController, title: str = "vidshrink") -> None:
 
         def ticker():
             while not stopped.wait(5):
-                refresh(i)
+                tick(refresh, i)
         threading.Thread(target=ticker, daemon=True).start()
 
     icon.run(setup=setup)
