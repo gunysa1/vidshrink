@@ -9,6 +9,7 @@ dependencies = ["tzdata; sys_platform == 'win32'"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+pc = ["pystray>=0.19", "Pillow>=10"]
 
 [project.scripts]
 vidshrink = "vidshrink.cli:main"
