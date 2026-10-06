@@ -91,12 +91,21 @@ class JobStore:
         scored.sort(key=lambda t: (-t[0], t[1]["id"]))
         return [row for _, row in scored]
 
+    def _download_today(self) -> dict:
+        """Today's download total, for the PC's tray status."""
+        return {"download_used": self.downloads.used(), "download_limit": self.downloads.limit}
+
     def claim(self, worker: str, encoder: str = "nvenc") -> dict:
+        return {**self._claim(worker, encoder), **self._download_today()}
+
+    def _claim(self, worker: str, encoder: str) -> dict:
         self._seen()
         self.expire_leases()
         if self.downloads.blocked():
             return {"job": None, "retry_after": self.downloads.seconds_until_reset()}
-        if self.uploads.blocked():
+        if not self.uploads.allows(1):
+            # Blocked by a rate-limit error, or today's upload budget is used up:
+            # the PC's result couldn't be uploaded today anyway.
             return {"job": None, "retry_after": self.uploads.seconds_until_reset()}
         busy = self._busy_final_paths()
         for row in self._candidates(encoder):
@@ -136,7 +145,7 @@ class JobStore:
         with db.transaction(self.conn):
             ok = self._is_leased_by(job_id, worker, now) and self._update_leased(
                 job_id, worker, now, {"lease_until": now + self.cfg.lease_secs})
-        return {"cancel": not ok}
+        return {"cancel": not ok, **self._download_today()}
 
     def report(self, job_id: int, worker: str, outcome: str, **data) -> None:
         self._seen()

@@ -94,3 +94,39 @@ def test_transaction_takes_write_lock_up_front(conn, cfg):
                 other.execute("BEGIN IMMEDIATE")
     finally:
         other.close()
+
+
+def test_connect_tolerates_a_concurrent_migration(cfg, monkeypatch):
+    """Two processes starting at once can both see a column missing; the one that
+    loses the race must not crash on "duplicate column name"."""
+    db.connect(cfg.db_path).close()  # the other process already migrated
+    real_connect = sqlite3.connect
+
+    class StaleTableInfo:
+        """A connection whose table_info read happened before the other ALTER."""
+
+        def __init__(self, c):
+            object.__setattr__(self, "_c", c)
+
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA table_info"):
+                return iter([])
+            return self._c.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._c, name, value)
+
+    monkeypatch.setattr(db.sqlite3, "connect",
+                        lambda *a, **k: StaleTableInfo(real_connect(*a, **k)))
+    c = db.connect(cfg.db_path)
+    cols = {r["name"] for r in c._c.execute("PRAGMA table_info(videos)")}
+    assert {name for name, _ in db.MIGRATIONS} <= cols
+    c.close()
+
+
+def test_connect_twice_is_idempotent(cfg):
+    db.connect(cfg.db_path).close()
+    db.connect(cfg.db_path).close()

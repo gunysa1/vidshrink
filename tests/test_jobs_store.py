@@ -96,11 +96,11 @@ def test_heartbeat_extends_and_cancels(conn, store):
     vid = add(conn, "a.mkv")
     store.claim("pc")
     store.clock.t += 600
-    assert store.heartbeat(vid, "pc") == {"cancel": False}
+    assert store.heartbeat(vid, "pc")["cancel"] is False
     assert db.get(conn, vid)["lease_until"] == store.clock.t + 1800
-    assert store.heartbeat(vid, "other") == {"cancel": True}
+    assert store.heartbeat(vid, "other")["cancel"] is True
     db.mark(conn, vid, "queued")
-    assert store.heartbeat(vid, "pc") == {"cancel": True}
+    assert store.heartbeat(vid, "pc")["cancel"] is True
 
 
 def test_report_uploaded(conn, store):
@@ -226,7 +226,7 @@ def test_heartbeat_after_expiry_cancels_without_reviving(conn, store):
     store.claim("pc")
     original_lease_until = db.get(conn, vid)["lease_until"]
     store.clock.t += 1801
-    assert store.heartbeat(vid, "pc") == {"cancel": True}
+    assert store.heartbeat(vid, "pc")["cancel"] is True
     row = db.get(conn, vid)
     assert row["stage"] == "leased" and row["lease_until"] == original_lease_until
 
@@ -270,3 +270,26 @@ def test_claim_skips_same_stem_collision(conn, store):
     db.mark(conn, avi, "done")
     r2 = store.claim("pc")
     assert r2["job"]["id"] == mp4
+
+
+def test_claim_waits_when_upload_budget_used_up(conn, cfg, store):
+    add(conn, "a.mkv")
+    store.uploads.add(cfg.daily_upload_limit)
+    r = store.claim("pc")
+    assert r["job"] is None and r["retry_after"] > 0
+    assert db.get_by_path(conn, "a.mkv")["stage"] == "queued"
+    assert store.downloads.used() == 0  # nothing charged for a job not handed out
+
+
+def test_claim_and_heartbeat_report_download_today(conn, cfg, store):
+    vid = add(conn, "a.mkv", size=5_000_000_000)
+    r = store.claim("pc")
+    assert r["job"]["id"] == vid
+    assert (r["download_used"], r["download_limit"]) == (5_000_000_000,
+                                                         cfg.daily_download_limit)
+    store.downloads.add(1_000)
+    hb = store.heartbeat(vid, "pc")
+    assert (hb["download_used"], hb["download_limit"]) == (5_000_001_000,
+                                                           cfg.daily_download_limit)
+    empty = store.claim("pc")  # no work left: still reports the totals
+    assert empty["job"] is None and empty["download_used"] == 5_000_001_000

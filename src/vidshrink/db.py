@@ -46,7 +46,13 @@ def connect(path: Path | str) -> sqlite3.Connection:
     have = {r["name"] for r in conn.execute("PRAGMA table_info(videos)")}
     for name, kind in MIGRATIONS:
         if name not in have:
-            conn.execute(f"ALTER TABLE videos ADD COLUMN {name} {kind}")
+            try:
+                conn.execute(f"ALTER TABLE videos ADD COLUMN {name} {kind}")
+            except sqlite3.OperationalError as e:
+                # Another process (e.g. serve and run starting together) added it
+                # between our table_info read and this ALTER.
+                if "duplicate column name" not in str(e):
+                    raise
     return conn
 
 
