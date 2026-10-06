@@ -214,9 +214,14 @@ class Worker:
                 if row is not None:
                     waits["download"] = self.download_budget.seconds_until_reset()
                 kind = min(waits, key=waits.get)
+                wait = waits[kind]
+                if self._pc_holds_work():
+                    # Wake up regularly anyway: a PC result (remote_ready) needs no
+                    # budget of ours to verify and swap, and must not sit for hours.
+                    wait = min(wait, self.cfg.idle_poll_secs)
                 self.log(f"{' and '.join(waits)} budget used up; "
-                         f"sleeping {waits[kind] / 3600:.1f} h")
-                self.sleep(waits[kind])
+                         f"sleeping {wait / 3600:.1f} h")
+                self.sleep(wait)
             return done
 
     def _wait_for_disk(self, size: int) -> None:
@@ -435,7 +440,10 @@ class Worker:
             self._cleanup(row["id"])
             self.log(f"SWAP FAILED, original kept: {row['path']}: {e}")
             return
-        # The original is already in Drive's trash; the local output may be the only copy.
+        # The original is already in Drive's trash; the encode may be the only copy.
+        # A PC encode (nvenc) only ever existed here as the Drive tmp, never locally.
+        kept = (tmp_path(row["path"]) + " on Drive" if row["encoder"] == "nvenc"
+                else self._out(row["id"]))
         db.mark(self.conn, row["id"], "swapping", reason=f"swap: needs attention: {e}"[:500])
         self.log(f"!!! SWAP NEEDS ATTENTION: original of {row['path']} is gone and the "
-                 f"encode is not in place; keeping {self._out(row['id'])}: {e}")
+                 f"encode is not in place; keeping {kept}: {e}")

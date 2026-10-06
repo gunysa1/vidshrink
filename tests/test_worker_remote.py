@@ -234,3 +234,53 @@ def test_next_job_skips_queued_row_sharing_a_stem_with_a_busy_row(conn, env, mak
 
     picked = worker._next_job()
     assert picked is None or picked["id"] != mp4_row["id"]
+
+
+def _budget_wait_sleep(worker):
+    """Run until the first sleep and return what it asked for."""
+    slept = []
+
+    def sleep(s):
+        slept.append(s)
+        raise KeyboardInterrupt
+
+    worker.sleep = sleep
+    with pytest.raises(KeyboardInterrupt):
+        worker.run()
+    return slept[0]
+
+
+@pytest.mark.parametrize("stage", ["leased", "remote_ready"])
+def test_budget_wait_is_capped_while_pc_holds_work(conn, env, make_clip, stage):
+    root, worker = env
+    shutil.copy(make_clip("b"), root / "Movies" / "b.mkv")
+    scan(conn, worker.rclone, worker.cfg,
+         lambda p, s: parse_ffprobe(run_ffprobe(str(root / p)), s), log=lambda s: None)
+    pc_row = db.get_by_path(conn, "Movies/b.mkv")["id"]
+    db.mark(conn, pc_row, stage, worker="pc", encoder="nvenc", lease_until=time.time() + 600,
+            out_size=len(PC_OUT), out_md5=PC_MD5)
+    worker._remote_fail_at = worker.clock()  # skip finishing the remote_ready row now
+    worker.download_budget.block(worker.cfg.download_block_secs)  # a.mkv must wait
+    assert worker.download_budget.seconds_until_reset() > worker.cfg.idle_poll_secs
+    assert _budget_wait_sleep(worker) <= worker.cfg.idle_poll_secs
+
+
+def test_budget_wait_unchanged_without_pc_work(conn, env):
+    _, worker = env
+    worker.download_budget.block(worker.cfg.download_block_secs)
+    expected = worker.download_budget.seconds_until_reset()
+    assert expected > worker.cfg.idle_poll_secs
+    assert _budget_wait_sleep(worker) == pytest.approx(expected, abs=5)
+
+
+def test_swap_needs_attention_log_names_drive_tmp_for_pc_rows(conn, env):
+    root, worker = env
+    vid = as_remote_ready(conn, root)
+    db.mark(conn, vid, "swapping")
+    (root / "Movies" / "a.mkv").unlink()  # the original is already gone
+    logs = []
+    worker.log = logs.append
+    worker._swap_failed(db.get(conn, vid), SwapError("move failed"))
+    msg = next(m for m in logs if "NEEDS ATTENTION" in m)
+    assert "Movies/a.vidshrink-tmp.mkv" in msg
+    assert str(worker._out(vid)) not in msg
