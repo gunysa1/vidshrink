@@ -445,3 +445,162 @@ def test_load_pc_config(tmp_path):
     c = load_pc_config(p)
     assert (c.server, c.token, c.cq, c.bwlimit) == ("http://192.168.1.10:8765", "abc", 24, "6M")
     assert c.workdir == Path("D:/vidshrink")
+
+
+# --- final-review fixes: unit tests with fakes ------------------------------
+
+class FakeRemote:
+    """Just enough of Rclone for the tmp-cleanup paths."""
+
+    def __init__(self, files=None):
+        self.files = dict(files or {})  # path -> md5
+        self.deleted = []
+
+    def exists(self, path):
+        return path in self.files
+
+    def md5(self, path):
+        return self.files.get(path)
+
+    def delete(self, path):
+        self.deleted.append(path)
+        self.files.pop(path, None)
+
+
+class FakeClient:
+    def __init__(self, heartbeat=None, claim=None):
+        self._heartbeat = heartbeat
+        self._claim = claim
+        self.released = []
+
+    def heartbeat(self, job_id, worker):
+        return self._heartbeat()
+
+    def claim(self, worker, encoder):
+        return self._claim()
+
+    def release(self, job_id, worker):
+        self.released.append(job_id)
+
+
+JOB = {"id": 7, "path": "Movies/a.mkv", "tmp_path": "Movies/a.vidshrink-tmp.mkv"}
+TMP = JOB["tmp_path"]
+
+
+def fake_pc(tmp_path, client=None, remote=None, logs=None, **cfg):
+    pcfg = PCConfig(server="http://x", token="t", workdir=tmp_path / "pcwork",
+                    worker_name="pc", **cfg)
+    return PCWorker(pcfg, client or FakeClient(), remote or FakeRemote(),
+                    encode=lambda *a: 0.0, log=(logs.append if logs is not None else
+                                                (lambda m: None)))
+
+
+def test_stop_now_abandon_without_local_md5_deletes_nothing(tmp_path):
+    remote, logs = FakeRemote({TMP: "f" * 32}), []
+    pc = fake_pc(tmp_path, remote=remote, logs=logs)
+    pc._abandon(JOB, TMP, None)
+    assert remote.deleted == []
+    assert any("not deleting" in m and TMP in m for m in logs)
+    assert pc.client.released == [7]
+
+
+def test_stop_now_abandon_leaves_a_tmp_that_is_not_ours(tmp_path):
+    remote = FakeRemote({TMP: "a" * 32})
+    pc = fake_pc(tmp_path, remote=remote)
+    pc._abandon(JOB, TMP, "b" * 32)
+    assert remote.deleted == []
+
+
+def test_stop_now_abandon_deletes_our_complete_tmp(tmp_path):
+    remote = FakeRemote({TMP: "a" * 32})
+    pc = fake_pc(tmp_path, remote=remote)
+    pc._abandon(JOB, TMP, "a" * 32)
+    assert remote.deleted == [TMP]
+
+
+def test_heartbeat_outage_longer_than_lease_cancels_as_server_cancel(tmp_path):
+    def down():
+        raise JobServiceError("cannot reach job service")
+
+    pc = fake_pc(tmp_path, client=FakeClient(heartbeat=down), heartbeat_secs=0.02,
+                 lease_secs=0.3)
+    stop, cancel, server_cancelled = threading.Event(), threading.Event(), threading.Event()
+    t = threading.Thread(target=pc._heartbeat, args=(7, stop, cancel, server_cancelled),
+                         daemon=True)
+    start = time.monotonic()
+    t.start()
+    t.join(5)
+    assert not t.is_alive()
+    assert cancel.is_set() and server_cancelled.is_set()
+    assert time.monotonic() - start >= 0.3
+
+
+def test_heartbeat_outage_resets_on_success(tmp_path):
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] % 3:  # fail twice, succeed once, ...
+            raise JobServiceError("blip")
+        return {"cancel": False}
+
+    pc = fake_pc(tmp_path, client=FakeClient(heartbeat=flaky), heartbeat_secs=0.02,
+                 lease_secs=0.15)
+    stop, cancel, server_cancelled = threading.Event(), threading.Event(), threading.Event()
+    t = threading.Thread(target=pc._heartbeat, args=(7, stop, cancel, server_cancelled),
+                         daemon=True)
+    t.start()
+    time.sleep(0.6)
+    stop.set()
+    t.join(5)
+    assert not cancel.is_set() and not server_cancelled.is_set()
+
+
+def test_lease_secs_default_matches_server():
+    from vidshrink.config import Config
+    assert PCConfig(server="x", token="t").lease_secs == Config().lease_secs == 1800
+
+
+def test_download_today_from_claim_and_heartbeat(tmp_path, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    pc = None
+
+    def claim():
+        pc.stop(now=False)
+        return {"job": None, "retry_after": 0.01, "download_used": 12e9,
+                "download_limit": 500e9}
+
+    pc = fake_pc(tmp_path, client=FakeClient(
+        claim=claim, heartbeat=lambda: {"cancel": False, "download_used": 13e9,
+                                        "download_limit": 500e9}), heartbeat_secs=0.02)
+    assert pc.download_today is None
+    pc.run()
+    assert pc.download_today == (12e9, 500e9)
+    stop = threading.Event()
+    t = threading.Thread(target=pc._heartbeat,
+                         args=(7, stop, threading.Event(), threading.Event()), daemon=True)
+    t.start()
+    assert wait_for(lambda: pc.download_today == (13e9, 500e9), timeout=5)
+    stop.set()
+    t.join(5)
+
+
+def test_missing_output_after_encode_is_reported_failed(conn, setup, monkeypatch):
+    root, pc, store = setup
+    pc.encode = lambda src, out, probe, log_path, cancel: 0.0  # "exit 0", no output
+    reports = []
+    orig_report = pc.client.report
+
+    def spy(job_id, worker, outcome, **data):
+        reports.append((outcome, data.get("reason", "")))
+        return orig_report(job_id, worker, outcome, **data)
+
+    monkeypatch.setattr(pc.client, "report", spy)
+    t = run_in_thread(pc)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    assert wait_for(lambda: db.get(conn, vid)["attempts"] == 1)
+    assert reports[0][0] == "failed" and "missing work file" in reports[0][1]
+    assert t.is_alive() and pc.state != "stopped"  # not a local fault: worker carries on
+    pc.stop(now=True)
+    t.join(10)
+    assert not t.is_alive()

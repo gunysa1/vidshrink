@@ -40,6 +40,9 @@ class PCConfig:
     ffmpeg_dir: str = ""
     min_saving: float = 0.20
     heartbeat_secs: float = 60
+    # Must match the server's Config.lease_secs: once heartbeats have failed for this
+    # long, the server has expired our lease, so the job is treated as server-cancelled.
+    lease_secs: float = 1800
     idle_secs: float = 300
     retry_attempts: int = 5
     retry_base_delay: float = 5.0
@@ -106,6 +109,9 @@ class PCWorker:
         self.stage = ""
         self.current_path: str | None = None
         self.done = 0
+        # (bytes downloaded today, daily limit) from the server's last claim/heartbeat
+        # answer, for the tray's status; None until the server has told us.
+        self.download_today: tuple[float, float] | None = None
         self._stop_now = threading.Event()
         self._stop_after = threading.Event()
         self._wake = threading.Event()  # wakes an idle wait promptly on either stop mode
@@ -160,6 +166,7 @@ class PCWorker:
                     self._wake.wait(self.cfg.idle_secs)
                     self._wake.clear()
                     continue
+                self._note_download_today(resp)
                 job = resp.get("job")
                 if job is None:
                     self.stage = "waiting for work"
@@ -256,16 +263,36 @@ class PCWorker:
                     raise
         raise last
 
+    def _note_download_today(self, resp: dict) -> None:
+        if "download_used" in resp and "download_limit" in resp:
+            self.download_today = (resp["download_used"], resp["download_limit"])
+
     def _heartbeat(self, job_id: int, stop: threading.Event, cancel: threading.Event,
                    server_cancelled: threading.Event) -> None:
+        failing_since = None  # time.monotonic() of the first failure in a row
         while not stop.wait(self.cfg.heartbeat_secs):
             try:
-                if self.client.heartbeat(job_id, self.cfg.worker_name).get("cancel"):
+                resp = self.client.heartbeat(job_id, self.cfg.worker_name)
+                failing_since = None
+                self._note_download_today(resp)
+                if resp.get("cancel"):
                     self.log("server cancelled the job")
                     server_cancelled.set()
                     cancel.set()
                     return
             except Exception as e:  # never let a heartbeat blip kill the thread
+                now = time.monotonic()
+                if failing_since is None:
+                    failing_since = now
+                if now - failing_since >= self.cfg.lease_secs:
+                    # The server has expired our lease by now (and may have handed
+                    # the job on): stop, as for a server cancel, so only a tmp that
+                    # provably holds our bytes is ever deleted.
+                    self.log(f"heartbeats failing for {now - failing_since:.0f} s, past "
+                             f"the lease; abandoning the job: {e}")
+                    server_cancelled.set()
+                    cancel.set()
+                    return
                 self.log(f"heartbeat failed (will retry): {e}")
 
     def _nvenc(self, src: Path, out: Path, probe: Probe, log_path: Path,
@@ -385,8 +412,7 @@ class PCWorker:
             self._check(cancel)
             self._report_uploaded(job, jid, path, tmp, out_size, md5, secs)
         except (_Abandon, EncodeCancelled, TransferCancelled):
-            self._abandon(job, tmp if uploading else None, md5,
-                          guarded=server_cancelled.is_set())
+            self._abandon(job, tmp if uploading else None, md5)
         except RcloneError as e:
             if e.rate_limited and uploading:
                 self._delete_tmp_if_ours(job, tmp, md5)
@@ -398,7 +424,7 @@ class PCWorker:
                 # tmp (nothing was uploaded yet).
                 self.log(f"rate limited during download (unexpected); releasing "
                          f"and backing off: {job['path']}")
-                self._abandon(job, None, None, guarded=server_cancelled.is_set())
+                self._abandon(job, None, None)
                 self._wake.wait(self.cfg.idle_secs)
                 self._wake.clear()
             elif e.download_quota:
@@ -407,11 +433,17 @@ class PCWorker:
                 self._report(job, "failed", reason=str(e))
         except (EncodeError, ProbeError) as e:
             self._report(job, "failed", reason=str(e))
+        except FileNotFoundError as e:
+            if e.filename not in (str(src), str(out)):
+                self._abandon(job, tmp if uploading else None, md5)
+                raise _LocalFault(str(e)) from e
+            # A missing work file (e.g. ffmpeg exited 0 without writing the output)
+            # is this video's problem, not the PC's: report it, keep working.
+            self._report(job, "failed", reason=f"missing work file: {e}")
         except OSError as e:
             # A local problem (missing tool, full disk, permissions, ...), not this
             # video's fault: release it (no attempt burned) and stop the worker.
-            self._abandon(job, tmp if uploading else None, md5,
-                          guarded=server_cancelled.is_set())
+            self._abandon(job, tmp if uploading else None, md5)
             raise _LocalFault(str(e)) from e
         finally:
             hb_stop.set()
@@ -425,26 +457,21 @@ class PCWorker:
     def _delete_tmp_if_ours(self, job: dict, tmp: str | None, md5: str | None) -> None:
         if not tmp or not self._safe_tmp(job, tmp):
             return
+        if not md5:
+            # No local md5 yet means the upload never completed, so there's no
+            # complete tmp of ours on Drive to remove.
+            self.log(f"no local md5 yet; not deleting {tmp}")
+            return
         try:
-            if md5 and self.rclone.exists(tmp) and self.rclone.md5(tmp) == md5:
+            if self.rclone.exists(tmp) and self.rclone.md5(tmp) == md5:
                 self.rclone.delete(tmp)
         except RcloneError as e:
             self.log(f"could not remove {tmp}: {e}")
 
-    def _abandon(self, job: dict, tmp: str | None, md5: str | None, guarded: bool = False) -> None:
-        if tmp:
-            if guarded:
-                # The lease may no longer be ours (server cancel): only remove the
-                # tmp if it still provably holds the bytes we uploaded.
-                self._delete_tmp_if_ours(job, tmp, md5)
-            elif self._safe_tmp(job, tmp):
-                # Stop now / our own release: the lease is still ours, nobody else
-                # writes this tmp name while that's true.
-                try:
-                    if self.rclone.exists(tmp):
-                        self.rclone.delete(tmp)
-                except RcloneError as e:
-                    self.log(f"could not remove partial {tmp}: {e}")
+    def _abandon(self, job: dict, tmp: str | None, md5: str | None) -> None:
+        # Stop now, a server cancel or a local fault: the lease may no longer be ours
+        # by now, so only ever remove a tmp that provably holds the bytes we uploaded.
+        self._delete_tmp_if_ours(job, tmp, md5)
         try:
             self.client.release(job["id"], self.cfg.worker_name)
         except (LeaseLost, JobServiceError):
