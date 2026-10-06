@@ -381,6 +381,7 @@ class PCWorker:
             path, tmp = job["path"], job["tmp_path"]
             probe = Probe(**job["probe"])
             self.stage = "downloading"
+            self.log(f"downloading {path} ({job['size'] / 1e9:.1f} GB)")
             self._check(cancel)
             self._retry(lambda: self.rclone.download(path, src, cancel=cancel), cancel)
             self._check(cancel)
@@ -388,21 +389,27 @@ class PCWorker:
                 self._report(job, "changed")
                 return
             self.stage = "encoding"
+            self.log(f"encoding {path}")
             secs = self.encode(src, out, probe, log_path, cancel)
             self.stage = "verifying"
+            self.log(f"verifying ({secs / 60:.0f} min encode)")
             out_size = out.stat().st_size
             verdict = compare(probe, parse_ffprobe(run_ffprobe(str(out)), out_size),
                               job["size"], out_size, self.cfg.min_saving, decode_errors(out))
             if verdict.problems:
+                self.log(f"failed checks: {'; '.join(verdict.problems)}")
                 self._report(job, "failed", reason="; ".join(verdict.problems))
                 return
             if verdict.not_worth_it:
+                self.log(f"not worth it: only {1 - out_size / job['size']:.0%} smaller")
                 self._report(job, "not_worth_it",
                              reason=f"only {1 - out_size / job['size']:.0%} smaller")
                 return
             md5 = md5_file(out)
             self._check(cancel)
             self.stage = "uploading"
+            self.log(f"uploading {out_size / 1e9:.1f} GB "
+                     f"({1 - out_size / job['size']:.0%} smaller)")
             uploading = True
             self._retry(lambda: self.rclone.upload(out, tmp, cancel=cancel), cancel)
             if self.rclone.md5(tmp) != md5:

@@ -88,10 +88,14 @@ def wait_for(cond, timeout=60):
 
 def test_full_job_then_server_swaps(conn, cfg, setup):
     root, pc, store = setup
+    logs = []
+    pc.log = logs.append
     t = run_in_thread(pc)
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
     assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
     assert wait_for(lambda: pc.done == 1)
+    for prefix in ("downloading Movies/a.mkv", "encoding Movies/a.mkv", "verifying", "uploading"):
+        assert any(m.startswith(prefix) for m in logs), (prefix, logs)
     pc.stop(now=True)
     t.join(10)
     row = db.get(conn, vid)
