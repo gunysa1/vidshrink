@@ -7,7 +7,7 @@ from pathlib import Path
 from vidshrink import db, scorer
 from vidshrink.budget import Budget
 from vidshrink.config import Config
-from vidshrink.jobs import PC_SEEN_KEY
+from vidshrink.jobs import PC_SEEN_KEY, JobStore, load_or_create_token, make_server
 from vidshrink.probe import Probe
 from vidshrink.rclone import Rclone, free_port, serve_http, served_stats
 from vidshrink.scanner import http_prober, scan
@@ -99,17 +99,48 @@ def main(argv: list[str] | None = None) -> int:
     rn.add_argument("--dry-run", action="store_true")
     rn.add_argument("--limit", type=int)
     sub.add_parser("status", help="show progress and the queue")
+    sv = sub.add_parser("serve", help="job service for the PC worker (LAN only)")
+    sv.add_argument("--host", default=base.serve_host)
+    sv.add_argument("--port", type=int, default=base.serve_port)
+    sub.add_parser("token", help="print the job-service token")
+    for name, helptext in (("pc-worker", "run the PC worker in this window"),
+                           ("tray", "PC worker tray icon"),
+                           ("calibrate", "pick the NVENC CQ with VMAF")):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("--config", type=Path, default=None)
+        if name == "calibrate":
+            p.add_argument("--samples", type=int, default=3)
+            p.add_argument("--cqs", default="20,22,24,26")
     args = ap.parse_args(argv)
+
+    if args.cmd in ("pc-worker", "tray", "calibrate"):
+        return _pc_main(args)
 
     cfg = replace(base, remote=args.remote, db_path=args.db, workdir=args.workdir)
     if "VIDSHRINK_MIN_SIZE" in os.environ:
         cfg = replace(cfg, min_size=int(os.environ["VIDSHRINK_MIN_SIZE"]))
+    if "VIDSHRINK_TOKEN_PATH" in os.environ:
+        cfg = replace(cfg, token_path=Path(os.environ["VIDSHRINK_TOKEN_PATH"]))
     if not cfg.remote.startswith("gdrive:"):
         cfg = replace(cfg, rclone_args=())  # drive-only flags are noise elsewhere
 
     conn = db.connect(cfg.db_path)
     rclone = Rclone(cfg.remote, cfg.rclone_args)
     budget = Budget(conn, cfg.daily_upload_limit)
+
+    if args.cmd == "token":
+        print(load_or_create_token(cfg.token_path))
+        return 0
+    if args.cmd == "serve":
+        token = load_or_create_token(cfg.token_path)
+        store = JobStore(conn, cfg, rclone, log=_log)
+        server = make_server(store, token, args.host, args.port)
+        _log(f"job service on {args.host}:{args.port} (token in {cfg.token_path})")
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+        return 0
 
     if args.cmd == "scan":
         cfg = replace(cfg, probe_workers=args.workers)
@@ -124,6 +155,78 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"run finished: {n} files")
     else:
         print(status_report(conn, cfg, budget))
+    return 0
+
+
+def _pc_main(args) -> int:
+    from vidshrink.jobs import JobClient
+    from vidshrink.pc_worker import (PCWorker, apply_ffmpeg_dir, default_config_path,
+                                      load_pc_config, pc_rclone)
+    pcfg = load_pc_config(args.config or default_config_path())
+    apply_ffmpeg_dir(pcfg)
+    client = JobClient(pcfg.server, pcfg.token)
+
+    def make_worker():
+        return PCWorker(pcfg, client, pc_rclone(pcfg), log=_log)
+
+    if args.cmd == "pc-worker":
+        w = make_worker()
+        try:
+            w.run()
+        except KeyboardInterrupt:
+            w.stop(now=True)
+        return 0
+    if args.cmd == "tray":
+        from vidshrink.tray import TrayController, run_tray
+        run_tray(TrayController(make_worker))
+        return 0
+    return _calibrate(args, pcfg, client)
+
+
+def _calibrate(args, pcfg, client) -> int:
+    from vidshrink.calibrate import cut_sample, format_table, measure, pick_cq
+    from vidshrink.encode import build_command, build_nvenc_command, run_encode_cancellable
+    from vidshrink.pc_worker import pc_rclone
+    from vidshrink.probe import Probe
+    rc = pc_rclone(pcfg)
+    pcfg.workdir.mkdir(parents=True, exist_ok=True)
+    jobs, samples = [], []
+    try:
+        for _ in range(args.samples):
+            job = client.claim(pcfg.worker_name, "nvenc")["job"]
+            if job is None:
+                break
+            jobs.append(job)  # leased until released below (or in finally, on an exception)
+            probe = Probe(**job["probe"])
+            src = pcfg.workdir / f"cal-{job['id']}.src"
+            _log(f"downloading {job['path']}")
+            rc.download(job["path"], src)
+            sample = pcfg.workdir / f"cal-{job['id']}.mkv"
+            cut_sample(src, sample, probe)
+            src.unlink()
+            samples.append((sample, probe))
+            # Release right away: the long measure() step below can exceed the
+            # lease (1800 s), and there's no heartbeat here to keep it alive.
+            try:
+                client.release(job["id"], pcfg.worker_name)
+            except Exception:
+                pass
+            jobs.remove(job)
+        x265 = lambda s, o, p, lg, c: run_encode_cancellable(build_command(s, o, p, Config()), lg, c)
+        nvenc = lambda cq: (lambda s, o, p, lg, c:
+                            run_encode_cancellable(build_nvenc_command(s, o, p, cq), lg, c))
+        cqs = [int(x) for x in args.cqs.split(",")]
+        rows = measure(samples, cqs, nvenc, x265, pcfg.workdir, log=_log)
+        print(format_table(rows))
+        print(f"\nSuggested cq = {pick_cq(rows)}  (set it in {args.config or 'config.toml'})")
+    finally:
+        for job in jobs:
+            try:
+                client.release(job["id"], pcfg.worker_name)
+            except Exception:
+                pass
+        for sample, _ in samples:
+            sample.unlink(missing_ok=True)
     return 0
 
 

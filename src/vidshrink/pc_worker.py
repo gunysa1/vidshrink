@@ -62,6 +62,17 @@ def load_pc_config(path: Path) -> PCConfig:
     return PCConfig(**data)
 
 
+def apply_ffmpeg_dir(cfg: PCConfig) -> None:
+    """Prepend cfg.ffmpeg_dir to PATH, idempotently, if set. Shared by PCWorker
+    (which needs ffmpeg/ffprobe on PATH to encode) and calibrate (which never
+    constructs a PCWorker, so it would otherwise never see ffmpeg_dir)."""
+    if not cfg.ffmpeg_dir:
+        return
+    current = os.environ.get("PATH", "")
+    if cfg.ffmpeg_dir not in current.split(os.pathsep):
+        os.environ["PATH"] = cfg.ffmpeg_dir + os.pathsep + current
+
+
 def pc_rclone(cfg: PCConfig) -> Rclone:
     # Same pinned Drive behaviour as the server, plus an upload-only bandwidth cap so the
     # 100 Mbps uplink stays usable for Plex.
@@ -103,13 +114,10 @@ class PCWorker:
         # keeps raising something we didn't anticipate gets released once, then
         # reported failed (poison-job guard) rather than released forever.
         self._unexpected_counts: dict[int, int] = {}
-        if cfg.ffmpeg_dir:
-            # Prepend once, idempotently: run() may be called more than once per
-            # process (e.g. restarted after a fix), and a growing PATH is a sign
-            # something is wrong.
-            current = os.environ.get("PATH", "")
-            if cfg.ffmpeg_dir not in current.split(os.pathsep):
-                os.environ["PATH"] = cfg.ffmpeg_dir + os.pathsep + current
+        # Prepend once, idempotently: run() may be called more than once per
+        # process (e.g. restarted after a fix), and a growing PATH is a sign
+        # something is wrong.
+        apply_ffmpeg_dir(cfg)
 
     # --- control -------------------------------------------------------------
     def stop(self, now: bool) -> None:

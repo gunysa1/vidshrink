@@ -1,0 +1,14 @@
+[Unit]
+Description=vidshrink job service for the PC worker (LAN only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/vidshrink/.venv/bin/vidshrink serve
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
