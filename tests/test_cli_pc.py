@@ -69,3 +69,62 @@ def test_pc_worker_ctrl_c_stops_now_and_joins(tmp_path, monkeypatch):
     assert made[0].stop_calls == [True]
     assert made[0].finished  # the worker thread ran to the end: joined, not abandoned
     assert joins[-1] is None  # final join waits for it without a timeout
+
+
+def test_calibrate_holds_leases_until_all_samples_are_cut(tmp_path, monkeypatch, capsys):
+    """The server hands out the top-scored queued job; releasing each job right after
+    its sample would make the next claim return (and download) the same file again."""
+    import argparse
+    import vidshrink.calibrate as cal
+    import vidshrink.pc_worker as pcw
+    from vidshrink.cli import _calibrate
+    from vidshrink.pc_worker import PCConfig
+
+    probe = dict(container="matroska", duration=600.0, codec="h264", width=1920,
+                 height=1080, video_index=0, vbitrate=8e6, is_dv=False,
+                 color_primaries=None, color_transfer=None, color_space=None,
+                 master_display=None, max_cll=None, streams=[])
+
+    class TopFirstClient:
+        def __init__(self):
+            self.queued, self.leased, self.calls = [1, 2, 3, 4], set(), []
+
+        def claim(self, worker, encoder):
+            self.calls.append("claim")
+            for i in self.queued:  # top-scored first, like the server
+                if i not in self.leased:
+                    self.leased.add(i)
+                    return {"job": {"id": i, "path": f"v{i}.mkv", "probe": probe}}
+            return {"job": None}
+
+        def heartbeat(self, job_id, worker):
+            self.calls.append(("hb", job_id))
+            return {"cancel": job_id not in self.leased}
+
+        def release(self, job_id, worker):
+            self.calls.append(("rel", job_id))
+            self.leased.discard(job_id)
+
+    downloaded = []
+
+    class FakeRc:
+        def download(self, path, dest):
+            downloaded.append(path)
+            dest.write_bytes(b"x")
+
+    client = TopFirstClient()
+    monkeypatch.setattr(pcw, "pc_rclone", lambda pcfg: FakeRc())
+    monkeypatch.setattr(cal, "cut_sample", lambda src, out, p: out.write_bytes(b"s"))
+    monkeypatch.setattr(cal, "measure", lambda samples, *a, **k:
+                        (client.calls.append("measure"), [])[1])
+    monkeypatch.setattr(cal, "format_table", lambda rows: "table")
+    monkeypatch.setattr(cal, "pick_cq", lambda rows: 23)
+    pcfg = PCConfig(server="http://x", token="t", workdir=tmp_path / "w", worker_name="pc")
+    args = argparse.Namespace(samples=3, cqs="22,24", config=None)
+
+    assert _calibrate(args, pcfg, client) == 0
+    assert downloaded == ["v1.mkv", "v2.mkv", "v3.mkv"]
+    assert client.leased == set()  # all released
+    assert client.calls.index("measure") > max(
+        i for i, c in enumerate(client.calls) if isinstance(c, tuple) and c[0] == "rel")
+    assert not list((tmp_path / "w").iterdir())  # samples cleaned up

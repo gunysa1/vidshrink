@@ -209,7 +209,10 @@ def _calibrate(args, pcfg, client) -> int:
             job = client.claim(pcfg.worker_name, "nvenc")["job"]
             if job is None:
                 break
-            jobs.append(job)  # leased until released below (or in finally, on an exception)
+            # Keep it leased until every sample is cut: the server hands out the
+            # top-scored queued job, so releasing it now would make the next claim
+            # return (and download) the same file again.
+            jobs.append(job)
             probe = Probe(**job["probe"])
             src = pcfg.workdir / f"cal-{job['id']}.src"
             _log(f"downloading {job['path']}")
@@ -218,13 +221,20 @@ def _calibrate(args, pcfg, client) -> int:
             cut_sample(src, sample, probe)
             src.unlink()
             samples.append((sample, probe))
-            # Release right away: the long measure() step below can exceed the
-            # lease (1800 s), and there's no heartbeat here to keep it alive.
+            for held in list(jobs):
+                try:
+                    if client.heartbeat(held["id"], pcfg.worker_name).get("cancel"):
+                        jobs.remove(held)  # lease already gone; nothing to release
+                except Exception:
+                    pass
+        # Release before measure(): it can outlast the lease (1800 s), and there's
+        # no heartbeat during it.
+        for job in jobs:
             try:
                 client.release(job["id"], pcfg.worker_name)
             except Exception:
                 pass
-            jobs.remove(job)
+        jobs.clear()
         x265 = lambda s, o, p, lg, c: run_encode_cancellable(build_command(s, o, p, Config()), lg, c)
         nvenc = lambda cq: (lambda s, o, p, lg, c:
                             run_encode_cancellable(build_nvenc_command(s, o, p, cq), lg, c))
