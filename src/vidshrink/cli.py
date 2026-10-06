@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -170,17 +171,28 @@ def _pc_main(args) -> int:
         return PCWorker(pcfg, client, pc_rclone(pcfg), log=_log)
 
     if args.cmd == "pc-worker":
-        w = make_worker()
-        try:
-            w.run()
-        except KeyboardInterrupt:
-            w.stop(now=True)
+        _run_until_ctrl_c(make_worker())
         return 0
     if args.cmd == "tray":
         from vidshrink.tray import TrayController, run_tray
         run_tray(TrayController(make_worker))
         return 0
     return _calibrate(args, pcfg, client)
+
+
+def _run_until_ctrl_c(w) -> None:
+    """Run the worker in a thread so Ctrl-C lands in the main thread, which then
+    stops it now (releasing its job) and waits for it to finish. Its ffmpeg/rclone
+    children run in their own process group, so the Ctrl-C doesn't reach them."""
+    t = threading.Thread(target=w.run, daemon=True)
+    t.start()
+    try:
+        while t.is_alive():
+            t.join(0.5)
+    except KeyboardInterrupt:
+        _log("Ctrl-C: stopping now and releasing the job")
+        w.stop(now=True)
+        t.join()
 
 
 def _calibrate(args, pcfg, client) -> int:
