@@ -11,8 +11,8 @@ from vidshrink.config import Config
 from vidshrink.jobs import PC_SEEN_KEY, JobStore, load_or_create_token, make_server
 from vidshrink.probe import Probe
 from vidshrink.rclone import Rclone, free_port, serve_http, served_stats
+from vidshrink.paths import tmp_path
 from vidshrink.scanner import http_prober, scan
-from vidshrink.worker import Worker, tmp_path
 
 
 def _log(msg: str) -> None:
@@ -152,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                           download_budget=downloads, stats=lambda: served_stats(rc_port))
         _log(f"scan finished: {counts}")
     elif args.cmd == "run":
+        from vidshrink.worker import Worker  # server-only (fcntl); keep the PC importable
         n = Worker(conn, rclone, cfg, budget, log=_log).run(limit=args.limit, dry_run=args.dry_run)
         _log(f"run finished: {n} files")
     else:
