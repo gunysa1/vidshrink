@@ -4,3 +4,5 @@ __pycache__/
 state.db*
 work/
 .pytest-tmp/
+.worktrees/
+serve.token
