@@ -253,6 +253,7 @@ class JobServiceError(Exception):
 
 REQUEST_TIMEOUT_SECS = 30
 MAX_REQUEST_BODY_BYTES = 1 << 20  # 1 MiB
+SWEEP_INTERVAL_SECS = 60
 
 
 def load_or_create_token(path: Path) -> str:
@@ -269,6 +270,29 @@ def load_or_create_token(path: Path) -> str:
         # Another process created it first; read and return its token
         return path.read_text().strip()
     return token
+
+
+class _SweepingHTTPServer(HTTPServer):
+    """Sweeps expired leases on its own, so a lease still expires even if no PC
+    ever calls in to trigger JobStore.claim()'s sweep. service_actions() is
+    called by serve_forever() on every poll, in the server's own thread -- the
+    same thread that owns the store's sqlite3 connection -- so this is safe
+    without any extra locking."""
+
+    def __init__(self, *args, store: JobStore, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._store = store
+        self._last_sweep = -SWEEP_INTERVAL_SECS
+
+    def service_actions(self) -> None:
+        now = time.monotonic()
+        if now - self._last_sweep < SWEEP_INTERVAL_SECS:
+            return
+        self._last_sweep = now
+        try:
+            self._store.expire_leases()
+        except Exception as e:  # never let a sweep blip kill serve_forever
+            self._store.log(f"lease sweep failed: {e!r}")
 
 
 def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer:
@@ -334,7 +358,7 @@ def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer
                 store.log(f"job service error on {self.path}: {e!r}")
                 self._send(500, {"error": repr(e)})
 
-    return HTTPServer((host, port), Handler)
+    return _SweepingHTTPServer((host, port), Handler, store=store)
 
 
 class JobClient:

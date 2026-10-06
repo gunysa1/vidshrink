@@ -9,9 +9,11 @@ from unittest.mock import patch
 import pytest
 
 from vidshrink import db
-from vidshrink.jobs import (JobClient, JobServiceError, LeaseLost,
-                            load_or_create_token, REQUEST_TIMEOUT_SECS)
-from tests.test_jobs_store import add
+from vidshrink import jobs as jobs_mod
+from vidshrink.jobs import (JobClient, JobServiceError, JobStore, LeaseLost,
+                            load_or_create_token, make_server, REQUEST_TIMEOUT_SECS)
+from vidshrink.rclone import Rclone, free_port
+from tests.test_jobs_store import Clock, add
 
 
 def test_token_file(tmp_path):
@@ -172,3 +174,51 @@ def test_slow_client_timeout_blocks_properly(monkeypatch, cfg):
         server_holder['server'].shutdown()
         server_holder['server'].server_close()
         t.join(timeout=5)
+
+
+def test_serve_sweeps_expired_leases_on_its_own(cfg, monkeypatch):
+    """serve must expire leases even with no client ever calling in (nothing
+    hits JobStore.claim()'s own sweep): make_server's server sweeps on its
+    own, via service_actions()."""
+    monkeypatch.setattr(jobs_mod, "SWEEP_INTERVAL_SECS", 0.0)
+    clock = Clock()
+
+    setup_conn = db.connect(cfg.db_path)
+    vid = add(setup_conn, "a.mkv")
+    JobStore(setup_conn, cfg, Rclone(cfg.remote), now=clock, log=lambda m: None).claim("pc")
+    row = db.get(setup_conn, vid)
+    assert (row["stage"], row["attempts"]) == ("leased", 0)
+    clock.t += cfg.lease_secs + 1  # now expired
+    setup_conn.close()
+
+    # The store's sqlite3 connection must be opened in the thread that runs
+    # serve_forever (and so calls service_actions): sqlite3 connections are
+    # thread-bound by default, same as the job_service fixture in conftest.py.
+    holder = {}
+
+    def run_server():
+        server_conn = db.connect(cfg.db_path)
+        store = JobStore(server_conn, cfg, Rclone(cfg.remote), now=clock, log=lambda m: None)
+        server = make_server(store, "tok", "127.0.0.1", free_port())
+        holder["server"] = server
+        try:
+            server.serve_forever(poll_interval=0.05)
+        finally:
+            server_conn.close()
+
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
+    check_conn = db.connect(cfg.db_path)
+    try:
+        row = db.get(check_conn, vid)
+        for _ in range(100):
+            if row["stage"] == "queued":
+                break
+            time.sleep(0.05)
+            row = db.get(check_conn, vid)
+        assert (row["stage"], row["attempts"]) == ("queued", 0)
+    finally:
+        holder["server"].shutdown()
+        holder["server"].server_close()
+        t.join(timeout=5)
+        check_conn.close()

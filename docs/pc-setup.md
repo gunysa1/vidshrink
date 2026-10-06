@@ -112,6 +112,16 @@ each sample at several NVENC CQ values (and once with the server's x265
 settings as the reference), scores them with VMAF, and prints a table plus a
 suggested `cq`. Set `cq` in `config.toml` to the suggested value.
 
+`calibrate` claims real jobs from the queue — the same ones `pc-worker` would
+have encoded — and downloads each one's **full source file**, not just the
+60-second sample it cuts from it. Each of those downloads is charged in full
+against the server's shared 500 GB/day Drive download budget, which Plex also
+relies on, so running `calibrate` with a larger `--samples` (or on several
+large files) eats into that budget like any other job. The jobs themselves are
+returned to the queue right after their sample is cut — `calibrate` doesn't
+remove them from the queue or touch anything on Drive — so running it doesn't
+cost encode time on the server, only download quota.
+
 Calibrate releases each job back to the queue as soon as it has cut that job's
 sample (it never leases a job through the whole measurement step, which can
 run long), and it never deletes anything from Drive — only its own local
