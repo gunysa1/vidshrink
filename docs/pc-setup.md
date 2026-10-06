@@ -6,11 +6,32 @@ NVENC, uploads the result, and reports back. This guide sets it up on a Windows 
 ## 0. Prerequisite: the server's job service
 
 Before setting up the PC, make sure the job service is installed and running on
-the server (the box running the main `vidshrink` pipeline, with its `state.db`):
+the server (the box running the main `vidshrink` pipeline, with its `state.db`).
 
-```bash
-systemctl --user enable --now vidshrink-serve
-```
+**Order matters.** First restart the main pipeline onto the new code, and only
+then enable the job service:
+
+1. Update the code on the server, then restart the pipeline:
+
+   ```bash
+   systemctl --user restart vidshrink
+   ```
+
+   Do this **before** enabling `vidshrink-serve`. The old pipeline code doesn't
+   know about PC leases, so it can pick up a row the PC has leased and overwrite
+   that lease.
+
+   Restart between jobs where you can. An encode that's running when the service
+   stops is thrown away and done again from the start after the restart. To find
+   a gap, watch `journalctl --user -u vidshrink -f` and restart right after a
+   `done:` or `not worth it:` line. Or run `vidshrink status` and check that
+   nothing is in `downloading` / `encoding` / `verifying`.
+
+2. Then enable the job service:
+
+   ```bash
+   systemctl --user enable --now vidshrink-serve
+   ```
 
 The unit file is `deploy/vidshrink-serve.service`; copy it to
 `~/.config/systemd/user/vidshrink-serve.service` on the server first. Check it
