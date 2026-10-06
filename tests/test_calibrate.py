@@ -1,4 +1,6 @@
+import subprocess
 import threading
+from unittest import mock
 
 from vidshrink.calibrate import cut_sample, format_table, measure, pick_cq, vmaf
 from vidshrink.encode import run_encode_cancellable
@@ -23,6 +25,35 @@ def test_pick_cq_falls_back_to_lowest():
 def test_vmaf_identical_is_high(make_clip):
     clip = make_clip("v", seconds=2)
     assert vmaf(clip, clip, threads=2) > 95
+
+
+def test_vmaf_filter_no_windows_paths(make_clip):
+    """Verify the filter string uses relative log_path to avoid Windows colon issues."""
+    clip = make_clip("w", seconds=2)
+    captured_calls = []
+
+    def capture_run(*args, **kwargs):
+        captured_calls.append((args, kwargs))
+        # Return a mock result with returncode 0
+        return mock.MagicMock(returncode=0)
+
+    with mock.patch("subprocess.run", side_effect=capture_run):
+        with mock.patch("pathlib.Path.read_text", return_value='{"pooled_metrics": {"vmaf": {"mean": 99.0}}}'):
+            vmaf(clip, clip, threads=2)
+
+    # Verify ffmpeg was called with the correct filter
+    assert len(captured_calls) == 1
+    args, kwargs = captured_calls[0]
+    # args[0] is the command list
+    cmd = args[0]
+    # Find the filter graph in the command
+    lavfi_idx = cmd.index("-lavfi")
+    graph = cmd[lavfi_idx + 1]
+
+    # Verify the filter contains relative path and no Windows path separators
+    assert "log_path=vmaf.json" in graph, f"Filter should use relative path 'vmaf.json': {graph}"
+    assert ":/" not in graph, f"Filter should not contain Windows path ':/' separator: {graph}"
+    assert ":\\" not in graph, f"Filter should not contain Windows path ':\\' separator: {graph}"
 
 
 def crf_encoder(crf):

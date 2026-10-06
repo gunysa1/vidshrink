@@ -13,16 +13,16 @@ from vidshrink.probe import Probe
 
 def vmaf(distorted: Path, reference: Path, threads: int = 4) -> float:
     with tempfile.TemporaryDirectory() as d:
-        log = Path(d) / "vmaf.json"
         graph = ("[0:v]format=yuv420p10le,setpts=PTS-STARTPTS[d];"
                  "[1:v]format=yuv420p10le,setpts=PTS-STARTPTS[r];"
-                 f"[d][r]libvmaf=n_threads={threads}:log_fmt=json:log_path={log.as_posix()}")
+                 f"[d][r]libvmaf=n_threads={threads}:log_fmt=json:log_path=vmaf.json")
         res = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
-                              "-i", str(distorted), "-i", str(reference),
+                              "-i", str(distorted.resolve()), "-i", str(reference.resolve()),
                               "-lavfi", graph, "-f", "null", "-"],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True, cwd=d)
         if res.returncode != 0:
             raise EncodeError(f"vmaf failed: {res.stderr[-300:]}")
+        log = Path(d) / "vmaf.json"
         return float(json.loads(log.read_text())["pooled_metrics"]["vmaf"]["mean"])
 
 
@@ -47,13 +47,15 @@ def measure(samples: list[tuple[Path, Probe]], cqs: list[int],
         runs = [("x265", None, encode_x265)] + [("nvenc", cq, encode_nvenc(cq)) for cq in cqs]
         for encoder, cq, fn in runs:
             out = workdir / f"cal-{name}-{encoder}-{cq}.mkv"
-            fn(src, out, sample_probe, workdir / "cal.log", never)
-            score = vmaf(out, src)
-            rows.append({"sample": name, "encoder": encoder, "cq": cq, "vmaf": score,
-                         "size": out.stat().st_size})
-            log(f"{name}: {encoder} {'' if cq is None else f'CQ {cq} '}VMAF {score:.2f}, "
-                f"{out.stat().st_size / 1e6:.0f} MB")
-            out.unlink(missing_ok=True)
+            try:
+                fn(src, out, sample_probe, workdir / "cal.log", never)
+                score = vmaf(out, src)
+                rows.append({"sample": name, "encoder": encoder, "cq": cq, "vmaf": score,
+                             "size": out.stat().st_size})
+                log(f"{name}: {encoder} {'' if cq is None else f'CQ {cq} '}VMAF {score:.2f}, "
+                    f"{out.stat().st_size / 1e6:.0f} MB")
+            finally:
+                out.unlink(missing_ok=True)
     return rows
 
 
