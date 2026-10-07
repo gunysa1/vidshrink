@@ -27,7 +27,7 @@ class Config:
     download_block_secs: float = 12 * 3600
     # The PC's own (second) Google account, used only for downloads, with its own
     # separate quota -- so PC jobs no longer spend the main account's 500 GB/day.
-    daily_pc_download_limit: int = 750_000_000_000
+    daily_pc_download_limit: int = 300_000_000_000  # start low; raise once the main account is confirmed unaffected
     max_ready: int = 2
     max_attempts: int = 2
     max_consecutive_failures: int = 5

@@ -67,14 +67,14 @@ def test_status_shows_pc_download_budget_when_used(conn, cfg):
     pc_downloads = Budget(conn, cfg.daily_pc_download_limit, budget.now, kind="pc_download")
     pc_downloads.add(7 * 10**9)
     out = status_report(conn, cfg, budget)
-    assert "PC account downloaded today: 7 / 750 GB" in out
+    assert "PC account downloaded today: 7 / 300 GB" in out
 
 
 def test_status_shows_pc_download_budget_when_pc_seen_recently_even_if_unused(conn, cfg):
     budget = Budget(conn, cfg.daily_upload_limit)
     db.kv_set(conn, PC_SEEN_KEY, str(budget.now()))
     out = status_report(conn, cfg, budget)
-    assert "PC account downloaded today: 0 / 750 GB" in out
+    assert "PC account downloaded today: 0 / 300 GB" in out
 
 
 def test_status_hides_pc_download_budget_when_never_seen_and_unused(conn, cfg):
