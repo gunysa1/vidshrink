@@ -698,3 +698,12 @@ def test_missing_output_after_encode_is_reported_failed(conn, setup, monkeypatch
     pc.stop(now=True)
     t.join(10)
     assert not t.is_alive()
+
+
+def test_bwlimit_plain_caps_uploads_only_and_pair_passes_through(tmp_path):
+    from vidshrink.pc_worker import pc_download_rclone, pc_rclone
+    for bw, want in (("6M", "6M:off"), ("6M:40M", "6M:40M")):
+        c = PCConfig(server="http://x", token="t", workdir=tmp_path, bwlimit=bw)
+        for rc in (pc_rclone(c), pc_download_rclone(c)):
+            args = list(rc.extra_args)
+            assert args[args.index("--bwlimit") + 1] == want

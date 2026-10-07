@@ -80,10 +80,16 @@ def apply_ffmpeg_dir(cfg: PCConfig) -> None:
         os.environ["PATH"] = cfg.ffmpeg_dir + os.pathsep + current
 
 
+def _bwlimit(cfg: PCConfig) -> str:
+    """rclone --bwlimit value. A plain value caps uploads only ("6M" -> "6M:off");
+    an explicit "UP:DOWN" pair (e.g. "6M:40M") is passed through as written."""
+    return cfg.bwlimit if ":" in cfg.bwlimit else f"{cfg.bwlimit}:off"
+
+
 def pc_rclone(cfg: PCConfig) -> Rclone:
     # Same pinned Drive behaviour as the server, plus an upload-only bandwidth cap so the
     # 100 Mbps uplink stays usable for Plex.
-    return Rclone(cfg.remote, (*Config().rclone_args, "--bwlimit", f"{cfg.bwlimit}:off"),
+    return Rclone(cfg.remote, (*Config().rclone_args, "--bwlimit", _bwlimit(cfg)),
                   binary=cfg.rclone)
 
 
@@ -91,7 +97,7 @@ def pc_download_rclone(cfg: PCConfig) -> Rclone:
     # Downloads only: the PC's own Drive account (download_remote) when set, so they're
     # charged against its own quota instead of the main account's; else the main remote.
     return Rclone(cfg.download_remote or cfg.remote,
-                  (*Config().rclone_args, "--bwlimit", f"{cfg.bwlimit}:off"), binary=cfg.rclone)
+                  (*Config().rclone_args, "--bwlimit", _bwlimit(cfg)), binary=cfg.rclone)
 
 
 class _Abandon(Exception):

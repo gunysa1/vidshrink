@@ -97,7 +97,8 @@ cq = 23
 ffmpeg_dir = 'C:\Users\you\AppData\Local\vidshrink\ffmpeg\bin'
 # A fast local disk with 200 GB free for source/output files while encoding:
 workdir = 'D:\vidshrink'
-# Optional: cap the PC's upload bandwidth so Plex stays usable, e.g. "6M".
+# Optional: cap the PC's upload bandwidth so Plex stays usable, e.g. "6M"
+# (uploads only). To cap downloads too, give "UP:DOWN", e.g. "6M:40M" (MiB/s).
 bwlimit = "6M"
 ```
 
