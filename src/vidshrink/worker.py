@@ -60,6 +60,8 @@ class Worker:
         self.failures = 0  # consecutive prepare/upload failures with no success between
         self._remote_fail_at = None  # self.clock() of the last remote_ready check we couldn't
         # complete (RcloneError), so we don't hammer Drive every loop iteration for it
+        self._remote_done_during_encode = 0  # remote_ready rows swapped via _encode_tick()
+        self._dry_run = False  # set for the duration of run(); guards _encode_tick's swap
 
     # --- work files -------------------------------------------------------
     def _src(self, vid: int) -> Path:
@@ -157,6 +159,43 @@ class Worker:
         self.failures = 0
         return True
 
+    def _service_remote(self) -> int:
+        """Check one remote_ready row (PC upload) for verify-and-swap, rate-limited
+        on check errors so it can't hammer Drive every call. Returns 1 if a row was
+        swapped to done, -1 if a row was handled but not completed (its stage moved
+        off remote_ready, e.g. a mismatch), or 0 if there was nothing to do right now
+        (no remote_ready rows, or still rate-limited after a prior check error)."""
+        remote = db.rows_in(self.conn, "remote_ready")
+        if not remote:
+            return 0
+        if not (self._remote_fail_at is None
+                or self.clock() - self._remote_fail_at >= self.cfg.idle_poll_secs):
+            return 0
+        if self._finish_remote(remote[0]):
+            self._remote_fail_at = None
+            return 1
+        if db.get(self.conn, remote[0]["id"])["stage"] == "remote_ready":
+            # Couldn't even check Drive (RcloneError): don't hammer it every call,
+            # and get on with the server's own work instead of spinning on this row.
+            self._remote_fail_at = self.clock()
+            return 0
+        return -1
+
+    def _encode_tick(self) -> None:
+        """Called every idle_poll_secs while the server's own ffmpeg encode runs, so
+        a PC upload doesn't wait hours behind a long movie. Never raises into
+        run_encode: any failure here must not interrupt the server's own encode."""
+        try:
+            self.jobs.expire_leases()
+            while True:
+                result = self._service_remote()
+                if result == 0:
+                    break
+                if result > 0:
+                    self._remote_done_during_encode += 1
+        except Exception as e:
+            self.log(f"PC result check during encode failed: {e!r}")
+
     def _pc_holds_work(self) -> bool:
         return bool(db.rows_in(self.conn, "leased", "remote_ready")) or (
             self._pc_active() and db.next_queued(self.conn) is not None)
@@ -164,6 +203,7 @@ class Worker:
     # --- main loop ---------------------------------------------------------
     def run(self, limit: int | None = None, dry_run: bool = False) -> int:
         self._check_tools()
+        self._dry_run = dry_run
         with _lock(self.cfg.workdir):
             done = self.recover(dry_run)
             self.failures = 0
@@ -179,21 +219,12 @@ class Worker:
                     last_reconcile = self.clock()
                 self.jobs.expire_leases()
                 if not dry_run:
-                    remote = db.rows_in(self.conn, "remote_ready")
-                    if remote and (self._remote_fail_at is None
-                                    or self.clock() - self._remote_fail_at
-                                    >= self.cfg.idle_poll_secs):
-                        if self._finish_remote(remote[0]):
-                            done += 1
-                            self._remote_fail_at = None
-                            continue
-                        if db.get(self.conn, remote[0]["id"])["stage"] == "remote_ready":
-                            # Couldn't even check Drive (RcloneError): don't hammer it
-                            # every loop iteration, and get on with the server's own
-                            # work instead of spinning on this row.
-                            self._remote_fail_at = self.clock()
-                        else:
-                            continue
+                    serviced = self._service_remote()
+                    if serviced > 0:
+                        done += 1
+                        continue
+                    if serviced < 0:
+                        continue
                 ready = db.rows_in(self.conn, "ready")
                 if ready and self.budget.allows(ready[0]["out_size"]):
                     if self.upload_and_swap(ready[0], dry_run):
@@ -202,6 +233,8 @@ class Worker:
                 row = self._next_job() if len(ready) < self.cfg.max_ready else None
                 if row is not None and self.download_budget.allows(row["size"]):
                     self.prepare(row)
+                    done += self._remote_done_during_encode
+                    self._remote_done_during_encode = 0
                     continue
                 if not ready and row is None:
                     if dry_run or not self._pc_holds_work():
@@ -270,7 +303,12 @@ class Worker:
                 return
             self.log(f"encoding {path}")
             db.mark(self.conn, vid, "encoding")
-            secs = run_encode(build_command(src, out, probe, self.cfg), self._logfile(vid))
+            # Service PC (remote_ready) results every idle_poll_secs while this
+            # potentially hours-long encode runs, so they don't wait behind it; never
+            # during a dry run, which must not swap/delete anything for real.
+            tick = None if self._dry_run else self._encode_tick
+            secs = run_encode(build_command(src, out, probe, self.cfg), self._logfile(vid),
+                              tick=tick, tick_secs=self.cfg.idle_poll_secs)
             db.mark(self.conn, vid, "verifying", encode_secs=secs)
             out_size = out.stat().st_size
             out_probe = parse_ffprobe(run_ffprobe(str(out)), out_size)

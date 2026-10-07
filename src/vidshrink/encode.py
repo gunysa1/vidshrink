@@ -71,15 +71,48 @@ def build_command(src: Path, out: Path, probe: Probe, cfg: Config) -> list[str]:
     return _input_args(src, probe) + video + _output_args(out, probe)
 
 
-def run_encode(cmd: list[str], log_path: Path) -> float:
+def run_encode(cmd: list[str], log_path: Path, tick=None, tick_secs: float = 60.0) -> float:
     start = time.monotonic()
-    with open(log_path, "w") as log:
-        res = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
-                             **procflags.spawn_kwargs())
-    if res.returncode != 0:
+    if tick is None:
+        with open(log_path, "w") as log:
+            res = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                 **procflags.spawn_kwargs())
+        returncode = res.returncode
+        elapsed = time.monotonic() - start
+    else:
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                    **procflags.spawn_kwargs())
+            try:
+                while True:
+                    try:
+                        returncode = proc.wait(timeout=tick_secs)
+                        elapsed = time.monotonic() - start
+                        break
+                    except subprocess.TimeoutExpired:
+                        exited = proc.poll()
+                        if exited is not None:
+                            # Ffmpeg finished in the gap between the timeout firing
+                            # and us getting here: record the end time now and skip
+                            # the tick, rather than letting it inflate elapsed.
+                            returncode = exited
+                            elapsed = time.monotonic() - start
+                            break
+                        try:
+                            tick()
+                        except Exception:
+                            pass  # never let a tick failure interrupt the encode;
+                            # the worker's own tick wrapper logs its own errors, and
+                            # writing tick noise into this log could push out the
+                            # ffmpeg tail an EncodeError reports below.
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+    if returncode != 0:
         tail = log_path.read_text(encoding="utf-8", errors="replace")[-500:]
-        raise EncodeError(f"ffmpeg exit {res.returncode}: {tail}")
-    return time.monotonic() - start
+        raise EncodeError(f"ffmpeg exit {returncode}: {tail}")
+    return elapsed
 
 
 # Matrices hevc_nvenc can be tagged with: the rest make the encode output nothing (ffmpeg 9).

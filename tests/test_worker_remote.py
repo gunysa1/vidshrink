@@ -273,6 +273,58 @@ def test_budget_wait_unchanged_without_pc_work(conn, env):
     assert _budget_wait_sleep(worker) == pytest.approx(expected, abs=5)
 
 
+def test_remote_ready_swapped_during_server_encode(conn, env, make_clip, monkeypatch):
+    """The PC's remote_ready row must be verified and swapped via a tick during the
+    server's own encode, not only between jobs."""
+    import vidshrink.worker as worker_mod
+
+    root, worker = env
+    shutil.copy(make_clip("b"), root / "Movies" / "b.mkv")
+    rc = Rclone(worker.cfg.remote)
+    scan(conn, rc, worker.cfg, lambda p, s: parse_ffprobe(run_ffprobe(str(root / p)), s),
+         log=lambda s: None)
+    pc_vid = as_remote_ready(conn, root)
+
+    real_run_encode = worker_mod.run_encode
+    ticked = []
+
+    def wrapper(cmd, log_path, tick=None, tick_secs=60.0):
+        if tick is not None:
+            tick()
+            ticked.append(1)
+        return real_run_encode(cmd, log_path, tick=tick, tick_secs=tick_secs)
+
+    monkeypatch.setattr(worker_mod, "run_encode", wrapper)
+
+    done = worker.run(limit=2)
+
+    assert ticked, "tick was never invoked during the server's own encode"
+    assert done == 2
+    assert db.get(conn, pc_vid)["stage"] == "done"
+    assert (root / "Movies" / "a.mkv").read_bytes() == PC_OUT
+    assert not (root / "Movies" / "a.vidshrink-tmp.mkv").exists()
+    assert db.get_by_path(conn, "Movies/b.mkv")["stage"] == "done"
+
+
+def test_encode_tick_error_does_not_raise(conn, env, monkeypatch):
+    """A tick whose _finish_remote raises unexpectedly must not escape _encode_tick
+    (which run_encode calls while the server's own ffmpeg encode is still running)."""
+    root, worker = env
+    as_remote_ready(conn, root)
+
+    def boom(*a, **k):
+        raise RuntimeError("_finish_remote exploded")
+
+    monkeypatch.setattr(worker, "_finish_remote", boom)
+
+    logs = []
+    worker.log = logs.append
+
+    worker._encode_tick()  # must not raise
+
+    assert any("PC result check during encode failed" in m for m in logs)
+
+
 def test_swap_needs_attention_log_names_drive_tmp_for_pc_rows(conn, env):
     root, worker = env
     vid = as_remote_ready(conn, root)

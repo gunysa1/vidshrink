@@ -77,7 +77,7 @@ def test_encode_failure_retries_then_fails(conn, env, monkeypatch):
     from vidshrink import worker as worker_mod
     from vidshrink.encode import EncodeError
 
-    def boom(cmd, log_path):
+    def boom(cmd, log_path, **kwargs):
         raise EncodeError("boom")
 
     monkeypatch.setattr(worker_mod, "run_encode", boom)
@@ -253,7 +253,7 @@ def test_tool_vanishing_mid_run_crashes_without_burning_attempts(conn, env, monk
     _, worker = env
     from vidshrink import worker as worker_mod
 
-    def gone(cmd, log_path):
+    def gone(cmd, log_path, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
 
     monkeypatch.setattr(worker_mod, "run_encode", gone)
@@ -270,7 +270,7 @@ def test_run_stops_after_consecutive_failures(conn, env, monkeypatch):
     worker.cfg.max_attempts = 100
     calls = []
 
-    def boom(cmd, log_path):
+    def boom(cmd, log_path, **kwargs):
         calls.append(1)
         raise EncodeError("boom")
 
@@ -364,7 +364,7 @@ def test_missing_non_tool_file_fails_the_file_instead_of_crashing(conn, cfg, env
     _, worker = env
     from vidshrink import worker as worker_mod
 
-    def no_output(cmd, log_path):
+    def no_output(cmd, log_path, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", str(cfg.workdir / "1.out.mkv"))
 
     monkeypatch.setattr(worker_mod, "run_encode", no_output)

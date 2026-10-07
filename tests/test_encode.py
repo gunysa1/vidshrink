@@ -1,3 +1,5 @@
+import sys
+import time
 from dataclasses import replace
 
 import pytest
@@ -68,3 +70,48 @@ def test_encode_failure_raises(cfg, tmp_path):
     bad.write_bytes(b"junk" * 100)
     with pytest.raises(EncodeError):
         run_encode(build_command(bad, tmp_path / "o.mkv", SDR, cfg), tmp_path / "log")
+
+
+def test_run_encode_calls_tick_while_waiting(tmp_path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(1.2)"]
+    ticks = []
+    secs = run_encode(cmd, tmp_path / "log", tick=lambda: ticks.append(time.monotonic()),
+                       tick_secs=0.2)
+    assert len(ticks) >= 3
+    assert secs == pytest.approx(1.2, abs=0.5)
+
+
+def test_run_encode_failure_with_tick_still_raises(tmp_path):
+    cmd = [sys.executable, "-c", "import sys; sys.exit(1)"]
+    with pytest.raises(EncodeError):
+        run_encode(cmd, tmp_path / "log", tick=lambda: None, tick_secs=0.2)
+
+
+def test_run_encode_tick_error_does_not_stop_encode(tmp_path):
+    cmd = [sys.executable, "-c", "import time; time.sleep(1.0)"]
+    calls = []
+
+    def bad_tick():
+        calls.append(1)
+        raise RuntimeError("boom")
+
+    secs = run_encode(cmd, tmp_path / "log", tick=bad_tick, tick_secs=0.2)
+    assert secs == pytest.approx(1.0, abs=0.5)
+    assert len(calls) >= 2
+
+
+def test_run_encode_no_tick_after_process_exits(tmp_path):
+    """A tick that overruns and happens to still be running when ffmpeg exits must
+    not inflate things further: once the next check sees ffmpeg has exited, no
+    further tick is called (encode_secs must not keep growing on a slow tick)."""
+    cmd = [sys.executable, "-c", "import time; time.sleep(0.3)"]
+    calls = []
+
+    def tick():
+        calls.append(1)
+        if len(calls) == 1:
+            time.sleep(0.6)  # long enough that the process exits during this tick
+
+    secs = run_encode(cmd, tmp_path / "log", tick=tick, tick_secs=0.1)
+    assert len(calls) == 1  # no tick ran after the process had already exited
+    assert secs < 1.2
