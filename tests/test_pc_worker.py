@@ -477,10 +477,10 @@ class FakeClient:
         self._claim = claim
         self.released = []
 
-    def heartbeat(self, job_id, worker):
+    def heartbeat(self, job_id, worker, download_account="main"):
         return self._heartbeat()
 
-    def claim(self, worker, encoder):
+    def claim(self, worker, encoder, download_account="main"):
         return self._claim()
 
     def release(self, job_id, worker):
@@ -587,6 +587,96 @@ def test_download_today_from_claim_and_heartbeat(tmp_path, monkeypatch):
     assert wait_for(lambda: pc.download_today == (13e9, 500e9), timeout=5)
     stop.set()
     t.join(5)
+
+
+def test_download_account_defaults_to_main_without_download_remote(tmp_path):
+    pc = fake_pc(tmp_path)
+    assert pc.download_account == "main"
+    assert pc.download_rclone is pc.rclone
+
+
+def test_download_rclone_falls_back_to_rclone_when_not_passed(tmp_path):
+    remote = FakeRemote()
+    pcfg = PCConfig(server="http://x", token="t", workdir=tmp_path / "w", worker_name="pc",
+                    download_remote="gdrive-pc:")
+    pc = PCWorker(pcfg, FakeClient(), remote, encode=lambda *a: 0.0)
+    assert pc.download_account == "pc"
+    assert pc.download_rclone is remote  # no download_rclone given: falls back to rclone
+
+
+def test_pc_download_rclone_uses_download_remote_or_remote():
+    from vidshrink.pc_worker import pc_download_rclone
+
+    plain = PCConfig(server="x", token="t")
+    assert pc_download_rclone(plain).remote == plain.remote
+
+    pc_account = PCConfig(server="x", token="t", download_remote="gdrive-pc:")
+    assert pc_download_rclone(pc_account).remote == "gdrive-pc:"
+
+
+def test_pc_download_account_uses_download_rclone_not_rclone(conn, cfg, make_clip, tmp_path):
+    """With download_remote set, downloads must go through download_rclone, while
+    upload/md5/exists/delete stay on rclone (the main account), and claim sends
+    download_account="pc"."""
+    root = Path(cfg.remote.rstrip("/"))
+    (root / "Movies").mkdir()
+    shutil.copy(make_clip("a"), root / "Movies" / "a.mkv")
+    rc = Rclone(cfg.remote)
+    scan(conn, rc, cfg, lambda p, s: parse_ffprobe(run_ffprobe(str(root / p)), s),
+         log=lambda s: None)
+
+    pc_root = tmp_path / "pcdrive"
+    (pc_root / "Movies").mkdir(parents=True)
+    shutil.copy(root / "Movies" / "a.mkv", pc_root / "Movies" / "a.mkv")
+
+    port = free_port()
+    server_holder = {}
+    ready = threading.Event()
+
+    def run_server():
+        server_conn = db.connect(cfg.db_path)
+        server_store = JobStore(server_conn, cfg, Rclone(cfg.remote), log=lambda m: None)
+        server = make_server(server_store, "tok", "127.0.0.1", port)
+        server_holder["server"] = server
+        ready.set()
+        try:
+            server.serve_forever()
+        finally:
+            server_conn.close()
+
+    threading.Thread(target=run_server, daemon=True).start()
+    assert ready.wait(timeout=10)
+
+    main_rc = Rclone(cfg.remote)
+    dl_rc = Rclone(str(pc_root) + "/")
+    main_calls, dl_calls = [], []
+    orig_main_dl, orig_dl_dl = main_rc.download, dl_rc.download
+    main_rc.download = lambda *a, **k: (main_calls.append(a), orig_main_dl(*a, **k))[1]
+    dl_rc.download = lambda *a, **k: (dl_calls.append(a), orig_dl_dl(*a, **k))[1]
+
+    pcfg = PCConfig(server=f"http://127.0.0.1:{port}", token="tok", remote=cfg.remote,
+                    download_remote=str(pc_root) + "/", workdir=tmp_path / "pcwork",
+                    worker_name="pc", heartbeat_secs=0.2, idle_secs=0.2, retry_base_delay=0.0)
+    client = JobClient(pcfg.server, "tok")
+    claimed_accounts = []
+    orig_claim = client.claim
+    client.claim = lambda *a, **k: (claimed_accounts.append(k.get("download_account")),
+                                    orig_claim(*a, **k))[1]
+    pc = PCWorker(pcfg, client, main_rc, download_rclone=dl_rc, encode=x265_encode,
+                 log=lambda m: None)
+    assert pc.download_account == "pc"
+    t = run_in_thread(pc)
+    try:
+        vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+    finally:
+        pc.stop(now=True)
+        t.join(10)
+        server_holder["server"].shutdown()
+        server_holder["server"].server_close()
+
+    assert dl_calls and not main_calls  # downloads used download_rclone only
+    assert "pc" in claimed_accounts
 
 
 def test_missing_output_after_encode_is_reported_failed(conn, setup, monkeypatch):

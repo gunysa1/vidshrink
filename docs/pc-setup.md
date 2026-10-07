@@ -148,6 +148,45 @@ sample (it never leases a job through the whole measurement step, which can
 run long), and it never deletes anything from Drive — only its own local
 sample files once it's done.
 
+## Optional: a separate Google account for downloads
+
+Drive's daily download quota is per Google user. By default the PC downloads with
+the same account the server uploads with, so PC jobs eat into the 500 GB/day that
+Plex also relies on. Giving the PC its own, second Google account for downloads
+only keeps the two separate:
+
+1. Create a free Google account. In the Drive web UI (on the main account), share
+   the `Movies` and `TV` folders with it as **Viewer**.
+
+2. On the PC, run `rclone config` to create a new remote, e.g. `gdrive-pc`, type
+   `drive`, scope `drive.readonly`, and in the advanced options set
+   `shared_with_me = true`, so that `Movies/...` paths resolve from the "Shared
+   with me" root. Log in with the second account in the browser.
+
+3. Test it:
+
+   ```powershell
+   rclone lsd gdrive-pc:
+   ```
+
+   This should list `Movies` and `TV`.
+
+4. In `config.toml` add:
+
+   ```toml
+   download_remote = "gdrive-pc:"
+   ```
+
+   Leave `remote` as it is (the main account) — it's still needed for uploads,
+   md5 checks, existence checks and deletes, so every file stays owned by the
+   main user.
+
+With `download_remote` set, the PC's downloads count against a separate 750
+GB/day budget on the PC's own account, and the main account's 500 GB/day is left
+free for the server and Plex. `vidshrink status` on the server shows both:
+`Downloaded today` is the main account, `PC account downloaded today` is the
+PC's.
+
 ## 8. Run it in the background: a tray icon
 
 Create a Start-menu shortcut (or put one in the Startup folder to run at

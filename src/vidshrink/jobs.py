@@ -40,6 +40,14 @@ class JobStore:
         self.log = log
         self.uploads = Budget(conn, cfg.daily_upload_limit, now)
         self.downloads = Budget(conn, cfg.daily_download_limit, now, kind="download")
+        self.pc_downloads = Budget(conn, cfg.daily_pc_download_limit, now, kind="pc_download")
+
+    def _download_budget(self, account: str) -> Budget:
+        if account == "main":
+            return self.downloads
+        if account == "pc":
+            return self.pc_downloads
+        raise ValueError(f"unknown download_account {account!r}")
 
     def _seen(self) -> None:
         db.kv_set(self.conn, PC_SEEN_KEY, str(self.now()))
@@ -91,18 +99,19 @@ class JobStore:
         scored.sort(key=lambda t: (-t[0], t[1]["id"]))
         return [row for _, row in scored]
 
-    def _download_today(self) -> dict:
-        """Today's download total, for the PC's tray status."""
-        return {"download_used": self.downloads.used(), "download_limit": self.downloads.limit}
+    def _download_today(self, downloads: Budget) -> dict:
+        """Today's download total on the selected budget, for the PC's tray status."""
+        return {"download_used": downloads.used(), "download_limit": downloads.limit}
 
-    def claim(self, worker: str, encoder: str = "nvenc") -> dict:
-        return {**self._claim(worker, encoder), **self._download_today()}
+    def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main") -> dict:
+        downloads = self._download_budget(download_account)
+        return {**self._claim(worker, encoder, downloads), **self._download_today(downloads)}
 
-    def _claim(self, worker: str, encoder: str) -> dict:
+    def _claim(self, worker: str, encoder: str, downloads: Budget) -> dict:
         self._seen()
         self.expire_leases()
-        if self.downloads.blocked():
-            return {"job": None, "retry_after": self.downloads.seconds_until_reset()}
+        if downloads.blocked():
+            return {"job": None, "retry_after": downloads.seconds_until_reset()}
         if not self.uploads.allows(1):
             # Blocked by a rate-limit error, or today's upload budget is used up:
             # the PC's result couldn't be uploaded today anyway.
@@ -116,8 +125,8 @@ class JobStore:
                 db.mark_if(self.conn, row["id"], ("queued",), "failed",
                            reason=f"target {final} already exists")
                 continue
-            if not self.downloads.allows(row["size"]):
-                return {"job": None, "retry_after": self.downloads.seconds_until_reset()}
+            if not downloads.allows(row["size"]):
+                return {"job": None, "retry_after": downloads.seconds_until_reset()}
             with db.transaction(self.conn):
                 # Re-check right before claiming: another row may have taken this
                 # final_path/tmp_path stem since the busy set above was computed.
@@ -128,7 +137,7 @@ class JobStore:
                                        worker=worker, encoder=encoder, final_path=final,
                                        reason=None, lease_until=self.now() + self.cfg.lease_secs)
                     if taken:
-                        self.downloads.add(row["size"])
+                        downloads.add(row["size"])
             if not taken:
                 continue
             self.log(f"leased to {worker}: {row['path']}")
@@ -139,15 +148,17 @@ class JobStore:
                     "retry_after": 0.0}
         return {"job": None, "retry_after": NO_WORK_RETRY_SECS}
 
-    def heartbeat(self, job_id: int, worker: str) -> dict:
+    def heartbeat(self, job_id: int, worker: str, download_account: str = "main") -> dict:
+        downloads = self._download_budget(download_account)
         self._seen()
         now = self.now()
         with db.transaction(self.conn):
             ok = self._is_leased_by(job_id, worker, now) and self._update_leased(
                 job_id, worker, now, {"lease_until": now + self.cfg.lease_secs})
-        return {"cancel": not ok, **self._download_today()}
+        return {"cancel": not ok, **self._download_today(downloads)}
 
-    def report(self, job_id: int, worker: str, outcome: str, **data) -> None:
+    def report(self, job_id: int, worker: str, outcome: str, download_account: str = "main",
+               **data) -> None:
         self._seen()
         now = self.now()
         with db.transaction(self.conn):
@@ -197,9 +208,13 @@ class JobStore:
                     "reason": "changed since scan", "probe_json": None, "score": None,
                     **clear})
             elif outcome == "download_quota":
-                self.downloads.block(self.cfg.download_block_secs)
+                self._download_budget(download_account).block(self.cfg.download_block_secs)
                 self._mark_leased_or_raise(job_id, worker, now, "queued", clear)
-                self.log("PC hit Drive's download quota; downloads paused for everyone")
+                if download_account == "pc":
+                    self.log("PC's own Drive account hit its download quota; "
+                             "PC downloads paused")
+                else:
+                    self.log("PC hit Drive's download quota; downloads paused for everyone")
             elif outcome == "upload_limited":
                 self.uploads.block(self.cfg.rate_limit_block_secs)
                 self._mark_leased_or_raise(job_id, worker, now, "queued", clear)
@@ -347,9 +362,11 @@ def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer
                     return
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/claim":
-                    self._send(200, store.claim(body["worker"], body.get("encoder", "nvenc")))
+                    self._send(200, store.claim(body["worker"], body.get("encoder", "nvenc"),
+                                                body.get("download_account", "main")))
                 elif self.path == "/heartbeat":
-                    self._send(200, store.heartbeat(int(body["id"]), body["worker"]))
+                    self._send(200, store.heartbeat(int(body["id"]), body["worker"],
+                                                    body.get("download_account", "main")))
                 elif self.path == "/report":
                     extra = {k: v for k, v in body.items() if k not in ("id", "worker", "outcome")}
                     store.report(int(body["id"]), body["worker"], body["outcome"], **extra)
@@ -394,14 +411,18 @@ class JobClient:
     def health(self) -> dict:
         return self._call("GET", "/health")
 
-    def claim(self, worker: str, encoder: str = "nvenc") -> dict:
-        return self._call("POST", "/claim", {"worker": worker, "encoder": encoder})
+    def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main") -> dict:
+        return self._call("POST", "/claim", {"worker": worker, "encoder": encoder,
+                                             "download_account": download_account})
 
-    def heartbeat(self, job_id: int, worker: str) -> dict:
-        return self._call("POST", "/heartbeat", {"id": job_id, "worker": worker})
+    def heartbeat(self, job_id: int, worker: str, download_account: str = "main") -> dict:
+        return self._call("POST", "/heartbeat", {"id": job_id, "worker": worker,
+                                                  "download_account": download_account})
 
-    def report(self, job_id: int, worker: str, outcome: str, **data) -> None:
-        self._call("POST", "/report", {"id": job_id, "worker": worker, "outcome": outcome, **data})
+    def report(self, job_id: int, worker: str, outcome: str, download_account: str = "main",
+               **data) -> None:
+        self._call("POST", "/report", {"id": job_id, "worker": worker, "outcome": outcome,
+                                       "download_account": download_account, **data})
 
     def release(self, job_id: int, worker: str) -> None:
         self._call("POST", "/release", {"id": job_id, "worker": worker})

@@ -84,6 +84,12 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
     paused = " (PAUSED: Drive download quota hit)" if downloads.blocked() else ""
     lines.append(f"Downloaded today: {downloads.used() / 1e9:.0f} / "
                  f"{downloads.limit / 1e9:.0f} GB{paused}")
+    pc_downloads = Budget(conn, cfg.daily_pc_download_limit, budget.now, kind="pc_download")
+    pc_recently_seen = bool(seen) and (budget.now() - float(seen)) / 86400 <= cfg.pc_absent_days
+    if pc_downloads.used() > 0 or pc_recently_seen:
+        pc_paused = " (PAUSED: Drive download quota hit)" if pc_downloads.blocked() else ""
+        lines.append(f"PC account downloaded today: {pc_downloads.used() / 1e9:.0f} / "
+                     f"{pc_downloads.limit / 1e9:.0f} GB{pc_paused}")
     return "\n".join(lines)
 
 
@@ -163,13 +169,14 @@ def main(argv: list[str] | None = None) -> int:
 def _pc_main(args) -> int:
     from vidshrink.jobs import JobClient
     from vidshrink.pc_worker import (PCWorker, apply_ffmpeg_dir, default_config_path,
-                                      load_pc_config, pc_rclone)
+                                      load_pc_config, pc_download_rclone, pc_rclone)
     pcfg = load_pc_config(args.config or default_config_path())
     apply_ffmpeg_dir(pcfg)
     client = JobClient(pcfg.server, pcfg.token)
 
     def make_worker():
-        return PCWorker(pcfg, client, pc_rclone(pcfg), log=_log)
+        return PCWorker(pcfg, client, pc_rclone(pcfg),
+                        download_rclone=pc_download_rclone(pcfg), log=_log)
 
     if args.cmd == "pc-worker":
         _run_until_ctrl_c(make_worker())
@@ -199,14 +206,16 @@ def _run_until_ctrl_c(w) -> None:
 def _calibrate(args, pcfg, client) -> int:
     from vidshrink.calibrate import cut_sample, format_table, measure, pick_cq
     from vidshrink.encode import build_command, build_nvenc_command, run_encode_cancellable
-    from vidshrink.pc_worker import pc_rclone
+    from vidshrink.pc_worker import pc_download_rclone
     from vidshrink.probe import Probe
-    rc = pc_rclone(pcfg)
+    rc = pc_download_rclone(pcfg)
+    download_account = "pc" if pcfg.download_remote else "main"
     pcfg.workdir.mkdir(parents=True, exist_ok=True)
     jobs, samples = [], []
     try:
         for _ in range(args.samples):
-            job = client.claim(pcfg.worker_name, "nvenc")["job"]
+            job = client.claim(pcfg.worker_name, "nvenc",
+                               download_account=download_account)["job"]
             if job is None:
                 break
             # Keep it leased until every sample is cut: the server hands out the
@@ -223,7 +232,8 @@ def _calibrate(args, pcfg, client) -> int:
             samples.append((sample, probe))
             for held in list(jobs):
                 try:
-                    if client.heartbeat(held["id"], pcfg.worker_name).get("cancel"):
+                    if client.heartbeat(held["id"], pcfg.worker_name,
+                                        download_account=download_account).get("cancel"):
                         jobs.remove(held)  # lease already gone; nothing to release
                 except Exception:
                     pass

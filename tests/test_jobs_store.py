@@ -281,6 +281,84 @@ def test_claim_waits_when_upload_budget_used_up(conn, cfg, store):
     assert store.downloads.used() == 0  # nothing charged for a job not handed out
 
 
+def test_claim_pc_account_charges_pc_downloads_not_main(conn, store):
+    vid = add(conn, "a.mkv", size=5_000_000_000)
+    r = store.claim("pc", download_account="pc")
+    assert r["job"]["id"] == vid
+    assert store.pc_downloads.used() == 5_000_000_000
+    assert store.downloads.used() == 0
+    assert (r["download_used"], r["download_limit"]) == (5_000_000_000, store.cfg.daily_pc_download_limit)
+
+
+def test_claim_pc_account_works_while_main_exhausted(conn, cfg, store):
+    store.downloads.add(cfg.daily_download_limit)
+    vid = add(conn, "a.mkv", size=5_000_000_000)
+    r = store.claim("pc", download_account="pc")
+    assert r["job"]["id"] == vid
+
+
+def test_claim_pc_account_works_while_main_blocked(conn, store):
+    store.downloads.block(3600)
+    vid = add(conn, "a.mkv", size=5_000_000_000)
+    r = store.claim("pc", download_account="pc")
+    assert r["job"]["id"] == vid
+
+
+def test_claim_main_account_default_is_unchanged(conn, store):
+    vid = add(conn, "a.mkv", size=5_000_000_000)
+    r = store.claim("pc", download_account="main")
+    assert r["job"]["id"] == vid
+    assert store.downloads.used() == 5_000_000_000
+    assert store.pc_downloads.used() == 0
+
+
+def test_claim_bad_download_account_raises(conn, store):
+    add(conn, "a.mkv")
+    with pytest.raises(ValueError):
+        store.claim("pc", download_account="bogus")
+
+
+def test_report_download_quota_pc_blocks_only_pc_downloads(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc", download_account="pc")
+    store.report(vid, "pc", "download_quota", download_account="pc")
+    assert store.pc_downloads.blocked()
+    assert not store.downloads.blocked()
+    row = db.get(conn, vid)
+    assert (row["stage"], row["attempts"]) == ("queued", 0)
+
+
+def test_report_download_quota_main_blocks_only_main_downloads(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "download_quota")
+    assert store.downloads.blocked()
+    assert not store.pc_downloads.blocked()
+
+
+def test_report_download_account_ignored_on_other_outcomes(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "not_worth_it", reason="x", download_account="bogus")
+    assert db.get(conn, vid)["stage"] == "not_worth_it"
+
+
+def test_report_bad_download_account_on_quota_raises(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    with pytest.raises(ValueError):
+        store.report(vid, "pc", "download_quota", download_account="bogus")
+
+
+def test_heartbeat_reports_pc_budget_when_selected(conn, store):
+    vid = add(conn, "a.mkv", size=5_000_000_000)
+    store.claim("pc", download_account="pc")
+    store.pc_downloads.add(1_000)
+    hb = store.heartbeat(vid, "pc", download_account="pc")
+    assert (hb["download_used"], hb["download_limit"]) == (
+        5_000_001_000, store.cfg.daily_pc_download_limit)
+
+
 def test_claim_and_heartbeat_report_download_today(conn, cfg, store):
     vid = add(conn, "a.mkv", size=5_000_000_000)
     r = store.claim("pc")

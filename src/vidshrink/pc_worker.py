@@ -32,6 +32,10 @@ class PCConfig:
     server: str
     token: str
     remote: str = "gdrive:"
+    # A second, free Google account with Viewer access to the library, used ONLY for
+    # downloads (so PC jobs no longer spend the main account's shared download quota).
+    # Empty means downloads use `remote`, as before.
+    download_remote: str = ""
     workdir: Path = field(default_factory=_default_workdir)
     cq: int = 23
     bwlimit: str = "6M"
@@ -83,6 +87,13 @@ def pc_rclone(cfg: PCConfig) -> Rclone:
                   binary=cfg.rclone)
 
 
+def pc_download_rclone(cfg: PCConfig) -> Rclone:
+    # Downloads only: the PC's own Drive account (download_remote) when set, so they're
+    # charged against its own quota instead of the main account's; else the main remote.
+    return Rclone(cfg.download_remote or cfg.remote,
+                  (*Config().rclone_args, "--bwlimit", f"{cfg.bwlimit}:off"), binary=cfg.rclone)
+
+
 class _Abandon(Exception):
     """Stop working on the current job (Stop now or the server cancelled it)."""
 
@@ -99,10 +110,16 @@ EncodeFn = Callable[[Path, Path, Probe, Path, threading.Event], float]
 
 class PCWorker:
     def __init__(self, cfg: PCConfig, client: JobClient, rclone: Rclone,
-                 encode: EncodeFn | None = None, log: Callable[[str], None] = print):
+                 encode: EncodeFn | None = None, log: Callable[[str], None] = print,
+                 download_rclone: Rclone | None = None):
         self.cfg = cfg
         self.client = client
         self.rclone = rclone
+        # Downloads only; upload/md5/exists/delete always stay on `rclone` (the main
+        # account), since every file must stay owned by the main user.
+        self.download_rclone = download_rclone or rclone
+        # Sent on every claim/heartbeat/report so the server charges the right budget.
+        self.download_account = "pc" if cfg.download_remote else "main"
         self.encode = encode or self._nvenc
         self.log = log
         self.state = "idle"
@@ -160,7 +177,8 @@ class PCWorker:
         try:
             while not self._stop_now.is_set() and not self._stop_after.is_set():
                 try:
-                    resp = self.client.claim(self.cfg.worker_name, "nvenc")
+                    resp = self.client.claim(self.cfg.worker_name, "nvenc",
+                                             download_account=self.download_account)
                 except JobServiceError as e:
                     self.log(f"job service unreachable, retrying: {e}")
                     self._wake.wait(self.cfg.idle_secs)
@@ -203,7 +221,8 @@ class PCWorker:
             self._unexpected_counts.pop(job_id, None)
             try:
                 self._retry_job_call(lambda: self.client.report(
-                    job_id, self.cfg.worker_name, "failed", reason=tb[:500]))
+                    job_id, self.cfg.worker_name, "failed",
+                    download_account=self.download_account, reason=tb[:500]))
             except (LeaseLost, JobServiceError):
                 pass
         else:
@@ -272,7 +291,8 @@ class PCWorker:
         failing_since = None  # time.monotonic() of the first failure in a row
         while not stop.wait(self.cfg.heartbeat_secs):
             try:
-                resp = self.client.heartbeat(job_id, self.cfg.worker_name)
+                resp = self.client.heartbeat(job_id, self.cfg.worker_name,
+                                              download_account=self.download_account)
                 failing_since = None
                 self._note_download_today(resp)
                 if resp.get("cancel"):
@@ -303,7 +323,8 @@ class PCWorker:
     def _report(self, job: dict, outcome: str, **data) -> None:
         try:
             self._retry_job_call(
-                lambda: self.client.report(job["id"], self.cfg.worker_name, outcome, **data))
+                lambda: self.client.report(job["id"], self.cfg.worker_name, outcome,
+                                          download_account=self.download_account, **data))
         except LeaseLost:
             self.log(f"lease lost before reporting {outcome}: {job['path']}")
         except JobServiceError as e:
@@ -324,6 +345,7 @@ class PCWorker:
         for i in range(self.cfg.retry_attempts):
             try:
                 self.client.report(jid, self.cfg.worker_name, "uploaded",
+                                   download_account=self.download_account,
                                    out_size=out_size, out_md5=md5, encode_secs=secs)
                 self.done += 1
                 self.log(f"uploaded {tmp} ({out_size / 1e9:.1f} GB)")
@@ -383,7 +405,7 @@ class PCWorker:
             self.stage = "downloading"
             self.log(f"downloading {path} ({job['size'] / 1e9:.1f} GB)")
             self._check(cancel)
-            self._retry(lambda: self.rclone.download(path, src, cancel=cancel), cancel)
+            self._retry(lambda: self.download_rclone.download(path, src, cancel=cancel), cancel)
             self._check(cancel)
             if src.stat().st_size != job["size"]:
                 self._report(job, "changed")

@@ -89,16 +89,16 @@ def test_calibrate_holds_leases_until_all_samples_are_cut(tmp_path, monkeypatch,
         def __init__(self):
             self.queued, self.leased, self.calls = [1, 2, 3, 4], set(), []
 
-        def claim(self, worker, encoder):
-            self.calls.append("claim")
+        def claim(self, worker, encoder, download_account="main"):
+            self.calls.append(("claim", download_account))
             for i in self.queued:  # top-scored first, like the server
                 if i not in self.leased:
                     self.leased.add(i)
                     return {"job": {"id": i, "path": f"v{i}.mkv", "probe": probe}}
             return {"job": None}
 
-        def heartbeat(self, job_id, worker):
-            self.calls.append(("hb", job_id))
+        def heartbeat(self, job_id, worker, download_account="main"):
+            self.calls.append(("hb", job_id, download_account))
             return {"cancel": job_id not in self.leased}
 
         def release(self, job_id, worker):
@@ -113,18 +113,22 @@ def test_calibrate_holds_leases_until_all_samples_are_cut(tmp_path, monkeypatch,
             dest.write_bytes(b"x")
 
     client = TopFirstClient()
-    monkeypatch.setattr(pcw, "pc_rclone", lambda pcfg: FakeRc())
+    monkeypatch.setattr(pcw, "pc_download_rclone", lambda pcfg: FakeRc())
     monkeypatch.setattr(cal, "cut_sample", lambda src, out, p: out.write_bytes(b"s"))
     monkeypatch.setattr(cal, "measure", lambda samples, *a, **k:
                         (client.calls.append("measure"), [])[1])
     monkeypatch.setattr(cal, "format_table", lambda rows: "table")
     monkeypatch.setattr(cal, "pick_cq", lambda rows: 23)
-    pcfg = PCConfig(server="http://x", token="t", workdir=tmp_path / "w", worker_name="pc")
+    pcfg = PCConfig(server="http://x", token="t", workdir=tmp_path / "w", worker_name="pc",
+                    download_remote="gdrive-pc:")
     args = argparse.Namespace(samples=3, cqs="22,24", config=None)
 
     assert _calibrate(args, pcfg, client) == 0
     assert downloaded == ["v1.mkv", "v2.mkv", "v3.mkv"]
     assert client.leased == set()  # all released
+    assert [c[1] for c in client.calls if c[0] == "claim"] == ["pc", "pc", "pc"]
+    assert [c[2] for c in client.calls if c[0] == "hb"] == ["pc"] * (
+        len([c for c in client.calls if c[0] == "hb"]))
     assert client.calls.index("measure") > max(
-        i for i, c in enumerate(client.calls) if isinstance(c, tuple) and c[0] == "rel")
+        i for i, c in enumerate(client.calls) if c[0] == "rel")
     assert not list((tmp_path / "w").iterdir())  # samples cleaned up

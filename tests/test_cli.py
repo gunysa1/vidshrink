@@ -4,6 +4,7 @@ from pathlib import Path
 from vidshrink import db
 from vidshrink.budget import Budget
 from vidshrink.cli import main, status_report
+from vidshrink.jobs import PC_SEEN_KEY
 
 
 def test_scan_run_status_end_to_end(cfg, make_clip, capsys, monkeypatch):
@@ -59,3 +60,31 @@ def test_status_shows_download_budget(conn, cfg):
     assert "Downloaded today: 42 / 500 GB" in out and "PAUSED" not in out
     downloads.block(3600)
     assert "PAUSED" in status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))
+
+
+def test_status_shows_pc_download_budget_when_used(conn, cfg):
+    budget = Budget(conn, cfg.daily_upload_limit)
+    pc_downloads = Budget(conn, cfg.daily_pc_download_limit, budget.now, kind="pc_download")
+    pc_downloads.add(7 * 10**9)
+    out = status_report(conn, cfg, budget)
+    assert "PC account downloaded today: 7 / 750 GB" in out
+
+
+def test_status_shows_pc_download_budget_when_pc_seen_recently_even_if_unused(conn, cfg):
+    budget = Budget(conn, cfg.daily_upload_limit)
+    db.kv_set(conn, PC_SEEN_KEY, str(budget.now()))
+    out = status_report(conn, cfg, budget)
+    assert "PC account downloaded today: 0 / 750 GB" in out
+
+
+def test_status_hides_pc_download_budget_when_never_seen_and_unused(conn, cfg):
+    budget = Budget(conn, cfg.daily_upload_limit)
+    out = status_report(conn, cfg, budget)
+    assert "PC account downloaded today" not in out
+
+
+def test_status_hides_pc_download_budget_once_pc_absent_long_enough(conn, cfg):
+    budget = Budget(conn, cfg.daily_upload_limit)
+    db.kv_set(conn, PC_SEEN_KEY, str(budget.now() - (cfg.pc_absent_days + 1) * 86400))
+    out = status_report(conn, cfg, budget)
+    assert "PC account downloaded today" not in out

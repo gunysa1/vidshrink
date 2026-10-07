@@ -62,6 +62,25 @@ def test_round_trip(conn, job_service):
     assert db.get(conn, vid)["stage"] == "remote_ready"
 
 
+def test_download_account_passes_through_claim_heartbeat_report(conn, cfg, job_service):
+    vid = add(conn, "a.mkv", size=5_000_000_000)
+    c = JobClient(job_service.url, job_service.token)
+    r = c.claim("pc", download_account="pc")
+    assert r["job"]["id"] == vid
+    assert r["download_limit"] == cfg.daily_pc_download_limit
+    hb = c.heartbeat(vid, "pc", download_account="pc")
+    assert hb["cancel"] is False
+    c.report(vid, "pc", "download_quota", download_account="pc")
+    assert db.get(conn, vid)["stage"] == "queued"
+
+
+def test_bad_download_account_is_400(conn, job_service):
+    add(conn, "a.mkv")
+    c = JobClient(job_service.url, job_service.token)
+    with pytest.raises(JobServiceError, match="400"):
+        c.claim("pc", download_account="bogus")
+
+
 def test_wrong_token(job_service):
     with pytest.raises(JobServiceError, match="401"):
         JobClient(job_service.url, "nope").health()
