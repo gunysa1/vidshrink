@@ -69,3 +69,18 @@ def test_cancellable_encode_failure(tmp_path):
     with pytest.raises(EncodeError):
         run_encode_cancellable(x265_cmd(bad, tmp_path / "o.mkv"), tmp_path / "log",
                                threading.Event())
+
+
+def test_nvenc_command_tags_colour_via_setparams(tmp_path):
+    cmd = build_nvenc_command(tmp_path / "s", tmp_path / "o.mkv", P, cq=23)
+    assert opt(cmd, "-filter:v:1") == \
+        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+
+
+def test_nvenc_command_skips_unknown_or_unsafe_colour(tmp_path):
+    untagged = replace(P, color_primaries=None, color_transfer="unknown", color_space="ycgco")
+    cmd = build_nvenc_command(tmp_path / "s", tmp_path / "o.mkv", untagged, cq=23)
+    assert "-filter:v:1" not in cmd
+    pal = replace(P, color_primaries="bt470bg", color_transfer=None, color_space="gbr")
+    cmd = build_nvenc_command(tmp_path / "s", tmp_path / "o.mkv", pal, cq=23)
+    assert opt(cmd, "-filter:v:1") == "setparams=color_primaries=bt470bg"

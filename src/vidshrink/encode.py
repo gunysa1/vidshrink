@@ -82,9 +82,29 @@ def run_encode(cmd: list[str], log_path: Path) -> float:
     return time.monotonic() - start
 
 
+# Matrices hevc_nvenc can be tagged with: the rest make the encode output nothing (ffmpeg 9).
+NVENC_MATRICES = MATRICES - {"gbr", "bt2020c", "chroma-derived-nc", "chroma-derived-c",
+                             "ictcp", "smpte2085", "ycgco"}
+
+
+def nvenc_color_filter(probe: Probe) -> str | None:
+    # ffmpeg 9 takes the encoder's colour tags from the frames, ignoring the
+    # -color_primaries/-color_trc output options, so tag the frames with setparams.
+    parts = []
+    if probe.color_primaries in PRIMARIES:
+        parts.append(f"color_primaries={probe.color_primaries}")
+    if probe.color_transfer in TRANSFERS:
+        parts.append(f"color_trc={probe.color_transfer}")
+    if probe.color_space in NVENC_MATRICES:
+        parts.append(f"colorspace={probe.color_space}")
+    return "setparams=" + ":".join(parts) if parts else None
+
+
 def build_nvenc_command(src: Path, out: Path, probe: Probe, cq: int) -> list[str]:
     vi = probe.video_index
-    video = [
+    color = nvenc_color_filter(probe)
+    video = [f"-filter:v:{vi}", color] if color else []
+    video += [
         f"-c:v:{vi}", "hevc_nvenc",
         f"-preset:v:{vi}", "p7",
         f"-tune:v:{vi}", "hq",
