@@ -103,9 +103,42 @@ class JobStore:
         """Today's download total on the selected budget, for the PC's tray status."""
         return {"download_used": downloads.used(), "download_limit": downloads.limit}
 
-    def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main") -> dict:
+    def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main",
+             resume: bool = False) -> dict:
         downloads = self._download_budget(download_account)
+        if resume:
+            resumed = self._try_resume(worker)
+            if resumed is not None:
+                return {**resumed, **self._download_today(downloads)}
         return {**self._claim(worker, encoder, downloads), **self._download_today(downloads)}
+
+    def _try_resume(self, worker: str) -> dict | None:
+        """A job this worker still holds a live lease on (e.g. after a PC restart):
+        hand it straight back, with no download charged, instead of leasing a fresh
+        one and leaving the old row to expire. Oldest lease_until first, in case a
+        worker somehow holds more than one (it shouldn't, but pick deterministically
+        if so). None if nothing qualifies, so the caller falls through to a normal
+        claim."""
+        self._seen()
+        now = self.now()
+        row = self.conn.execute(
+            "SELECT * FROM videos WHERE stage='leased' AND worker=? AND lease_until>=?"
+            " ORDER BY lease_until ASC LIMIT 1", (worker, now)).fetchone()
+        if row is None:
+            return None
+        with db.transaction(self.conn):
+            # Re-check-and-extend atomically: the lease condition is the UPDATE's own
+            # WHERE, so this is safe even if it has moved on since the SELECT above.
+            extended = self._update_leased(row["id"], worker, now,
+                                           {"lease_until": now + self.cfg.lease_secs})
+        if not extended:
+            return None
+        self.log(f"{worker} resumed: {row['path']}")
+        return {"job": {"id": row["id"], "path": row["path"], "size": row["size"],
+                        "modtime": row["modtime"], "final_path": row["final_path"],
+                        "tmp_path": tmp_path(row["path"]),
+                        "probe": json.loads(row["probe_json"])},
+                "resumed": True, "retry_after": 0.0}
 
     def _claim(self, worker: str, encoder: str, downloads: Budget) -> dict:
         self._seen()
@@ -363,7 +396,8 @@ def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/claim":
                     self._send(200, store.claim(body["worker"], body.get("encoder", "nvenc"),
-                                                body.get("download_account", "main")))
+                                                body.get("download_account", "main"),
+                                                resume=bool(body.get("resume", False))))
                 elif self.path == "/heartbeat":
                     self._send(200, store.heartbeat(int(body["id"]), body["worker"],
                                                     body.get("download_account", "main")))
@@ -411,9 +445,11 @@ class JobClient:
     def health(self) -> dict:
         return self._call("GET", "/health")
 
-    def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main") -> dict:
+    def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main",
+             resume: bool = False) -> dict:
         return self._call("POST", "/claim", {"worker": worker, "encoder": encoder,
-                                             "download_account": download_account})
+                                             "download_account": download_account,
+                                             "resume": resume})
 
     def heartbeat(self, job_id: int, worker: str, download_account: str = "main") -> dict:
         return self._call("POST", "/heartbeat", {"id": job_id, "worker": worker,

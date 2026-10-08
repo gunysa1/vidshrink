@@ -62,6 +62,15 @@ def test_round_trip(conn, job_service):
     assert db.get(conn, vid)["stage"] == "remote_ready"
 
 
+def test_resume_passes_through_claim(conn, job_service):
+    vid = add(conn, "a.mkv")
+    c = JobClient(job_service.url, job_service.token)
+    c.claim("pc")  # leases it
+    r = c.claim("pc", resume=True)
+    assert r["job"]["id"] == vid
+    assert r["resumed"] is True
+
+
 def test_download_account_passes_through_claim_heartbeat_report(conn, cfg, job_service):
     vid = add(conn, "a.mkv", size=5_000_000_000)
     c = JobClient(job_service.url, job_service.token)

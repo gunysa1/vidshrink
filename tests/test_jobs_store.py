@@ -103,6 +103,45 @@ def test_heartbeat_extends_and_cancels(conn, store):
     assert store.heartbeat(vid, "pc")["cancel"] is True
 
 
+def test_resume_returns_same_leased_job_and_extends_lease(conn, store):
+    vid = add(conn, "a.mkv", size=5_000_000_000)
+    first = store.claim("pc")["job"]
+    before_used = store.downloads.used()
+    store.clock.t += 100
+    r = store.claim("pc", resume=True)
+    assert r["job"]["id"] == vid == first["id"]
+    assert r["resumed"] is True
+    assert db.get(conn, vid)["lease_until"] == store.clock.t + 1800
+    assert store.downloads.used() == before_used  # no extra download charged
+
+
+def test_resume_ignores_another_workers_lease(conn, store):
+    add(conn, "a.mkv")
+    store.claim("pc")
+    r = store.claim("other", resume=True)
+    assert r.get("resumed") is not True
+    assert r["job"] is None  # nothing else queued, so a normal claim finds nothing
+
+
+def test_resume_ignores_an_expired_lease(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.clock.t += 1801  # lease_until now strictly in the past
+    r = store.claim("pc", resume=True)
+    assert r.get("resumed") is not True
+    # Falls through to a normal claim: the expired lease gets swept and re-leased.
+    assert r["job"]["id"] == vid
+
+
+def test_resume_false_behaves_like_today(conn, store):
+    best = add(conn, "a.mkv")
+    other = add(conn, "b.mkv", size=1_000_000)
+    store.claim("pc")  # leases `best` (bigger -> scores higher)
+    r = store.claim("pc", resume=False)
+    assert "resumed" not in r
+    assert r["job"]["id"] == other
+
+
 def test_report_uploaded(conn, store):
     vid = add(conn, "a.mkv")
     store.claim("pc")

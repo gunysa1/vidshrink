@@ -3,6 +3,7 @@ Must stay importable on Windows: no fcntl, no vidshrink.worker."""
 import os
 import platform
 import random
+import re
 import shutil
 import threading
 import time
@@ -25,6 +26,64 @@ from vidshrink.verify import compare, decode_errors
 def _default_workdir() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".cache")
     return Path(base) / "vidshrink" / "work"
+
+
+# Only files whose NAME matches one of these are ever touched by clean_workdir --
+# never anything else, and never a subdirectory, even if workdir is a whole drive.
+# The first group of each numbered pattern is the job id, so a match can be kept
+# when it belongs to the job currently running.
+_NUMBERED_PATTERNS = tuple(re.compile(p) for p in (
+    r"^(\d+)\.src$",
+    r"^(\d+)\.out\.mkv$",
+    r"^(\d+)\.log$",
+    r"^(\d+)\.encoded$",
+    r"^(\d+)\.downloaded$",
+    # rclone's local backend, when it does write a partial file, names it
+    # "<name>.<random>.partial" (e.g. "65137.src.a1b2c3.partial").
+    r"^(\d+)\.(?:src|out\.mkv)\..*\.partial$",
+    # A marker's own write-then-rename tmp, if a crash lands mid-write.
+    r"^(\d+)\.(?:encoded|downloaded)\.tmp$",
+))
+# calibrate's own leftovers: never present while the PC worker loop runs (the two
+# never run at once in one process), so always safe to sweep here.
+_CALIBRATE_PATTERNS = tuple(re.compile(p) for p in (r"^cal-.*$", r"^cal\.log$"))
+
+
+def clean_workdir(workdir: Path, keep_id: int | None) -> list[Path]:
+    """Delete vidshrink's own stale work files from `workdir` -- never a
+    subdirectory, never anything whose name doesn't match one of our own
+    patterns. Files that belong to `keep_id` (by the numeric id in their name)
+    are kept; everything else matching is removed. Returns what was actually
+    deleted; an OSError deleting one file is swallowed so the rest still get a
+    chance (and so this never fails a job)."""
+    deleted = []
+    try:
+        entries = list(workdir.iterdir())
+    except OSError:
+        return deleted
+    for p in entries:
+        if not p.is_file():
+            continue
+        name = p.name
+        match = False
+        for pat in _NUMBERED_PATTERNS:
+            m = pat.match(name)
+            if m:
+                if keep_id is not None and int(m.group(1)) == keep_id:
+                    match = False
+                else:
+                    match = True
+                break
+        if not match:
+            match = any(pat.match(name) for pat in _CALIBRATE_PATTERNS)
+        if not match:
+            continue
+        try:
+            p.unlink()
+            deleted.append(p)
+        except OSError:
+            continue
+    return deleted
 
 
 @dataclass
@@ -180,11 +239,14 @@ class PCWorker:
             self.state = "stopped"
             return
         self.cfg.workdir.mkdir(parents=True, exist_ok=True)
+        first_claim = True
         try:
             while not self._stop_now.is_set() and not self._stop_after.is_set():
+                resume, first_claim = first_claim, False
                 try:
                     resp = self.client.claim(self.cfg.worker_name, "nvenc",
-                                             download_account=self.download_account)
+                                             download_account=self.download_account,
+                                             resume=resume)
                 except JobServiceError as e:
                     self.log(f"job service unreachable, retrying: {e}")
                     self._wake.wait(self.cfg.idle_secs)
@@ -326,6 +388,21 @@ class PCWorker:
         return run_encode_cancellable(build_nvenc_command(src, out, probe, self.cfg.cq),
                                       log_path, cancel)
 
+    def _read_marker(self, marker: Path) -> float | None:
+        """The encode seconds recorded in a finished-encode marker, or None if
+        it's absent or unreadable (treated the same as absent)."""
+        try:
+            return float(marker.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def _write_marker(self, marker: Path, content) -> None:
+        """Record a successful download/encode atomically: write-then-rename, so
+        a crash mid-write never leaves a marker that looks valid but isn't."""
+        tmp = marker.with_name(marker.name + ".tmp")
+        tmp.write_text(str(content))
+        os.replace(tmp, marker)
+
     def _report(self, job: dict, outcome: str, **data) -> None:
         try:
             self._retry_job_call(
@@ -396,7 +473,12 @@ class PCWorker:
         src = self.cfg.workdir / f"{jid}.src"
         out = self.cfg.workdir / f"{jid}.out.mkv"
         log_path = self.cfg.workdir / f"{jid}.log"
+        marker = self.cfg.workdir / f"{jid}.encoded"
+        downloaded = self.cfg.workdir / f"{jid}.downloaded"
         self.current_path = job.get("path")
+        deleted = clean_workdir(self.cfg.workdir, jid)
+        if deleted:
+            self.log(f"cleaned stale work files: {', '.join(p.name for p in deleted)}")
         hb_stop = threading.Event()
         server_cancelled = threading.Event()
         hb = threading.Thread(target=self._heartbeat, args=(jid, hb_stop, cancel,
@@ -408,17 +490,37 @@ class PCWorker:
         try:
             path, tmp = job["path"], job["tmp_path"]
             probe = Probe(**job["probe"])
-            self.stage = "downloading"
-            self.log(f"downloading {path} ({job['size'] / 1e9:.1f} GB)")
-            self._check(cancel)
-            self._retry(lambda: self.download_rclone.download(path, src, cancel=cancel), cancel)
-            self._check(cancel)
-            if src.stat().st_size != job["size"]:
-                self._report(job, "changed")
-                return
-            self.stage = "encoding"
-            self.log(f"encoding {path}")
-            secs = self.encode(src, out, probe, log_path, cancel)
+            secs = self._read_marker(marker) if out.exists() else None
+            if secs is not None:
+                self.log(f"resuming {path}: reusing finished encode")
+            else:
+                if downloaded.exists() and src.exists() and src.stat().st_size == job["size"]:
+                    self.log(f"resuming {path}: reusing download")
+                else:
+                    # Normal path. A leftover out without a (valid) marker is an
+                    # unfinished encode from a previous run; a leftover src
+                    # without a (valid) marker may be a shutdown-truncated
+                    # download that happens to sit at the full size (rclone's
+                    # local backend preallocates it) -- neither is trustworthy,
+                    # so clear them all before starting over.
+                    src.unlink(missing_ok=True)
+                    downloaded.unlink(missing_ok=True)
+                    out.unlink(missing_ok=True)
+                    marker.unlink(missing_ok=True)
+                    self.stage = "downloading"
+                    self.log(f"downloading {path} ({job['size'] / 1e9:.1f} GB)")
+                    self._check(cancel)
+                    self._retry(lambda: self.download_rclone.download(path, src, cancel=cancel),
+                               cancel)
+                    self._check(cancel)
+                    if src.stat().st_size != job["size"]:
+                        self._report(job, "changed")
+                        return
+                    self._write_marker(downloaded, job["size"])
+                self.stage = "encoding"
+                self.log(f"encoding {path}")
+                secs = self.encode(src, out, probe, log_path, cancel)
+                self._write_marker(marker, secs)
             self.stage = "verifying"
             self.log(f"verifying ({secs / 60:.0f} min encode)")
             out_size = out.stat().st_size
@@ -484,7 +586,7 @@ class PCWorker:
             hb_stop.set()
             hb.join(5)
             self._current_cancel = None
-            for f in (src, out, log_path):
+            for f in (src, out, log_path, marker, downloaded):
                 f.unlink(missing_ok=True)
             self.current_path = None
             self.stage = ""

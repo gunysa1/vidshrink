@@ -11,7 +11,7 @@ from vidshrink.budget import Budget
 from vidshrink.encode import run_encode_cancellable
 from vidshrink.jobs import JobClient, JobServiceError, JobStore, LeaseLost, make_server
 from vidshrink.paths import md5_file
-from vidshrink.pc_worker import PCConfig, PCWorker, load_pc_config
+from vidshrink.pc_worker import PCConfig, PCWorker, clean_workdir, load_pc_config
 from vidshrink.probe import parse_ffprobe, run_ffprobe
 from vidshrink.rclone import Rclone, RcloneError, TransferCancelled, free_port
 from vidshrink.scanner import scan
@@ -480,7 +480,7 @@ class FakeClient:
     def heartbeat(self, job_id, worker, download_account="main"):
         return self._heartbeat()
 
-    def claim(self, worker, encoder, download_account="main"):
+    def claim(self, worker, encoder, download_account="main", resume=False):
         return self._claim()
 
     def release(self, job_id, worker):
@@ -707,3 +707,208 @@ def test_bwlimit_plain_caps_uploads_only_and_pair_passes_through(tmp_path):
         for rc in (pc_rclone(c), pc_download_rclone(c)):
             args = list(rc.extra_args)
             assert args[args.index("--bwlimit") + 1] == want
+
+
+# --- clean_workdir -----------------------------------------------------------
+
+def test_clean_workdir_deletes_matching_keeps_kept_and_unrelated(tmp_path):
+    keep = tmp_path / "5.src"
+    keep.write_text("keep")
+    other_src = tmp_path / "6.src"
+    other_src.write_text("x")
+    other_out = tmp_path / "6.out.mkv"
+    other_out.write_text("x")
+    other_log = tmp_path / "6.log"
+    other_log.write_text("x")
+    other_marker = tmp_path / "6.encoded"
+    other_marker.write_text("1.0")
+    other_dl_marker = tmp_path / "6.downloaded"
+    other_dl_marker.write_text("12345")
+    encoded_tmp = tmp_path / "6.encoded.tmp"
+    encoded_tmp.write_text("1.0")
+    downloaded_tmp = tmp_path / "6.downloaded.tmp"
+    downloaded_tmp.write_text("12345")
+    partial = tmp_path / "6.src.ab12cd.partial"
+    partial.write_text("x")
+    out_partial = tmp_path / "6.out.mkv.deadbeef.partial"
+    out_partial.write_text("x")
+    cal1 = tmp_path / "cal-foo.mkv"
+    cal1.write_text("x")
+    cal_log = tmp_path / "cal.log"
+    cal_log.write_text("x")
+    notes = tmp_path / "notes.txt"
+    notes.write_text("keep me")
+    weird = tmp_path / "123abc.src"
+    weird.write_text("keep me too")
+    subdir = tmp_path / "sub"
+    subdir.mkdir()
+    (subdir / "7.src").write_text("never touched")
+
+    deleted = clean_workdir(tmp_path, keep_id=5)
+
+    assert set(deleted) == {other_src, other_out, other_log, other_marker,
+                            other_dl_marker, encoded_tmp, downloaded_tmp,
+                            partial, out_partial, cal1, cal_log}
+    assert keep.exists()
+    assert notes.exists() and weird.exists()
+    assert subdir.exists() and (subdir / "7.src").exists()
+
+
+def test_clean_workdir_keep_id_none_deletes_all_matching(tmp_path):
+    a = tmp_path / "1.src"
+    a.write_text("x")
+    b = tmp_path / "2.out.mkv"
+    b.write_text("x")
+    deleted = clean_workdir(tmp_path, keep_id=None)
+    assert set(deleted) == {a, b}
+    assert not a.exists() and not b.exists()
+
+
+def test_clean_workdir_oserror_on_one_file_does_not_block_others(tmp_path, monkeypatch):
+    bad = tmp_path / "1.src"
+    bad.write_text("x")
+    good = tmp_path / "2.src"
+    good.write_text("x")
+    orig_unlink = Path.unlink
+
+    def flaky_unlink(self, *a, **k):
+        if self.name == "1.src":
+            raise OSError("permission denied")
+        return orig_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    deleted = clean_workdir(tmp_path, keep_id=None)
+    assert deleted == [good]
+    assert bad.exists() and not good.exists()
+
+
+def test_clean_workdir_missing_dir_returns_empty(tmp_path):
+    assert clean_workdir(tmp_path / "nope", keep_id=None) == []
+
+
+# --- resume: reusing finished local work --------------------------------------
+
+def test_resume_reuses_finished_encode_skips_download_and_encode(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    pc.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    out = pc.cfg.workdir / f"{vid}.out.mkv"
+    marker = pc.cfg.workdir / f"{vid}.encoded"
+    x265_encode(root / "Movies" / "a.mkv", out, None, pc.cfg.workdir / "setup.log",
+               threading.Event())
+    marker.write_text("12.5")
+
+    def must_not_encode(*a, **k):
+        raise AssertionError("encode must not be called when reusing a finished encode")
+
+    pc.encode = must_not_encode
+    orig_download = pc.download_rclone.download
+    download_calls = []
+
+    def spy_download(*a, **k):
+        download_calls.append(1)
+        return orig_download(*a, **k)
+
+    monkeypatch.setattr(pc.download_rclone, "download", spy_download)
+    t = run_in_thread(pc)
+    assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+    pc.stop(now=True)
+    t.join(10)
+    assert download_calls == []
+
+
+def test_resume_reuses_downloaded_src_skips_download(conn, cfg, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    pc.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    src = pc.cfg.workdir / f"{vid}.src"
+    shutil.copy(root / "Movies" / "a.mkv", src)
+    (pc.cfg.workdir / f"{vid}.downloaded").write_text(str(src.stat().st_size))
+    orig_download = pc.download_rclone.download
+    download_calls = []
+
+    def spy_download(*a, **k):
+        download_calls.append(1)
+        return orig_download(*a, **k)
+
+    monkeypatch.setattr(pc.download_rclone, "download", spy_download)
+    t = run_in_thread(pc)
+    assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+    pc.stop(now=True)
+    t.join(10)
+    assert download_calls == []
+
+
+def test_resume_full_size_src_without_marker_is_downloaded_again(conn, cfg, setup, monkeypatch):
+    """rclone's local backend preallocates the full size, so a full-size src left
+    over from a shutdown mid-download can't be trusted without the .downloaded
+    marker proving the transfer actually completed."""
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    pc.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    src = pc.cfg.workdir / f"{vid}.src"
+    shutil.copy(root / "Movies" / "a.mkv", src)
+    # No .downloaded marker.
+    orig_download = pc.download_rclone.download
+    download_calls = []
+
+    def spy_download(*a, **k):
+        download_calls.append(1)
+        return orig_download(*a, **k)
+
+    monkeypatch.setattr(pc.download_rclone, "download", spy_download)
+    t = run_in_thread(pc)
+    assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+    pc.stop(now=True)
+    t.join(10)
+    assert download_calls  # re-downloaded, not trusted
+
+
+def test_resume_stale_out_without_marker_is_regenerated(conn, setup):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    pc.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    out = pc.cfg.workdir / f"{vid}.out.mkv"
+    out.write_bytes(b"not a real mkv, left over from a crash")
+    orig_encode = pc.encode
+    calls = []
+
+    def spy_encode(*a, **k):
+        calls.append(1)
+        return orig_encode(*a, **k)
+
+    pc.encode = spy_encode
+    t = run_in_thread(pc)
+    assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+    pc.stop(now=True)
+    t.join(10)
+    assert calls  # the encode actually ran -- out was regenerated, not trusted stale
+
+
+def test_resume_cleans_stale_files_of_another_job_at_start(conn, setup):
+    root, pc, store = setup
+    pc.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    stale = pc.cfg.workdir / "999999.src"
+    stale.write_bytes(b"leftover from a job that no longer exists")
+    t = run_in_thread(pc)
+    assert wait_for(lambda: not stale.exists())
+    pc.stop(now=True)
+    t.join(10)
+
+
+def test_first_claim_after_start_sends_resume_true_then_false(conn, setup, monkeypatch):
+    root, pc, store = setup
+    orig_claim = pc.client.claim
+    resumes = []
+
+    def spy_claim(worker, encoder, download_account="main", resume=False):
+        resumes.append(resume)
+        return orig_claim(worker, encoder, download_account=download_account, resume=resume)
+
+    monkeypatch.setattr(pc.client, "claim", spy_claim)
+    t = run_in_thread(pc)
+    assert wait_for(lambda: len(resumes) >= 2)
+    pc.stop(now=True)
+    t.join(10)
+    assert resumes[0] is True
+    assert all(r is False for r in resumes[1:])
