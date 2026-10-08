@@ -183,11 +183,11 @@ only keeps the two separate:
    main user.
 
 With `download_remote` set, the PC's downloads count against a separate budget
-on the PC's own account (300 GB/day to start, `daily_pc_download_limit` in
-`config.py`), and the main account's 500 GB/day is left free for the server and
-Plex. It starts low on purpose: Google may also charge downloads of a shared file
-to its owner. Watch the first days for any download-quota error on the main
-account (server log or Plex) before raising it. `vidshrink status` on the server shows both:
+on the PC's own account (750 GB/day, `daily_pc_download_limit` in `config.py`),
+and the main account's 500 GB/day is left free for the server and Plex. It
+started at 300 GB/day; on 2026-10-07 the PC account downloaded its full 300 GB
+with no download-quota error on the main account (probed every 15 min for a
+day), so Google charges these downloads to the PC account, not the owner. `vidshrink status` on the server shows both:
 `Downloaded today` is the main account, `PC account downloaded today` is the
 PC's.
 
