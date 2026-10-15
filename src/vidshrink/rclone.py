@@ -20,6 +20,9 @@ TMP_SUFFIX = ".vidshrink-tmp.mkv"
 CANCEL_GRACE_SECS = 5.0
 # Drive's daily download quota (shared with anything else on the account, e.g. Plex).
 DOWNLOAD_QUOTA_MARKER = "downloadQuotaExceeded"
+# The remote's Drive login is dead (expired/revoked refresh token): no retry helps;
+# it needs `rclone config reconnect <remote>:`.
+AUTH_MARKERS = ("invalid_grant", "couldn't fetch token", "Token has been expired or revoked")
 # "Received upload limit error" is what rclone 1.60 logs when --drive-stop-on-upload-limit
 # turns Drive's daily-limit 403 into a fatal error.
 RATE_LIMIT_MARKERS = ("userRateLimitExceeded", "uploadLimitExceeded", "User rate limit exceeded",
@@ -43,6 +46,10 @@ class RcloneError(Exception):
     @property
     def download_quota(self) -> bool:
         return DOWNLOAD_QUOTA_MARKER in self.stderr
+
+    @property
+    def auth_failed(self) -> bool:
+        return any(m in self.stderr for m in AUTH_MARKERS)
 
 
 class Rclone:
@@ -135,7 +142,7 @@ def with_retries(fn: Callable[[], T], attempts: int, base_delay: float,
         try:
             return fn()
         except RcloneError as e:
-            if e.rate_limited or e.download_quota or i == attempts - 1:
+            if e.rate_limited or e.download_quota or e.auth_failed or i == attempts - 1:
                 raise
             sleep(base_delay * 2 ** i + random.uniform(0, base_delay))
     raise AssertionError("unreachable")

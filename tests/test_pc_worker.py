@@ -212,6 +212,28 @@ def test_local_fault_during_job_releases_and_stops(conn, setup):
     assert (row["stage"], row["attempts"]) == ("queued", 0)
 
 
+def test_drive_login_failure_releases_and_stops(conn, setup, monkeypatch):
+    """An expired/revoked Drive login is the PC's problem, not the video's: release
+    the job without using an attempt and stop, instead of failing the whole queue."""
+    root, pc, store = setup
+    calls = {"n": 0}
+
+    def expired(*a, **k):
+        calls["n"] += 1
+        raise RcloneError(1, 'CRITICAL: Failed to create file system for "gdrive-pc:Movies/a.mkv": '
+                             "couldn't fetch token: invalid_grant: maybe token expired?")
+
+    monkeypatch.setattr(pc.download_rclone, "download", expired)
+    t = run_in_thread(pc)
+    t.join(30)
+    assert not t.is_alive()
+    assert pc.state == "stopped"
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    row = db.get(conn, vid)
+    assert (row["stage"], row["attempts"]) == ("queued", 0)
+    assert calls["n"] == 1  # no pointless retries of a dead login
+
+
 def test_unexpected_exception_in_job_releases_and_continues(conn, setup, monkeypatch):
     root, pc, store = setup
     calls = {"n": 0}

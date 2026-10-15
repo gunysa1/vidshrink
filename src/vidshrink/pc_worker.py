@@ -312,7 +312,8 @@ class PCWorker:
             try:
                 return fn()
             except RcloneError as e:
-                if e.rate_limited or e.download_quota or i == self.cfg.retry_attempts - 1:
+                if (e.rate_limited or e.download_quota or e.auth_failed
+                        or i == self.cfg.retry_attempts - 1):
                     raise
                 delay = self.cfg.retry_base_delay * 2 ** i + random.uniform(
                     0, self.cfg.retry_base_delay)
@@ -551,6 +552,12 @@ class PCWorker:
         except (_Abandon, EncodeCancelled, TransferCancelled):
             self._abandon(job, tmp if uploading else None, md5)
         except RcloneError as e:
+            if e.auth_failed:
+                # The PC's Drive login is dead: every job would fail the same way,
+                # so release this one (no attempt used) and stop until it's fixed.
+                self._abandon(job, tmp if uploading else None, md5)
+                raise _LocalFault(f"Drive login failed (run `rclone config reconnect` "
+                                  f"for the remote, then Start again): {e}") from e
             if e.rate_limited and uploading:
                 self._delete_tmp_if_ours(job, tmp, md5)
                 self._report(job, "upload_limited")
