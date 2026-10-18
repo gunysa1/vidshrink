@@ -81,17 +81,44 @@ def test_swap_inconsistent_marks_failed(conn, cfg, setup):
     assert not (cfg.workdir / f"{vid}.out.mkv").exists()
 
 
-def test_interrupted_encode_requeues_then_fails(conn, cfg, setup):
+INTERRUPTED = "interrupted during encoding"
+
+
+def test_first_interruption_is_free(conn, cfg, setup):
     root, worker, row = setup
     vid = row("e.mkv", "encoding")
     (cfg.workdir / f"{vid}.src").write_bytes(b"partial")
     worker.recover()
     r = db.get(conn, vid)
-    assert (r["stage"], r["attempts"]) == ("queued", 1)
+    assert (r["stage"], r["attempts"], r["reason"]) == ("queued", 0, INTERRUPTED)
     assert not (cfg.workdir / f"{vid}.src").exists()
-    db.mark(conn, vid, "verifying")
+
+
+def test_second_interruption_in_a_row_burns_an_attempt(conn, cfg, setup):
+    root, worker, row = setup
+    vid = row("e.mkv", "encoding", reason=INTERRUPTED)
     worker.recover()
+    r = db.get(conn, vid)
+    assert (r["stage"], r["attempts"]) == ("queued", 1)
+    db.mark(conn, vid, "verifying")        # reason still says interrupted
+    worker.recover()
+    assert db.get(conn, vid)["attempts"] == 2
     assert db.get(conn, vid)["stage"] == "failed"
+
+
+def test_starting_work_clears_an_old_interruption(conn, cfg, setup):
+    root, worker, row = setup
+    (root / "e.mkv").write_bytes(b"x" * 1000)
+    vid = row("e.mkv", "queued", reason=INTERRUPTED)
+    seen = []
+
+    def download(*a, **k):
+        seen.append(db.get(conn, vid)["reason"])
+        raise RcloneError(1, "boom")
+
+    worker.rclone.download = download
+    worker.prepare(db.get(conn, vid))
+    assert seen and all(reason is None for reason in seen)
 
 
 def test_interrupted_upload(conn, cfg, setup):

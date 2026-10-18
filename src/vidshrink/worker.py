@@ -16,6 +16,9 @@ from vidshrink.rclone import Rclone, RcloneError, with_retries
 from vidshrink.verify import compare, decode_errors
 
 
+INTERRUPTED_PREFIX = "interrupted during "
+
+
 class AlreadyRunning(Exception):
     pass
 
@@ -288,7 +291,7 @@ class Worker:
                     started = False
                 else:
                     started = db.mark_if(self.conn, vid, ("queued",), "downloading",
-                                         encoder="x265")
+                                         encoder="x265", reason=None)
             if not started:
                 self.log(f"skipping {path}: no longer queued or its target is busy "
                          f"(leased to another worker?)")
@@ -433,7 +436,17 @@ class Worker:
 
     def recover(self, dry_run: bool = False) -> int:
         for row in db.rows_in(self.conn, "downloading", "encoding", "verifying"):
-            self._fail(row, f"interrupted during {row['stage']}")
+            reason = f"{INTERRUPTED_PREFIX}{row['stage']}"
+            if (row["reason"] or "").startswith(INTERRUPTED_PREFIX):
+                # Second interruption in a row for this file: it may be what's
+                # crashing us, so it costs an attempt like any other failure.
+                self._fail(row, reason)
+            else:
+                # A reboot or restart isn't this file's fault: requeue for free, but
+                # remember it so a repeat does count.
+                self._cleanup(row["id"])
+                db.mark(self.conn, row["id"], "queued", reason=reason)
+                self.log(f"queued: {row['path']}: {reason} (first time, no attempt used)")
         for row in db.rows_in(self.conn, "uploading"):
             tmp = tmp_path(row["path"])
             try:
