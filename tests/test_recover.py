@@ -1,11 +1,12 @@
 import hashlib
+import shutil
 from pathlib import Path
 
 import pytest
 
 from vidshrink import db
 from vidshrink.budget import Budget
-from vidshrink.probe import Probe
+from vidshrink.probe import Probe, parse_ffprobe, run_ffprobe
 from vidshrink.rclone import Rclone, RcloneError
 from vidshrink.worker import SwapError, Worker
 
@@ -94,31 +95,52 @@ def test_first_interruption_is_free(conn, cfg, setup):
     assert not (cfg.workdir / f"{vid}.src").exists()
 
 
-def test_second_interruption_in_a_row_burns_an_attempt(conn, cfg, setup):
-    root, worker, row = setup
-    vid = row("e.mkv", "encoding", reason=INTERRUPTED)
-    worker.recover()
-    r = db.get(conn, vid)
-    assert (r["stage"], r["attempts"]) == ("queued", 1)
-    db.mark(conn, vid, "verifying")        # reason still says interrupted
-    worker.recover()
-    assert db.get(conn, vid)["attempts"] == 2
-    assert db.get(conn, vid)["stage"] == "failed"
+class Crash(BaseException):
+    """Stands in for the process dying: nothing in prepare() catches it."""
 
 
-def test_starting_work_clears_an_old_interruption(conn, cfg, setup):
+def test_crash_loop_is_parked(conn, cfg, setup):
     root, worker, row = setup
     (root / "e.mkv").write_bytes(b"x" * 1000)
-    vid = row("e.mkv", "queued", reason=INTERRUPTED)
+    vid = row("e.mkv", "queued")
+
+    def download(*a, **k):
+        raise Crash()                      # the machine dies mid-download
+
+    worker.rclone.download = download
+    seen = []
+    for _ in range(3):
+        with pytest.raises(Crash):
+            worker.prepare(db.get(conn, vid))
+        assert db.get(conn, vid)["stage"] == "downloading"
+        worker.recover()                   # service restarts after the crash
+        r = db.get(conn, vid)
+        seen.append((r["stage"], r["attempts"]))
+    # The first interruption is free, the second in a row burns an attempt, and a
+    # file that keeps killing the machine ends up parked.
+    assert seen == [("queued", 0), ("queued", 1), ("failed", 2)]
+
+
+def test_interruption_marker_survives_until_work_completes(conn, cfg, setup, make_clip):
+    root, worker, row = setup
+    shutil.copy(make_clip("e", container="mp4"), root / "e.mp4")
+    vid = row("e.mp4", "queued", reason=INTERRUPTED)
+    # row() stores a stub probe; the encode and its verification need the real one.
+    db.save_probe(conn, "e.mp4", parse_ffprobe(run_ffprobe(str(root / "e.mp4")),
+                                               (root / "e.mp4").stat().st_size).to_json())
+    db.mark(conn, vid, "queued", reason=INTERRUPTED)
+    real_download = worker.rclone.download
     seen = []
 
     def download(*a, **k):
         seen.append(db.get(conn, vid)["reason"])
-        raise RcloneError(1, "boom")
+        return real_download(*a, **k)
 
     worker.rclone.download = download
     worker.prepare(db.get(conn, vid))
-    assert seen and all(reason is None for reason in seen)
+    assert seen == [INTERRUPTED]                  # still marked while work is under way
+    r = db.get(conn, vid)
+    assert r["stage"] == "ready" and r["reason"] is None
 
 
 def test_interrupted_upload(conn, cfg, setup):

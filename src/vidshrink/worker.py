@@ -281,6 +281,9 @@ class Worker:
                 return
             self._wait_for_disk(row["size"])
             self.log(f"downloading {path} ({row['size'] / 1e9:.1f} GB)")
+            # The interruption marker (reason) stays through downloading/encoding/
+            # verifying and is cleared only when the work completes (-> ready), so a
+            # second interruption in a row is recognised by recover().
             # Atomic: re-check the busy-stem guard and switch to downloading in one
             # transaction, so a lease or another row's progress can't slip in between
             # the check and the mark (requirement A: no double assignment).
@@ -291,7 +294,7 @@ class Worker:
                     started = False
                 else:
                     started = db.mark_if(self.conn, vid, ("queued",), "downloading",
-                                         encoder="x265", reason=None)
+                                         encoder="x265")
             if not started:
                 self.log(f"skipping {path}: no longer queued or its target is busy "
                          f"(leased to another worker?)")
@@ -356,7 +359,8 @@ class Worker:
             self._fail(row, str(e))
             return
         self._cleanup(vid, keep_output=True)
-        db.mark(self.conn, vid, "ready", out_size=out_size, out_md5=md5, final_path=final)
+        db.mark(self.conn, vid, "ready", out_size=out_size, out_md5=md5, final_path=final,
+                reason=None)
         self.failures = 0
 
     def upload_and_swap(self, row, dry_run: bool) -> bool:
