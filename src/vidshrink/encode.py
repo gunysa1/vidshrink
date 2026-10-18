@@ -29,7 +29,9 @@ class EncodeCancelled(Exception):
 # (arib_caption copies into a broken file).
 TO_FLAC = {"pcm_bluray", "pcm_dvd"}
 TO_SRT = {"mov_text", "eia_608"}          # text-ish subtitles Matroska can't store as-is
-DROPPED_SUBS = {"arib_caption"}
+# arib_caption copies into a broken file; "" is a stream ffprobe couldn't identify,
+# which the muxer can't store either.
+DROPPED_SUBS = {"arib_caption", ""}
 CONVERTED = {**{c: "subrip" for c in TO_SRT}, **{c: "flac" for c in TO_FLAC}}
 
 

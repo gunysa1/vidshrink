@@ -166,3 +166,11 @@ def test_eia_608_after_a_dropped_sub_is_numbered_among_kept_subs(cfg, tmp_path):
     cmd = build_command(tmp_path / "s", tmp_path / "o.mkv", probe, cfg)
     assert cmd[cmd.index("-c:s:0") + 1] == "srt"  # arib dropped, eia_608 is output sub 0
     assert "-c:s:1" not in cmd
+
+
+def test_unknown_codec_subtitle_is_dropped(cfg, tmp_path):
+    probe = replace(SDR, streams=[["audio", "ac3", "eng"], ["subtitle", "", "eng"],
+                                  ["subtitle", "subrip", "eng"]])
+    cmd = build_command(tmp_path / "s", tmp_path / "o.mkv", probe, cfg)
+    assert "-0:s:0" in cmd
+    assert output_streams(probe.streams) == [["audio", "ac3", "eng"], ["subtitle", "subrip", "eng"]]
