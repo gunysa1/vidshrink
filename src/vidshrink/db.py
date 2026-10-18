@@ -84,7 +84,8 @@ def upsert_listing(conn, path: str, size: int, modtime: str) -> None:
         return
     if row["stage"] in IN_PROGRESS or row["stage"] in REMOTE_STAGES or row["stage"] == "ready":
         return
-    if (row["size"], row["modtime"]) != (size, modtime):
+    # A gone row is re-probed even when unchanged: it was restored from the trash or re-listed.
+    if row["stage"] == "gone" or (row["size"], row["modtime"]) != (size, modtime):
         conn.execute(
             "UPDATE videos SET size=?, modtime=?, stage='unprobed', probe_json=NULL,"
             " score=NULL, reason=NULL, attempts=0, updated_at=? WHERE path=?",

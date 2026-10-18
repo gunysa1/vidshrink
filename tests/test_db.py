@@ -51,6 +51,15 @@ def test_mark_gone(conn):
     assert db.get_by_path(conn, "a.mkv")["stage"] == "unprobed"
 
 
+def test_gone_row_comes_back_when_listed_again(conn):
+    db.upsert_listing(conn, "a.mkv", 1, "t")
+    db.mark_gone(conn, [])
+    assert db.get_by_path(conn, "a.mkv")["stage"] == "gone"
+    db.upsert_listing(conn, "a.mkv", 1, "t")          # restored from the trash, unchanged
+    r = db.get_by_path(conn, "a.mkv")
+    assert (r["stage"], r["probe_json"], r["attempts"]) == ("unprobed", None, 0)
+
+
 def test_rows_in_orders_by_score(conn):
     for name, score in [("a", 1.0), ("b", 5.0), ("c", 3.0)]:
         db.upsert_listing(conn, name, 1, "t")
