@@ -28,8 +28,9 @@ class EncodeCancelled(Exception):
 # Codecs Matroska can't hold as-is: audio is converted losslessly, subtitles dropped
 # (arib_caption copies into a broken file).
 TO_FLAC = {"pcm_bluray", "pcm_dvd"}
+TO_SRT = {"mov_text", "eia_608"}          # text-ish subtitles Matroska can't store as-is
 DROPPED_SUBS = {"arib_caption"}
-CONVERTED = {"mov_text": "subrip", **{c: "flac" for c in TO_FLAC}}
+CONVERTED = {**{c: "subrip" for c in TO_SRT}, **{c: "flac" for c in TO_FLAC}}
 
 
 def output_streams(streams: list[list[str]]) -> list[list[str]]:
@@ -60,7 +61,7 @@ def _output_args(out: Path, probe: Probe) -> list[str]:
     # Numbered among the subtitles that are kept.
     subs = [s for s in probe.streams if s[0] == "subtitle" and s[1] not in DROPPED_SUBS]
     for i, (_, codec, _) in enumerate(subs):
-        if codec == "mov_text":
+        if codec in TO_SRT:
             cmd += [f"-c:s:{i}", "srt"]
     return cmd + ["-max_muxing_queue_size", "4096", str(out)]
 

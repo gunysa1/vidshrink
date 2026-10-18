@@ -152,3 +152,17 @@ def test_run_encode_no_tick_after_process_exits(tmp_path):
     secs = run_encode(cmd, tmp_path / "log", tick=tick, tick_secs=0.1)
     assert len(calls) == 1  # no tick ran after the process had already exited
     assert secs < 1.2
+
+
+def test_eia_608_captions_become_srt(cfg, tmp_path):
+    probe = replace(SDR, streams=[["audio", "aac", "eng"], ["subtitle", "eia_608", "eng"]])
+    cmd = build_command(tmp_path / "s", tmp_path / "o.mkv", probe, cfg)
+    assert cmd[cmd.index("-c:s:0") + 1] == "srt"
+    assert output_streams(probe.streams) == [["audio", "aac", "eng"], ["subtitle", "subrip", "eng"]]
+
+
+def test_eia_608_after_a_dropped_sub_is_numbered_among_kept_subs(cfg, tmp_path):
+    probe = replace(SDR, streams=[["subtitle", "arib_caption", "jpn"], ["subtitle", "eia_608", "eng"]])
+    cmd = build_command(tmp_path / "s", tmp_path / "o.mkv", probe, cfg)
+    assert cmd[cmd.index("-c:s:0") + 1] == "srt"  # arib dropped, eia_608 is output sub 0
+    assert "-c:s:1" not in cmd
