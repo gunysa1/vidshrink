@@ -31,6 +31,12 @@ def test_language_change_detected():
     assert not v.ok
 
 
+def test_converted_and_dropped_streams_still_match():
+    src = replace(SRC, streams=[["audio", "pcm_bluray", "eng"], ["subtitle", "arib_caption", "jpn"]])
+    out = replace(OUT, streams=[["audio", "flac", "eng"]])
+    assert compare(src, out, 1000, 500, 0.2, "").ok
+
+
 def test_not_hevc():
     assert not compare(SRC, replace(OUT, codec="h264"), 1000, 500, 0.2, "").ok
 

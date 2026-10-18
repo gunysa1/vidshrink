@@ -1,10 +1,12 @@
+import subprocess
 import sys
 import time
 from dataclasses import replace
 
 import pytest
 
-from vidshrink.encode import EncodeError, build_command, run_encode, x265_params
+from vidshrink.encode import (EncodeError, build_command, output_streams, run_encode,
+                              x265_params)
 from vidshrink.probe import Probe, parse_ffprobe, run_ffprobe
 
 SDR = Probe(container="matroska,webm", duration=10.0, codec="h264", width=1920, height=1080,
@@ -63,6 +65,41 @@ def test_encode_mp4_converts_mov_text(cfg, make_clip, tmp_path):
     out = tmp_path / "out.mkv"
     run_encode(build_command(src, out, _probe_file(src), cfg), tmp_path / "log")
     assert _probe_file(out).streams[-1] == ["subtitle", "subrip", "eng"]
+
+
+def test_encode_converts_bluray_pcm_to_flac(cfg, tmp_path):
+    # Matroska can't hold pcm_bluray (Blu-ray .m2ts audio): copying it fails at the header.
+    src = tmp_path / "src.m2ts"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=320x240:rate=24:duration=2", "-f", "lavfi", "-i",
+                    "sine=duration=2", "-c:v", "libx264", "-c:a", "pcm_bluray",
+                    "-f", "mpegts", str(src)], check=True)
+    out = tmp_path / "out.mkv"
+    probe = _probe_file(src)
+    assert probe.streams[0][1] == "pcm_bluray"
+    run_encode(build_command(src, out, probe, cfg), tmp_path / "log")
+    got = _probe_file(out)
+    assert got.streams[0][1] == "flac"
+    assert got.streams == output_streams(probe.streams)
+
+
+def test_command_maps_only_mkv_stream_types(cfg, tmp_path):
+    # Broadcast .ts files carry EPG/data/unknown streams Matroska rejects.
+    cmd = build_command(tmp_path / "s", tmp_path / "o.mkv", SDR, cfg)
+    maps = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-map"]
+    assert maps == ["0:v", "0:a?", "0:s?", "0:t?"]
+
+
+def test_command_drops_arib_captions_and_renumbers_subs(cfg, tmp_path):
+    probe = replace(SDR, streams=[["audio", "aac", "jpn"], ["subtitle", "arib_caption", "jpn"],
+                                  ["subtitle", "mov_text", "eng"]])
+    cmd = build_command(tmp_path / "s", tmp_path / "o.mkv", probe, cfg)
+    maps = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-map"]
+    assert "-0:s:0" in maps
+    assert cmd[cmd.index("-c:s:0") + 1] == "srt"  # mov_text is output subtitle 0 now
+    assert "-c:s:1" not in cmd
+    assert output_streams(probe.streams) == [["audio", "aac", "jpn"],
+                                             ["subtitle", "subrip", "eng"]]
 
 
 def test_encode_failure_raises(cfg, tmp_path):

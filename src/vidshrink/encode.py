@@ -25,16 +25,40 @@ class EncodeCancelled(Exception):
     pass
 
 
+# Codecs Matroska can't hold as-is: audio is converted losslessly, subtitles dropped
+# (arib_caption copies into a broken file).
+TO_FLAC = {"pcm_bluray", "pcm_dvd"}
+DROPPED_SUBS = {"arib_caption"}
+CONVERTED = {"mov_text": "subrip", **{c: "flac" for c in TO_FLAC}}
+
+
+def output_streams(streams: list[list[str]]) -> list[list[str]]:
+    """The audio/subtitle streams an encode writes for these source streams."""
+    return [[kind, CONVERTED.get(codec, codec), lang] for kind, codec, lang in streams
+            if not (kind == "subtitle" and codec in DROPPED_SUBS)]
+
+
 def _input_args(src: Path, probe: Probe) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error"]
     if probe.container.startswith("avi"):
         cmd += ["-fflags", "+genpts"]
-    return cmd + ["-i", str(src), "-map", "0", "-map", "-0:d", "-c", "copy"]
+    # Only stream types Matroska takes: broadcast .ts carries data/unknown streams too.
+    cmd += ["-i", str(src), "-map", "0:v", "-map", "0:a?", "-map", "0:s?", "-map", "0:t?"]
+    subs = [s for s in probe.streams if s[0] == "subtitle"]
+    for i, (_, codec, _) in enumerate(subs):
+        if codec in DROPPED_SUBS:
+            cmd += ["-map", f"-0:s:{i}"]
+    return cmd + ["-c", "copy"]
 
 
 def _output_args(out: Path, probe: Probe) -> list[str]:
     cmd = []
-    subs = [s for s in probe.streams if s[0] == "subtitle"]
+    audio = [s for s in probe.streams if s[0] == "audio"]
+    for i, (_, codec, _) in enumerate(audio):
+        if codec in TO_FLAC:
+            cmd += [f"-c:a:{i}", "flac"]
+    # Numbered among the subtitles that are kept.
+    subs = [s for s in probe.streams if s[0] == "subtitle" and s[1] not in DROPPED_SUBS]
     for i, (_, codec, _) in enumerate(subs):
         if codec == "mov_text":
             cmd += [f"-c:s:{i}", "srt"]

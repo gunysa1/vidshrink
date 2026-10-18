@@ -32,7 +32,7 @@ def test_nvenc_command(tmp_path):
     assert opt(cmd, "-spatial-aq:v:1") == "1" and opt(cmd, "-temporal-aq:v:1") == "1"
     assert opt(cmd, "-rc-lookahead:v:1") == "32"
     assert opt(cmd, "-c:s:0") == "srt"  # mov_text converted, as for x265
-    assert cmd[cmd.index("-map") + 1] == "0" and "-0:d" in cmd
+    assert [cmd[i + 1] for i, a in enumerate(cmd) if a == "-map"] == ["0:v", "0:a?", "0:s?", "0:t?"]
     assert cmd[-1] == str(tmp_path / "o.mkv")
 
 
