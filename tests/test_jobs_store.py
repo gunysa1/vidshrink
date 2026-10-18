@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from vidshrink import db
+from vidshrink import db, scorer
 from vidshrink.budget import Budget
 from vidshrink.jobs import PC_SEEN_KEY, JobStore, LeaseLost
 from vidshrink.probe import Probe
@@ -52,6 +52,17 @@ def test_claim_leases_best_nvenc_job(conn, store):
     assert row["lease_until"] == store.clock.t + 1800
     assert store.downloads.used() == 30_000_000_000
     assert float(db.kv_get(conn, PC_SEEN_KEY)) == store.clock.t
+
+
+def test_candidates_do_not_query_learned_per_row(store, conn, monkeypatch):
+    for i in range(50):
+        add(conn, f"Movies/m{i}.mkv", size=10_000_000_000)
+    calls = []
+    orig = db.learned_mean
+    monkeypatch.setattr(db, "learned_mean", lambda *a, **k: calls.append(1) or orig(*a, **k))
+    rows = store._candidates("nvenc")
+    assert len(rows) == 50
+    assert len(calls) <= len(scorer.DEFAULT_RATIO) + len(scorer.DEFAULT_SPEED)  # tables, not per row
 
 
 def test_claim_skips_hdr(conn, store):

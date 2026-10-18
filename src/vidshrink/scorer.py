@@ -90,6 +90,13 @@ def encoder_score(conn, size: int, probe: Probe, encoder: str) -> float:
     return score(size, probe, ratio_for(conn, family, encoder), speed_for(conn, res, encoder))
 
 
+def encoder_tables(conn, encoder: str) -> tuple[dict[str, float], dict[str, float]]:
+    """Learned ratio per codec family and speed per resolution class for one encoder,
+    looked up once so callers can score many rows without a query per row."""
+    return ({f: ratio_for(conn, f, encoder) for f in DEFAULT_RATIO},
+            {r: speed_for(conn, r, encoder) for r in DEFAULT_SPEED})
+
+
 def score(size: int, probe: Probe, ratio: float, speed: float) -> float:
     saved_gb = size / 1e9 * ratio
     hours = probe.duration * speed / 3600

@@ -90,12 +90,15 @@ class JobStore:
         return {final_path(r["path"]) for r in db.rows_in(self.conn, *BUSY_STAGES)}
 
     def _candidates(self, encoder: str) -> list:
+        ratios, speeds = scorer.encoder_tables(self.conn, encoder)
         scored = []
         for row in db.rows_in(self.conn, "queued"):
             probe = Probe.from_json(row["probe_json"])
             if probe.is_hdr:
                 continue
-            scored.append((scorer.encoder_score(self.conn, row["size"], probe, encoder), row))
+            family = scorer.codec_family(probe.codec)
+            res = scorer.resolution_class(probe.width, probe.height)
+            scored.append((scorer.score(row["size"], probe, ratios[family], speeds[res]), row))
         scored.sort(key=lambda t: (-t[0], t[1]["id"]))
         return [row for _, row in scored]
 
