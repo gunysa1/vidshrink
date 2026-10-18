@@ -30,6 +30,16 @@ def test_list_videos(rc):
     assert [(e["Path"], e["Size"]) for e in entries] == [("Movies/A [1080p]/a.mkv", 1000)]
 
 
+def test_list_videos_uses_fast_list(rc, monkeypatch):
+    seen = {}
+    def fake_run(*args, **kwargs):
+        seen["args"] = args
+        return "[]"
+    monkeypatch.setattr(rc, "_run", fake_run)
+    rc.list_videos(["mkv"])
+    assert "--fast-list" in seen["args"] and "-R" in seen["args"]
+
+
 def test_exists_and_md5(rc):
     assert rc.exists("Movies/A [1080p]/a.mkv")
     assert not rc.exists("Movies/A [1080p]/nope.mkv")
