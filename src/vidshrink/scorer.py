@@ -107,8 +107,7 @@ RESCORABLE = ("probed", "queued")
 
 
 def rescore(conn, cfg: Config) -> None:
-    ratios = {f: ratio_for(conn, f) for f in DEFAULT_RATIO}
-    speeds = {r: speed_for(conn, r) for r in DEFAULT_SPEED}
+    ratios, speeds = encoder_tables(conn, "x265")
     rows = db.rows_in(conn, *RESCORABLE)
     with db.transaction(conn):
         for row in rows:

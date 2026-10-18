@@ -25,8 +25,8 @@ class EncodeCancelled(Exception):
     pass
 
 
-# Codecs Matroska can't hold as-is: audio is converted losslessly, subtitles dropped
-# (arib_caption copies into a broken file).
+# Codecs Matroska can't hold as-is: audio is converted losslessly (FLAC), text-ish
+# subtitles to SRT, and subtitles it can't mux at all are dropped.
 TO_FLAC = {"pcm_bluray", "pcm_dvd"}
 TO_SRT = {"mov_text", "eia_608"}          # text-ish subtitles Matroska can't store as-is
 # arib_caption copies into a broken file; "" is a stream ffprobe couldn't identify,
