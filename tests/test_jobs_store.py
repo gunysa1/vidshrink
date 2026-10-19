@@ -536,3 +536,266 @@ def test_resumed_claim_clears_alert(conn, store):
     store.alert("cloud-vm", "x")
     assert store.claim("cloud-vm", "x265-cloud", "cloud", resume=True)["resumed"] is True
     assert db.kv_get(conn, f"{ALERT_PREFIX}cloud-vm") is None
+
+
+DAY = 86400
+
+
+def test_claim_returns_expected_hours(conn, store):
+    add(conn, "a.mkv")
+    job = store.claim("pc")["job"]
+    assert job["expected_hours"] == pytest.approx(scorer.expected_hours(conn, BASE, "nvenc"))
+    cloud = add(conn, "b.mkv")
+    job = store.claim("vm", encoder="x265-cloud", download_account="cloud")["job"]
+    assert job["id"] == cloud
+    assert job["expected_hours"] == pytest.approx(scorer.expected_hours(conn, BASE, "x265-cloud"))
+
+
+def test_worker_can_hold_several_leases(conn, store):
+    a, b = add(conn, "a.mkv"), add(conn, "b.mkv")
+    store.claim("pc")
+    store.claim("pc")
+    for vid in (a, b):
+        row = db.get(conn, vid)
+        assert (row["stage"], row["worker"]) == ("leased", "pc")
+
+
+def test_downloaded_report_sets_reservation(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.clock.t += 600
+    store.report(vid, "pc", "downloaded", reserve_secs=7 * DAY)
+    row = db.get(conn, vid)
+    assert (row["stage"], row["worker"]) == ("leased", "pc")
+    assert row["lease_until"] == pytest.approx(store.clock.t + 7 * DAY)
+    assert row["reserve_secs"] == 7 * DAY
+    # Idempotent: a retried report just sets the same reservation again.
+    store.report(vid, "pc", "downloaded", reserve_secs=7 * DAY)
+    assert db.get(conn, vid)["lease_until"] == pytest.approx(store.clock.t + 7 * DAY)
+
+
+def test_downloaded_report_needs_the_lease_and_a_positive_reservation(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    with pytest.raises(LeaseLost):
+        store.report(vid, "other", "downloaded", reserve_secs=DAY)
+    for bad in (0, -5, None, "x", True):
+        with pytest.raises(ValueError):
+            store.report(vid, "pc", "downloaded", reserve_secs=bad)
+    with pytest.raises(ValueError):
+        store.report(vid, "pc", "downloaded")
+    row = db.get(conn, vid)
+    assert row["reserve_secs"] is None and row["lease_until"] == store.clock.t + 1800
+
+
+def test_reserve_secs_capped_at_30_days(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "downloaded", reserve_secs=365 * DAY)
+    row = db.get(conn, vid)
+    assert row["reserve_secs"] == 30 * DAY
+    assert row["lease_until"] == pytest.approx(store.clock.t + 30 * DAY)
+
+
+def test_expire_leases_keeps_reservation(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    start = store.clock.t
+    store.report(vid, "pc", "downloaded", reserve_secs=7 * DAY)
+    store.clock.t = start + 3 * DAY
+    assert store.expire_leases() == 0
+    assert db.get(conn, vid)["stage"] == "leased"
+    store.clock.t = start + 7 * DAY + 1
+    assert store.expire_leases() == 1
+    row = db.get(conn, vid)
+    assert (row["stage"], row["worker"], row["lease_until"], row["reserve_secs"]) == \
+        ("queued", None, None, None)
+
+
+def test_old_heartbeat_extends_reserved_row_by_reservation(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "downloaded", reserve_secs=7 * DAY)
+    store.clock.t += 2 * DAY
+    assert store.heartbeat(vid, "pc")["cancel"] is False
+    assert db.get(conn, vid)["lease_until"] == pytest.approx(store.clock.t + 7 * DAY)
+
+
+def test_heartbeat_many_reports_lost_ids(conn, store):
+    a, b, c = add(conn, "a.mkv", score=3), add(conn, "b.mkv", score=2), add(conn, "c.mkv", score=1)
+    for _ in range(3):
+        store.claim("pc")
+    store.report(b, "pc", "downloaded", reserve_secs=7 * DAY)
+    store.release(c, "pc")
+    store.clock.t += 600
+    r = store.heartbeat_many([a, b, c], "pc", "pc")
+    assert r["cancel"] == [c]
+    assert r["download_used"] == store.pc_downloads.used()
+    assert r["download_limit"] is None
+    assert db.get(conn, a)["lease_until"] == store.clock.t + 1800
+    assert db.get(conn, b)["lease_until"] == pytest.approx(store.clock.t + 7 * DAY)
+    assert db.get(conn, c)["stage"] == "queued"
+    assert float(db.kv_get(conn, PC_SEEN_KEY)) == store.clock.t
+
+
+def test_heartbeat_many_cancels_other_workers_and_expired_ids(conn, store):
+    a, b = add(conn, "a.mkv", score=2), add(conn, "b.mkv", score=1)
+    store.claim("pc")
+    store.claim("other")
+    assert store.heartbeat_many([a, b, 999], "pc")["cancel"] == [b, 999]
+    store.clock.t += 1801
+    assert store.heartbeat_many([a], "pc")["cancel"] == [a]
+    assert db.get(conn, a)["stage"] == "leased"  # not revived, left for the sweep
+
+
+def _resume_item(conn, vid, reserve_secs=7 * DAY):
+    row = db.get(conn, vid)
+    return {"id": vid, "size": row["size"], "modtime": row["modtime"],
+            "reserve_secs": reserve_secs}
+
+
+def test_resume_leased_row(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    used = store.downloads.used()
+    store.clock.t += 1801  # expired but not swept yet: still ours
+    r = store.resume("pc", "nvenc", "main", [_resume_item(conn, vid)])
+    assert r["refused"] == []
+    [job] = r["resumed"]
+    assert (job["id"], job["path"], job["final_path"], job["tmp_path"]) == \
+        (vid, "a.mkv", "a.mkv", "a.vidshrink-tmp.mkv")
+    assert job["probe"]["codec"] == "h264"
+    assert job["expected_hours"] == pytest.approx(scorer.expected_hours(conn, BASE, "nvenc"))
+    row = db.get(conn, vid)
+    assert (row["stage"], row["worker"], row["reserve_secs"]) == ("leased", "pc", 7 * DAY)
+    assert row["lease_until"] == pytest.approx(store.clock.t + 7 * DAY)
+    assert store.downloads.used() == used
+
+
+def test_resume_queued_unclaimed_row_releases_to_worker_without_download_charge(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.clock.t += 1801
+    store.expire_leases()
+    db.mark(conn, vid, "queued", reason="something")
+    used = store.pc_downloads.used(), store.downloads.used()
+    r = store.resume("pc", "nvenc", "pc", [_resume_item(conn, vid, DAY)])
+    assert [j["id"] for j in r["resumed"]] == [vid] and r["refused"] == []
+    row = db.get(conn, vid)
+    assert (row["stage"], row["worker"], row["encoder"], row["final_path"], row["reason"]) == \
+        ("leased", "pc", "nvenc", "a.mkv", None)
+    assert row["reserve_secs"] == DAY
+    assert row["lease_until"] == pytest.approx(store.clock.t + DAY)
+    assert (store.pc_downloads.used(), store.downloads.used()) == used
+
+
+def test_resume_queued_row_sets_resuming_encoder(conn, store):
+    vid = add(conn, "a.mkv")
+    r = store.resume("vm", "x265-cloud", "cloud", [_resume_item(conn, vid, DAY)])
+    assert [j["id"] for j in r["resumed"]] == [vid]
+    assert db.get(conn, vid)["encoder"] == "x265-cloud"
+
+
+def test_resume_refuses_queued_row_whose_stem_is_busy(conn, store):
+    add(conn, "a.mkv", score=2)
+    other = add(conn, "a.mp4", score=1)
+    store.claim("vm", encoder="x265-cloud")  # takes a.mkv, which owns the a.* stem
+    r = store.resume("pc", "nvenc", "main", [_resume_item(conn, other)])
+    assert r == {"resumed": [], "refused": [other]}
+    assert db.get(conn, other)["stage"] == "queued"
+
+
+def test_resume_refuses_row_taken_by_other_worker(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("other")
+    r = store.resume("pc", "nvenc", "main", [_resume_item(conn, vid)])
+    assert r == {"resumed": [], "refused": [vid]}
+    assert db.get(conn, vid)["worker"] == "other"
+
+
+def test_resume_refuses_lease_held_with_another_encoder(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    r = store.resume("pc", "x265-cloud", "main", [_resume_item(conn, vid)])
+    assert r == {"resumed": [], "refused": [vid]}
+
+
+def test_resume_refuses_done_row(conn, store):
+    vid = add(conn, "a.mkv")
+    item = _resume_item(conn, vid)
+    db.mark(conn, vid, "done")
+    failed = add(conn, "b.mkv")
+    failed_item = _resume_item(conn, failed)
+    db.mark(conn, failed, "failed")
+    r = store.resume("pc", "nvenc", "main", [item, failed_item, {**item, "id": 999}])
+    assert r == {"resumed": [], "refused": [vid, failed, 999]}
+    assert db.get(conn, vid)["stage"] == "done"
+
+
+def test_resume_refuses_changed_original(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    item = _resume_item(conn, vid)
+    r = store.resume("pc", "nvenc", "main", [{**item, "size": item["size"] + 1},
+                                             {**item, "modtime": "other"}])
+    assert r == {"resumed": [], "refused": [vid, vid]}
+    assert db.get(conn, vid)["reserve_secs"] is None
+
+
+def test_resume_caps_and_validates_reserve_secs(conn, store):
+    vid = add(conn, "a.mkv")
+    for bad in (0, -1, None):
+        with pytest.raises(ValueError):
+            store.resume("pc", "nvenc", "main", [_resume_item(conn, vid, bad)])
+    assert db.get(conn, vid)["stage"] == "queued"
+    store.resume("pc", "nvenc", "main", [_resume_item(conn, vid, 99 * DAY)])
+    assert db.get(conn, vid)["reserve_secs"] == 30 * DAY
+
+
+def test_resume_refreshes_seen(conn, store):
+    store.resume("pc", "nvenc", "main", [])
+    assert float(db.kv_get(conn, PC_SEEN_KEY)) == store.clock.t
+
+
+def test_upload_paused_keeps_lease_and_blocks_uploads(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "downloaded", reserve_secs=7 * DAY)
+    before = db.get(conn, vid)
+    store.report(vid, "pc", "upload_paused")
+    row = db.get(conn, vid)
+    assert (row["stage"], row["worker"], row["lease_until"], row["reserve_secs"]) == \
+        ("leased", "pc", before["lease_until"], 7 * DAY)
+    assert store.uploads.blocked()
+    with pytest.raises(LeaseLost):
+        store.report(vid, "other", "upload_paused")
+
+
+def test_release_clears_reservation(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "downloaded", reserve_secs=7 * DAY)
+    store.release(vid, "pc")
+    row = db.get(conn, vid)
+    assert (row["stage"], row["worker"], row["lease_until"], row["reserve_secs"]) == \
+        ("queued", None, None, None)
+
+
+@pytest.mark.parametrize("outcome,extra", [
+    ("failed", {"reason": "boom"}), ("not_worth_it", {}), ("changed", {}),
+    ("download_quota", {}), ("upload_limited", {}),
+    ("uploaded", {"out_size": 10, "out_md5": "a" * 32, "encode_secs": 1.0})])
+def test_final_outcomes_clear_reservation(conn, store, outcome, extra):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "downloaded", reserve_secs=7 * DAY)
+    store.report(vid, "pc", outcome, **extra)
+    row = db.get(conn, vid)
+    assert row["reserve_secs"] is None and row["lease_until"] is None
+
+
+def test_claim_clears_stale_reservation(conn, store):
+    vid = add(conn, "a.mkv")
+    conn.execute("UPDATE videos SET reserve_secs=? WHERE id=?", (7 * DAY, vid))
+    store.claim("pc")
+    assert db.get(conn, vid)["reserve_secs"] is None

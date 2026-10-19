@@ -26,10 +26,20 @@ NO_WORK_RETRY_SECS = 600.0
 # shares a stem with one of them (same basename, different extension) can't be
 # claimed yet, since the two would race over the same remote final_path/tmp_path.
 BUSY_STAGES = db.IN_PROGRESS + ("ready",) + db.REMOTE_STAGES
+# Longest a worker may reserve a downloaded job for (its reserve_days is clamped to this).
+MAX_RESERVE_SECS = 30 * 86400
 
 
 class LeaseLost(Exception):
     """The job isn't leased by this worker any more (expired, released or cancelled)."""
+
+
+def _reserve_secs(value) -> float:
+    """A worker's requested reservation, clamped to MAX_RESERVE_SECS. ValueError unless
+    it is a positive number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        raise ValueError(f"reserve_secs must be a positive number, not {value!r}")
+    return min(float(value), MAX_RESERVE_SECS)
 
 
 class JobStore:
@@ -76,12 +86,16 @@ class JobStore:
             raise LeaseLost(f"job {job_id} is not leased by {worker}")
         return row
 
-    def _is_leased_by(self, job_id: int, worker: str, now: float) -> bool:
+    def _extend(self, job_id: int, worker: str, now: float) -> bool:
+        """Renew a valid lease: by the row's reservation once its download is done
+        (reserve_secs set), else by the normal lease_secs. False if it isn't validly
+        leased by worker. Callers wrap this in a db.transaction."""
         try:
-            self._leased_by(job_id, worker, now)
-            return True
+            row = self._leased_by(job_id, worker, now)
         except LeaseLost:
             return False
+        return self._update_leased(job_id, worker, now, {
+            "lease_until": now + (row["reserve_secs"] or self.cfg.lease_secs)})
 
     def _update_leased(self, job_id: int, worker: str, now: float, fields: dict) -> bool:
         """Write fields iff the row is still validly leased by worker right now. The
@@ -103,6 +117,14 @@ class JobStore:
 
     def _busy_final_paths(self) -> set:
         return {final_path(r["path"]) for r in db.rows_in(self.conn, *BUSY_STAGES)}
+
+    def _job(self, row, final: str, encoder: str) -> dict:
+        """What a worker is told about a job it now holds."""
+        probe = Probe.from_json(row["probe_json"])
+        return {"id": row["id"], "path": row["path"], "size": row["size"],
+                "modtime": row["modtime"], "final_path": final,
+                "tmp_path": tmp_path(row["path"]), "probe": json.loads(row["probe_json"]),
+                "expected_hours": scorer.expected_hours(self.conn, probe, encoder)}
 
     def _candidates(self, encoder: str) -> list:
         ratios, speeds = scorer.encoder_tables(self.conn, encoder)
@@ -166,10 +188,7 @@ class JobStore:
         if not extended:
             return None
         self.log(f"{worker} resumed: {row['path']}")
-        return {"job": {"id": row["id"], "path": row["path"], "size": row["size"],
-                        "modtime": row["modtime"], "final_path": row["final_path"],
-                        "tmp_path": tmp_path(row["path"]),
-                        "probe": json.loads(row["probe_json"])},
+        return {"job": self._job(row, row["final_path"], encoder),
                 "resumed": True, "retry_after": 0.0}
 
     def _claim(self, worker: str, encoder: str, downloads: Budget,
@@ -207,17 +226,14 @@ class JobStore:
                 else:
                     taken = db.mark_if(self.conn, row["id"], ("queued",), "leased",
                                        worker=worker, encoder=encoder, final_path=final,
-                                       reason=None, lease_until=self.now() + self.cfg.lease_secs)
+                                       reason=None, lease_until=self.now() + self.cfg.lease_secs,
+                                       reserve_secs=None)
                     if taken:
                         downloads.add(row["size"])
             if not taken:
                 continue
             self.log(f"leased to {worker}: {row['path']}")
-            return {"job": {"id": row["id"], "path": row["path"], "size": row["size"],
-                            "modtime": row["modtime"], "final_path": final,
-                            "tmp_path": tmp_path(row["path"]),
-                            "probe": json.loads(row["probe_json"])},
-                    "retry_after": 0.0}
+            return {"job": self._job(row, final, encoder), "retry_after": 0.0}
         return {"job": None, "retry_after": NO_WORK_RETRY_SECS}
 
     def heartbeat(self, job_id: int, worker: str, download_account: str = "main") -> dict:
@@ -225,9 +241,66 @@ class JobStore:
         self._seen(worker, self._row_encoder(job_id))
         now = self.now()
         with db.transaction(self.conn):
-            ok = self._is_leased_by(job_id, worker, now) and self._update_leased(
-                job_id, worker, now, {"lease_until": now + self.cfg.lease_secs})
+            ok = self._extend(job_id, worker, now)
         return {"cancel": not ok, **self._download_today(downloads)}
+
+    def heartbeat_many(self, ids: list[int], worker: str,
+                       download_account: str = "main") -> dict:
+        """One heartbeat for every job a pipelined worker holds. "cancel" lists the ids
+        that aren't validly leased by it any more; it should drop those."""
+        downloads = self._download_budget(download_account)
+        encoders = {self._row_encoder(job_id) for job_id in ids}
+        self._seen(worker, "nvenc" if "nvenc" in encoders else None)
+        now = self.now()
+        with db.transaction(self.conn):
+            cancel = [job_id for job_id in ids if not self._extend(job_id, worker, now)]
+        return {"cancel": cancel, **self._download_today(downloads)}
+
+    def resume(self, worker: str, encoder: str, download_account: str,
+               jobs: list[dict]) -> dict:
+        """A pipelined worker restarted with these jobs downloaded (or encoded) in its
+        workdir. Each item is {"id", "size", "modtime", "reserve_secs"}. A job is
+        confirmed, and reserved for the worker again with no download charged, when
+        the original is unchanged (size and modtime as sent) and the row is either
+        still leased to this worker with this encoder (even if the lease has expired
+        but not yet been swept) or back in the queue with its stem free. Everything
+        else is refused, and the worker deletes its local files for it."""
+        self._download_budget(download_account)  # rejects an unknown account
+        reserves = [_reserve_secs(item.get("reserve_secs")) for item in jobs]
+        self._seen(worker, encoder)
+        now = self.now()
+        resumed, refused = [], []
+        for item, reserve in zip(jobs, reserves):
+            job_id = item["id"]
+            with db.transaction(self.conn):
+                row = db.get(self.conn, job_id)
+                ok = False
+                if row is not None and (row["size"], row["modtime"]) == \
+                        (item["size"], item["modtime"]):
+                    if row["stage"] == "leased":
+                        # No lease_until guard: an expired lease that's still ours
+                        # (not yet swept) is resumed too.
+                        ok = self.conn.execute(
+                            "UPDATE videos SET lease_until=?, reserve_secs=?, updated_at=?"
+                            " WHERE id=? AND stage='leased' AND worker=? AND encoder=?",
+                            (now + reserve, reserve, now, job_id, worker, encoder),
+                        ).rowcount == 1
+                        final = row["final_path"]
+                    elif row["stage"] == "queued":
+                        final = final_path(row["path"])
+                        # Same busy-stem guard as _claim, checked inside the transaction.
+                        ok = final not in self._busy_final_paths() and db.mark_if(
+                            self.conn, job_id, ("queued",), "leased", worker=worker,
+                            encoder=encoder, final_path=final, reason=None,
+                            lease_until=now + reserve, reserve_secs=reserve)
+            if ok:
+                resumed.append(self._job(row, final, encoder))
+                self.log(f"{worker} resumed: {row['path']}")
+            else:
+                refused.append(job_id)
+        if refused:
+            self.log(f"{worker} resume refused for {len(refused)} job(s): {refused}")
+        return {"resumed": resumed, "refused": refused}
 
     def report(self, job_id: int, worker: str, outcome: str, download_account: str = "main",
                **data) -> None:
@@ -252,9 +325,25 @@ class JobStore:
                     raise LeaseLost(
                         f"job {job_id} is already remote_ready for {worker} with a "
                         "different md5")
+            if outcome == "downloaded":
+                reserve = _reserve_secs(data.get("reserve_secs"))
             row = self._leased_by(job_id, worker, now)
-            clear = {"worker": None, "lease_until": None}
-            if outcome == "uploaded":
+            clear = {"worker": None, "lease_until": None, "reserve_secs": None}
+            if outcome == "downloaded":
+                # The worker has the whole original now: hold it for reserve_secs
+                # (renewed by each heartbeat) rather than the short download lease.
+                # Idempotent: a retry just sets the same reservation again.
+                if not self._update_leased(job_id, worker, now, {
+                        "lease_until": now + reserve, "reserve_secs": reserve}):
+                    raise LeaseLost(f"job {job_id} is not leased by {worker}")
+            elif outcome == "upload_paused":
+                # A pipelined worker hit Drive's upload limit and keeps its encoded
+                # file, so it keeps the lease and reservation too.
+                self.uploads.block(self.cfg.rate_limit_block_secs)
+                if not self._update_leased(job_id, worker, now, {}):
+                    raise LeaseLost(f"job {job_id} is not leased by {worker}")
+                self.log(f"{worker} hit Drive's upload limit; uploads paused for everyone")
+            elif outcome == "uploaded":
                 out_size, out_md5 = int(data["out_size"]), data["out_md5"]
                 if out_size <= 0 or not is_valid_md5(out_md5):
                     raise ValueError(
@@ -264,7 +353,7 @@ class JobStore:
                     "encode_secs": float(data["encode_secs"]), "reason": None,
                     # Keep `worker` (don't clear it) so a retried duplicate report of
                     # this same success can still be recognized as idempotent above.
-                    "worker": worker, "lease_until": None})
+                    "worker": worker, "lease_until": None, "reserve_secs": None})
                 self.uploads.add(out_size)
             elif outcome == "failed":
                 attempts = row["attempts"] + 1
@@ -302,7 +391,8 @@ class JobStore:
         with db.transaction(self.conn):
             row = self._leased_by(job_id, worker, now)
             self._mark_leased_or_raise(job_id, worker, now, "queued",
-                                       {"worker": None, "lease_until": None})
+                                       {"worker": None, "lease_until": None,
+                                        "reserve_secs": None})
         self.log(f"{worker} released: {row['path']}")
 
     def _requeue_if_still_expired(self, job_id: int, now: float) -> bool:
@@ -312,7 +402,8 @@ class JobStore:
         with db.transaction(self.conn):
             return self.conn.execute(
                 "UPDATE videos SET stage='queued', worker=NULL, lease_until=NULL,"
-                " updated_at=? WHERE id=? AND stage='leased' AND lease_until < ?",
+                " reserve_secs=NULL, updated_at=? WHERE id=? AND stage='leased'"
+                " AND lease_until < ?",
                 (now, job_id, now),
             ).rowcount == 1
 
@@ -392,6 +483,10 @@ class _SweepingHTTPServer(HTTPServer):
             self._store.log(f"lease sweep failed: {e!r}")
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer:
     expected = f"Bearer {token}".encode()
 
@@ -451,8 +546,25 @@ def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer
                     store.alert(str(body["worker"]), str(body["message"]))
                     self._send(200, {"ok": True})
                 elif self.path == "/heartbeat":
-                    self._send(200, store.heartbeat(int(body["id"]), body["worker"],
-                                                    body.get("download_account", "main")))
+                    if "ids" in body:
+                        ids = body["ids"]
+                        if not isinstance(ids, list) or not all(_is_int(i) for i in ids):
+                            raise TypeError("ids must be a list of integers")
+                        self._send(200, store.heartbeat_many(
+                            ids, body["worker"], body.get("download_account", "main")))
+                    else:
+                        self._send(200, store.heartbeat(int(body["id"]), body["worker"],
+                                                        body.get("download_account", "main")))
+                elif self.path == "/resume":
+                    jobs = body["jobs"]
+                    if not isinstance(jobs, list) or not all(
+                            isinstance(j, dict) and _is_int(j.get("id"))
+                            and _is_int(j.get("size")) and isinstance(j.get("modtime"), str)
+                            for j in jobs):
+                        raise TypeError("jobs must be a list of objects with integer id and"
+                                        " size and a string modtime")
+                    self._send(200, store.resume(body["worker"], body["encoder"],
+                                                 body.get("download_account", "main"), jobs))
                 elif self.path == "/report":
                     extra = {k: v for k, v in body.items() if k not in ("id", "worker", "outcome")}
                     store.report(int(body["id"]), body["worker"], body["outcome"], **extra)
@@ -514,6 +626,16 @@ class JobClient:
     def heartbeat(self, job_id: int, worker: str, download_account: str = "main") -> dict:
         return self._call("POST", "/heartbeat", {"id": job_id, "worker": worker,
                                                   "download_account": download_account})
+
+    def heartbeat_many(self, ids: list[int], worker: str, download_account: str = "main") -> dict:
+        return self._call("POST", "/heartbeat", {"ids": list(ids), "worker": worker,
+                                                  "download_account": download_account})
+
+    def resume(self, worker: str, encoder: str, download_account: str,
+               jobs: list[dict]) -> dict:
+        return self._call("POST", "/resume", {"worker": worker, "encoder": encoder,
+                                              "download_account": download_account,
+                                              "jobs": jobs})
 
     def report(self, job_id: int, worker: str, outcome: str, download_account: str = "main",
                **data) -> None:

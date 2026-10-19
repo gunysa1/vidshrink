@@ -282,3 +282,90 @@ def test_alert_requires_token(job_service):
     with pytest.raises(JobServiceError) as e:
         c.alert("cloud-vm", "x")
     assert e.value.status == 401
+
+
+@pytest.fixture
+def clocked_service(cfg):
+    """Like conftest's job_service, but the store runs on a Clock the test controls."""
+    clock = Clock()
+    holder, ready = {}, threading.Event()
+
+    def run_server():
+        server_conn = db.connect(cfg.db_path)
+        store = JobStore(server_conn, cfg, Rclone(cfg.remote), now=clock, log=lambda m: None)
+        holder["server"] = make_server(store, "tok", "127.0.0.1", free_port())
+        ready.set()
+        try:
+            holder["server"].serve_forever(poll_interval=0.05)
+        finally:
+            server_conn.close()
+
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
+    assert ready.wait(10)
+    port = holder["server"].server_address[1]
+    yield JobClient(f"http://127.0.0.1:{port}", "tok"), clock
+    holder["server"].shutdown()
+    holder["server"].server_close()
+    t.join(timeout=5)
+
+
+def test_http_heartbeat_ids(conn, clocked_service):
+    c, clock = clocked_service
+    a, b = add(conn, "a.mkv", score=2), add(conn, "b.mkv", score=1)
+    c.claim("pc")
+    c.claim("pc")
+    c.report(a, "pc", "downloaded", reserve_secs=7 * 86400)
+    c.release(b, "pc")
+    clock.t += 60
+    r = c.heartbeat_many([a, b], "pc", download_account="pc")
+    assert r["cancel"] == [b]
+    assert r["download_limit"] is None and "download_used" in r
+    assert db.get(conn, a)["lease_until"] == pytest.approx(clock.t + 7 * 86400)
+
+
+def test_http_resume_roundtrip(conn, clocked_service):
+    c, clock = clocked_service
+    vid = add(conn, "a.mkv")
+    other = add(conn, "b.mkv")
+    db.mark(conn, other, "done")
+    row = db.get(conn, vid)
+    item = {"id": vid, "size": row["size"], "modtime": row["modtime"], "reserve_secs": 86400}
+    r = c.resume("pc", "nvenc", "pc", [item, {**item, "id": other}])
+    assert [j["id"] for j in r["resumed"]] == [vid] and r["refused"] == [other]
+    assert r["resumed"][0]["expected_hours"] > 0
+    row = db.get(conn, vid)
+    assert (row["stage"], row["worker"], row["reserve_secs"]) == ("leased", "pc", 86400)
+
+
+@pytest.mark.parametrize("jobs", [
+    None, "x", [1], [{"size": 1, "modtime": "t", "reserve_secs": 1}],
+    [{"id": "1", "size": 1, "modtime": "t", "reserve_secs": 1}],
+    [{"id": True, "size": 1, "modtime": "t", "reserve_secs": 1}],
+    [{"id": 1, "size": 1.5, "modtime": "t", "reserve_secs": 1}],
+    [{"id": 1, "size": 1, "modtime": 5, "reserve_secs": 1}],
+    [{"id": 1, "size": 1, "modtime": "t"}],
+    [{"id": 1, "size": 1, "modtime": "t", "reserve_secs": 0}]])
+def test_http_resume_bad_jobs_is_400(conn, job_service, jobs):
+    c = JobClient(job_service.url, job_service.token)
+    with pytest.raises(JobServiceError, match="400"):
+        c._call("POST", "/resume", {"worker": "pc", "encoder": "nvenc",
+                                    "download_account": "pc", "jobs": jobs})
+
+
+def test_http_heartbeat_bad_ids_is_400(conn, job_service):
+    c = JobClient(job_service.url, job_service.token)
+    for ids in ("x", [1, "2"], [True]):
+        with pytest.raises(JobServiceError, match="400"):
+            c._call("POST", "/heartbeat", {"ids": ids, "worker": "pc"})
+
+
+def test_old_client_single_heartbeat_unchanged(conn, clocked_service):
+    c, clock = clocked_service
+    vid = add(conn, "a.mkv")
+    c.claim("pc")
+    clock.t += 600
+    r = c.heartbeat(vid, "pc")
+    assert r["cancel"] is False
+    assert db.get(conn, vid)["lease_until"] == clock.t + 1800
+    assert db.get(conn, vid)["reserve_secs"] is None

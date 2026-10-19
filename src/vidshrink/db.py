@@ -10,7 +10,7 @@ DUPLICATE_REASON = "duplicate name on Drive"
 _GONE_ELIGIBLE = ("unprobed", "probed", "queued", "skipped", "probe_failed")
 # Columns added after the first release; connect() adds any that are missing.
 MIGRATIONS = (("worker", "TEXT"), ("lease_until", "REAL"), ("encoder", "TEXT"),
-              ("remote_md5", "TEXT"))
+              ("remote_md5", "TEXT"), ("reserve_secs", "REAL"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
