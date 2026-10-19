@@ -82,7 +82,9 @@ journalctl --user -u vidshrink -f
 ```
 
 Settings live in `src/vidshrink/config.py` (`Config`): remote name, excluded
-folders, CRF and preset, size limits, daily budgets and lease times.
+folders, CRF and preset, size limits, daily budgets and lease times. Folders to skip
+besides `Torrent/` go one per line in `~/vidshrink/excluded.txt`, which stays out of
+the repo.
 
 ## Commands
 

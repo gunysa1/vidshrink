@@ -10,3 +10,4 @@ serve.token
 # local logs and reports
 *.log
 reports/
+excluded.txt

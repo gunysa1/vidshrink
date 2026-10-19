@@ -81,3 +81,15 @@ def test_rescore_leaves_rows_that_moved_on(conn, cfg, monkeypatch):
     for path in ("h264.mkv", "hevc.mkv"):
         r = db.get_by_path(conn, path)
         assert (r["stage"], r["score"], r["reason"]) == ("downloading", None, None)
+
+
+def test_load_excluded_adds_local_prefixes(tmp_path):
+    from vidshrink.config import load_excluded
+    f = tmp_path / "excluded.txt"
+    f.write_text("Private one/\n\n# a comment\n  Private two/  \n")
+    assert load_excluded(f) == ("Torrent/", "Private one/", "Private two/")
+
+
+def test_load_excluded_without_file_is_torrent_only(tmp_path):
+    from vidshrink.config import load_excluded
+    assert load_excluded(tmp_path / "missing.txt") == ("Torrent/",)

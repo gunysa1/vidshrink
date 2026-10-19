@@ -1,7 +1,19 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 HOME = Path.home() / "vidshrink"
+
+
+def load_excluded(path: Path = HOME / "excluded.txt") -> tuple[str, ...]:
+    """Torrent/ plus any personal folder prefixes listed one per line in a local,
+    untracked file (blank lines and # comments ignored), so they stay out of the repo."""
+    extra = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                extra.append(line)
+    return ("Torrent/", *extra)
 
 
 @dataclass
@@ -9,7 +21,7 @@ class Config:
     remote: str = "gdrive:"
     db_path: Path = HOME / "state.db"
     workdir: Path = HOME / "work"
-    excluded: tuple[str, ...] = ("Torrent/", "Private/")
+    excluded: tuple[str, ...] = field(default_factory=load_excluded)
     extensions: tuple[str, ...] = (
         "mkv", "mp4", "m4v", "avi", "mov", "wmv", "mpg", "mpeg", "ts", "m2ts",
     )
