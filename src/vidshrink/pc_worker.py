@@ -1,4 +1,5 @@
-"""The Windows PC's side: claim a job, encode it with NVENC, upload, report.
+"""The remote worker's side: claim a job, encode it, upload, report. Runs on the
+Windows PC (NVENC) and, headless, on a Linux cloud VM (x265, encoder="x265-cloud").
 Must stay importable on Windows: no fcntl, no vidshrink.worker."""
 import os
 import platform
@@ -14,8 +15,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from vidshrink.config import Config
-from vidshrink.encode import (EncodeCancelled, EncodeError, build_nvenc_command,
-                              run_encode_cancellable)
+from vidshrink.encode import (EncodeCancelled, EncodeError, build_command,
+                              build_nvenc_command, run_encode_cancellable)
 from vidshrink.jobs import JobClient, JobServiceError, LeaseLost
 from vidshrink.paths import md5_file, tmp_path
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
@@ -109,6 +110,14 @@ class PCConfig:
     idle_secs: float = 300
     retry_attempts: int = 5
     retry_base_delay: float = 5.0
+    # The cloud worker: "x265-cloud" encodes with the server's x265 command instead of NVENC.
+    encoder: str = "nvenc"
+    # Which download budget to charge. Empty = "pc" if download_remote else "main".
+    download_account: str = ""
+    # Only claim jobs expected to finish within this many hours; 0 = no limit sent.
+    max_hours: float = 0.0
+    # Send the workdir's free bytes on each claim so the server skips jobs that won't fit.
+    disk_check: bool = False
 
 
 def default_config_path() -> Path:
@@ -145,10 +154,14 @@ def _bwlimit(cfg: PCConfig) -> str:
     return cfg.bwlimit if ":" in cfg.bwlimit else f"{cfg.bwlimit}:off"
 
 
+def _bwlimit_args(cfg: PCConfig) -> tuple[str, ...]:
+    return ("--bwlimit", _bwlimit(cfg)) if cfg.bwlimit else ()
+
+
 def pc_rclone(cfg: PCConfig) -> Rclone:
     # Same pinned Drive behaviour as the server, plus an upload-only bandwidth cap so the
     # 100 Mbps uplink stays usable for Plex.
-    return Rclone(cfg.remote, (*Config().rclone_args, "--bwlimit", _bwlimit(cfg)),
+    return Rclone(cfg.remote, (*Config().rclone_args, *_bwlimit_args(cfg)),
                   binary=cfg.rclone)
 
 
@@ -156,7 +169,7 @@ def pc_download_rclone(cfg: PCConfig) -> Rclone:
     # Downloads only: the PC's own Drive account (download_remote) when set, so they're
     # charged against its own quota instead of the main account's; else the main remote.
     return Rclone(cfg.download_remote or cfg.remote,
-                  (*Config().rclone_args, "--bwlimit", _bwlimit(cfg)), binary=cfg.rclone)
+                  (*Config().rclone_args, *_bwlimit_args(cfg)), binary=cfg.rclone)
 
 
 class _Abandon(Exception):
@@ -184,8 +197,9 @@ class PCWorker:
         # account), since every file must stay owned by the main user.
         self.download_rclone = download_rclone or rclone
         # Sent on every claim/heartbeat/report so the server charges the right budget.
-        self.download_account = "pc" if cfg.download_remote else "main"
-        self.encode = encode or self._nvenc
+        self.download_account = (cfg.download_account
+                                 or ("pc" if cfg.download_remote else "main"))
+        self.encode = encode or (self._nvenc if cfg.encoder == "nvenc" else self._x265)
         self.log = log
         self.state = "idle"
         self.stage = ""
@@ -244,9 +258,15 @@ class PCWorker:
             while not self._stop_now.is_set() and not self._stop_after.is_set():
                 resume, first_claim = first_claim, False
                 try:
-                    resp = self.client.claim(self.cfg.worker_name, "nvenc",
+                    # Only passed when set, so the PC's claim is exactly what it always was.
+                    extra = {}
+                    if self.cfg.disk_check:
+                        extra["free_bytes"] = shutil.disk_usage(self.cfg.workdir).free
+                    if self.cfg.max_hours > 0:
+                        extra["max_hours"] = self.cfg.max_hours
+                    resp = self.client.claim(self.cfg.worker_name, self.cfg.encoder,
                                              download_account=self.download_account,
-                                             resume=resume)
+                                             resume=resume, **extra)
                 except JobServiceError as e:
                     self.log(f"job service unreachable, retrying: {e}")
                     self._wake.wait(self.cfg.idle_secs)
@@ -387,6 +407,11 @@ class PCWorker:
     def _nvenc(self, src: Path, out: Path, probe: Probe, log_path: Path,
                cancel: threading.Event) -> float:
         return run_encode_cancellable(build_nvenc_command(src, out, probe, self.cfg.cq),
+                                      log_path, cancel)
+
+    def _x265(self, src: Path, out: Path, probe: Probe, log_path: Path,
+              cancel: threading.Event) -> float:
+        return run_encode_cancellable(build_command(src, out, probe, Config()),
                                       log_path, cancel)
 
     def _read_marker(self, marker: Path) -> float | None:
@@ -556,6 +581,12 @@ class PCWorker:
                 # The PC's Drive login is dead: every job would fail the same way,
                 # so release this one (no attempt used) and stop until it's fixed.
                 self._abandon(job, tmp if uploading else None, md5)
+                try:
+                    self.client.alert(self.cfg.worker_name,
+                                      f"Drive login failed; re-authorize the rclone remote, "
+                                      f"then restart the worker: {e}")
+                except (JobServiceError, LeaseLost):
+                    pass  # best-effort: the worker stops either way
                 raise _LocalFault(f"Drive login failed (run `rclone config reconnect` "
                                   f"for the remote, then Start again): {e}") from e
             if e.rate_limited and uploading:

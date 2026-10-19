@@ -473,6 +473,16 @@ def test_load_pc_config(tmp_path):
     assert c.workdir == Path("D:/vidshrink")
 
 
+def test_load_pc_config_cloud_keys(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('server = "http://s"\ntoken = "abc"\nencoder = "x265-cloud"\n'
+                 'download_account = "cloud"\nmax_hours = 24.0\ndisk_check = true\n'
+                 'bwlimit = ""\n')
+    c = load_pc_config(p)
+    assert (c.encoder, c.download_account, c.max_hours, c.disk_check, c.bwlimit) == (
+        "x265-cloud", "cloud", 24.0, True, "")
+
+
 # --- final-review fixes: unit tests with fakes ------------------------------
 
 class FakeRemote:
@@ -498,12 +508,25 @@ class FakeClient:
         self._heartbeat = heartbeat
         self._claim = claim
         self.released = []
+        self.claims = []
+        self.alerts = []
+        self.reports = []
 
     def heartbeat(self, job_id, worker, download_account="main"):
         return self._heartbeat()
 
-    def claim(self, worker, encoder, download_account="main", resume=False):
+    def claim(self, worker, encoder="nvenc", download_account="main", resume=False,
+              free_bytes=None, max_hours=None):
+        self.claims.append(dict(worker=worker, encoder=encoder,
+                                download_account=download_account, free_bytes=free_bytes,
+                                max_hours=max_hours))
         return self._claim()
+
+    def alert(self, worker, message):
+        self.alerts.append((worker, message))
+
+    def report(self, job_id, worker, outcome, download_account="main", **data):
+        self.reports.append(outcome)
 
     def release(self, job_id, worker):
         self.released.append(job_id)
@@ -934,3 +957,107 @@ def test_first_claim_after_start_sends_resume_true_then_false(conn, setup, monke
     t.join(10)
     assert resumes[0] is True
     assert all(r is False for r in resumes[1:])
+
+
+# --- cloud worker settings ---------------------------------------------------
+
+def _probe():
+    from vidshrink.probe import Probe
+    return Probe("matroska", 60.0, "h264", 1920, 1080, 0, 8e6, False, None, None, None,
+                 None, None, [["0", "video", "h264"]])
+
+
+def _one_claim_pc(tmp_path, monkeypatch, **cfg):
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    pc = None
+
+    def claim():
+        pc.stop(now=False)
+        return {"job": None, "retry_after": 0.01}
+
+    pc = fake_pc(tmp_path, client=FakeClient(claim=claim, heartbeat=lambda: {"cancel": False}),
+                 heartbeat_secs=0.02, **cfg)
+    return pc
+
+
+def test_cloud_config_claims_as_x265_cloud(tmp_path, monkeypatch):
+    pc = _one_claim_pc(tmp_path, monkeypatch, encoder="x265-cloud", download_account="cloud",
+                       max_hours=24.0, disk_check=True)
+    pc.run()
+    c = pc.client.claims[0]
+    assert (c["encoder"], c["download_account"], c["max_hours"]) == ("x265-cloud", "cloud", 24.0)
+    assert isinstance(c["free_bytes"], int) and c["free_bytes"] > 0
+
+
+def test_pc_defaults_send_no_new_fields(tmp_path, monkeypatch):
+    pc = _one_claim_pc(tmp_path, monkeypatch)
+    pc.run()
+    c = pc.client.claims[0]
+    assert (c["encoder"], c["download_account"]) == ("nvenc", "main")
+    assert c["free_bytes"] is None and c["max_hours"] is None
+
+
+def test_x265_encoder_uses_server_command(tmp_path, monkeypatch):
+    from vidshrink import pc_worker
+    seen = {}
+
+    def fake_run(cmd, log_path, cancel):
+        seen["cmd"] = cmd
+        return 1.5
+
+    def no_nvenc(*a, **k):
+        raise AssertionError("nvenc command must not be built")
+
+    monkeypatch.setattr(pc_worker, "run_encode_cancellable", fake_run)
+    monkeypatch.setattr(pc_worker, "build_nvenc_command", no_nvenc)
+    pcfg = PCConfig(server="http://x", token="t", workdir=tmp_path / "w", worker_name="c",
+                    encoder="x265-cloud")
+    pc = PCWorker(pcfg, FakeClient(), FakeRemote())
+    secs = pc.encode(Path("in.mkv"), Path("out.mkv"), _probe(), tmp_path / "l", threading.Event())
+    assert secs == 1.5
+    assert "libx265" in seen["cmd"]
+
+
+class _DeadLogin(FakeRemote):
+    def download(self, path, dest, cancel=None):
+        raise RcloneError(1, "couldn't fetch token: invalid_grant: maybe token expired?")
+
+
+def _auth_failure_pc(tmp_path, monkeypatch):
+    job = dict(JOB, size=10, probe=_probe().__dict__)
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    client = FakeClient(claim=lambda: {"job": job}, heartbeat=lambda: {"cancel": False})
+    return fake_pc(tmp_path, client=client, remote=_DeadLogin(), heartbeat_secs=0.02)
+
+
+def test_auth_failure_sends_alert_and_stops(tmp_path, monkeypatch):
+    pc = _auth_failure_pc(tmp_path, monkeypatch)
+    pc.run()
+    client = pc.client
+    assert pc.state == "stopped"
+    assert client.released == [7]
+    assert client.reports == []
+    assert len(client.alerts) == 1 and client.alerts[0][0] == "pc"
+    assert "re-authorize" in client.alerts[0][1]
+    assert len(client.claims) == 1
+
+
+def test_auth_failure_alert_is_best_effort(tmp_path, monkeypatch):
+    pc = _auth_failure_pc(tmp_path, monkeypatch)
+
+    def bad_alert(worker, message):
+        raise JobServiceError("down")
+
+    pc.client.alert = bad_alert
+    pc.run()
+    assert pc.client.released == [7] and pc.client.reports == []
+
+
+def test_empty_bwlimit_adds_no_flag():
+    from vidshrink.pc_worker import pc_download_rclone, pc_rclone
+    for make in (pc_rclone, pc_download_rclone):
+        assert "--bwlimit" not in make(PCConfig(server="x", token="y", bwlimit="")).extra_args
+        a = make(PCConfig(server="x", token="y")).extra_args
+        assert a[a.index("--bwlimit") + 1] == "6M:off"
+        a = make(PCConfig(server="x", token="y", bwlimit="6M:40M")).extra_args
+        assert a[a.index("--bwlimit") + 1] == "6M:40M"
