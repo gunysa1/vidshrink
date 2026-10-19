@@ -791,7 +791,7 @@ def test_clean_workdir_deletes_matching_keeps_kept_and_unrelated(tmp_path):
     subdir.mkdir()
     (subdir / "7.src").write_text("never touched")
 
-    deleted = clean_workdir(tmp_path, keep_id=5)
+    deleted = clean_workdir(tmp_path, keep_ids={5})
 
     assert set(deleted) == {other_src, other_out, other_log, other_marker,
                             other_dl_marker, encoded_tmp, downloaded_tmp,
@@ -801,12 +801,12 @@ def test_clean_workdir_deletes_matching_keeps_kept_and_unrelated(tmp_path):
     assert subdir.exists() and (subdir / "7.src").exists()
 
 
-def test_clean_workdir_keep_id_none_deletes_all_matching(tmp_path):
+def test_clean_workdir_keep_ids_empty_deletes_all_matching(tmp_path):
     a = tmp_path / "1.src"
     a.write_text("x")
     b = tmp_path / "2.out.mkv"
     b.write_text("x")
-    deleted = clean_workdir(tmp_path, keep_id=None)
+    deleted = clean_workdir(tmp_path, keep_ids=set())
     assert set(deleted) == {a, b}
     assert not a.exists() and not b.exists()
 
@@ -824,13 +824,13 @@ def test_clean_workdir_oserror_on_one_file_does_not_block_others(tmp_path, monke
         return orig_unlink(self, *a, **k)
 
     monkeypatch.setattr(Path, "unlink", flaky_unlink)
-    deleted = clean_workdir(tmp_path, keep_id=None)
+    deleted = clean_workdir(tmp_path, keep_ids=set())
     assert deleted == [good]
     assert bad.exists() and not good.exists()
 
 
 def test_clean_workdir_missing_dir_returns_empty(tmp_path):
-    assert clean_workdir(tmp_path / "nope", keep_id=None) == []
+    assert clean_workdir(tmp_path / "nope", keep_ids=set()) == []
 
 
 # --- resume: reusing finished local work --------------------------------------

@@ -39,6 +39,8 @@ _NUMBERED_PATTERNS = tuple(re.compile(p) for p in (
     r"^(\d+)\.log$",
     r"^(\d+)\.encoded$",
     r"^(\d+)\.downloaded$",
+    # The queued job's claim dict, plus its own write-then-rename tmp.
+    r"^(\d+)\.job\.json(?:\.tmp)?$",
     # rclone's local backend, when it does write a partial file, names it
     # "<name>.<random>.partial" (e.g. "65137.src.a1b2c3.partial").
     r"^(\d+)\.(?:src|out\.mkv)\..*\.partial$",
@@ -50,11 +52,11 @@ _NUMBERED_PATTERNS = tuple(re.compile(p) for p in (
 _CALIBRATE_PATTERNS = tuple(re.compile(p) for p in (r"^cal-.*$", r"^cal\.log$"))
 
 
-def clean_workdir(workdir: Path, keep_id: int | None) -> list[Path]:
+def clean_workdir(workdir: Path, keep_ids: set[int]) -> list[Path]:
     """Delete vidshrink's own stale work files from `workdir` -- never a
     subdirectory, never anything whose name doesn't match one of our own
-    patterns. Files that belong to `keep_id` (by the numeric id in their name)
-    are kept; everything else matching is removed. Returns what was actually
+    patterns. Files that belong to any id in `keep_ids` (by the numeric id in their
+    name) are kept; everything else matching is removed. Returns what was actually
     deleted; an OSError deleting one file is swallowed so the rest still get a
     chance (and so this never fails a job)."""
     deleted = []
@@ -70,7 +72,7 @@ def clean_workdir(workdir: Path, keep_id: int | None) -> list[Path]:
         for pat in _NUMBERED_PATTERNS:
             m = pat.match(name)
             if m:
-                if keep_id is not None and int(m.group(1)) == keep_id:
+                if int(m.group(1)) in keep_ids:
                     match = False
                 else:
                     match = True
@@ -118,6 +120,12 @@ class PCConfig:
     max_hours: float = 0.0
     # Send the workdir's free bytes on each claim so the server skips jobs that won't fit.
     disk_check: bool = False
+    # Local job queue limits: bytes on disk (sources waiting + outputs not yet
+    # uploaded), expected encode hours not yet encoded, and how long a finished
+    # download stays reserved for us on the server while we are switched off.
+    queue_disk_gb: float = 300.0
+    queue_hours: float = 24.0
+    reserve_days: float = 7.0
 
 
 def default_config_path() -> Path:
@@ -515,7 +523,7 @@ class PCWorker:
         marker = self.cfg.workdir / f"{jid}.encoded"
         downloaded = self.cfg.workdir / f"{jid}.downloaded"
         self.current_path = job.get("path")
-        deleted = clean_workdir(self.cfg.workdir, jid)
+        deleted = clean_workdir(self.cfg.workdir, {jid})
         if deleted:
             self.log(f"cleaned stale work files: {', '.join(p.name for p in deleted)}")
         hb_stop = threading.Event()
