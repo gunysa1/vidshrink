@@ -11,3 +11,4 @@ serve.token
 *.log
 reports/
 excluded.txt
+.superpowers/
