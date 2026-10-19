@@ -180,7 +180,14 @@ class _LocalFault(Exception):
     """Something at the PC itself is broken (missing tool, full disk, permissions,
     a crashed subprocess launch, ...) -- not this video's fault. The whole worker
     stops; the job is released with no attempt burned, so it's picked up again
-    (by this worker once fixed, or another one) rather than failed outright."""
+    (by this worker once fixed, or another one) rather than failed outright.
+
+    alert, if set, is the message sent to the server; otherwise run() sends a
+    generic one, so no local fault leaves the worker stopped silently."""
+
+    def __init__(self, message: str, alert: str | None = None):
+        super().__init__(message)
+        self.alert = alert
 
 
 EncodeFn = Callable[[Path, Path, Probe, Path, threading.Event], float]
@@ -256,7 +263,7 @@ class PCWorker:
         first_claim = True
         try:
             while not self._stop_now.is_set() and not self._stop_after.is_set():
-                resume, first_claim = first_claim, False
+                resume = first_claim
                 try:
                     # Only passed when set, so the PC's claim is exactly what it always was.
                     extra = {}
@@ -272,6 +279,7 @@ class PCWorker:
                     self._wake.wait(self.cfg.idle_secs)
                     self._wake.clear()
                     continue
+                first_claim = False  # only a claim that got an answer uses up resume
                 self._note_download_today(resp)
                 job = resp.get("job")
                 if job is None:
@@ -285,6 +293,11 @@ class PCWorker:
                     self._do_job(job)
                 except _LocalFault as e:
                     self.log(f"stopping: local fault: {e}")
+                    try:
+                        self.client.alert(self.cfg.worker_name,
+                                          e.alert or f"Local fault, worker stopped: {e}")
+                    except (JobServiceError, LeaseLost):
+                        pass  # best-effort: the worker stops either way
                     return
                 except Exception as e:
                     self._handle_unexpected(job, e)
@@ -581,14 +594,13 @@ class PCWorker:
                 # The PC's Drive login is dead: every job would fail the same way,
                 # so release this one (no attempt used) and stop until it's fixed.
                 self._abandon(job, tmp if uploading else None, md5)
-                try:
-                    self.client.alert(self.cfg.worker_name,
-                                      f"Drive login failed; re-authorize the rclone remote, "
-                                      f"then restart the worker: {e}")
-                except (JobServiceError, LeaseLost):
-                    pass  # best-effort: the worker stops either way
-                raise _LocalFault(f"Drive login failed (run `rclone config reconnect` "
-                                  f"for the remote, then Start again): {e}") from e
+                remote = (self.download_rclone if self.stage == "downloading"
+                          else self.rclone).remote
+                raise _LocalFault(
+                    f"Drive login failed (run `rclone config reconnect` "
+                    f"for the remote, then Start again): {e}",
+                    alert=f"Drive login failed for {remote}; re-authorize that rclone "
+                          f"remote, then restart the worker: {e}") from e
             if e.rate_limited and uploading:
                 self._delete_tmp_if_ours(job, tmp, md5)
                 self._report(job, "upload_limited")

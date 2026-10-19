@@ -187,16 +187,16 @@ class JobStore:
             final = final_path(row["path"])
             if final in busy:
                 continue  # another row owns this final_path/tmp_path stem right now
-            if final != row["path"] and self.rclone.exists(final):
-                db.mark_if(self.conn, row["id"], ("queued",), "failed",
-                           reason=f"target {final} already exists")
-                continue
             if free_bytes is not None and (
                     row["size"] * self.cfg.disk_factor + self.cfg.disk_reserve > free_bytes):
                 continue  # wouldn't fit on the worker's disk
             if max_hours is not None and scorer.expected_hours(
                     self.conn, Probe.from_json(row["probe_json"]), encoder) > max_hours:
                 continue  # would take the worker too long
+            if final != row["path"] and self.rclone.exists(final):
+                db.mark_if(self.conn, row["id"], ("queued",), "failed",
+                           reason=f"target {final} already exists")
+                continue
             if not downloads.allows(row["size"]):
                 return {"job": None, "retry_after": downloads.seconds_until_reset()}
             with db.transaction(self.conn):

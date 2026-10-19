@@ -491,6 +491,7 @@ class FakeRemote:
     def __init__(self, files=None):
         self.files = dict(files or {})  # path -> md5
         self.deleted = []
+        self.remote = "gdrive:"
 
     def exists(self, path):
         return path in self.files
@@ -518,7 +519,8 @@ class FakeClient:
     def claim(self, worker, encoder="nvenc", download_account="main", resume=False,
               free_bytes=None, max_hours=None):
         self.claims.append(dict(worker=worker, encoder=encoder,
-                                download_account=download_account, free_bytes=free_bytes,
+                                download_account=download_account, resume=resume,
+                                free_bytes=free_bytes,
                                 max_hours=max_hours))
         return self._claim()
 
@@ -1051,6 +1053,54 @@ def test_auth_failure_alert_is_best_effort(tmp_path, monkeypatch):
     pc.client.alert = bad_alert
     pc.run()
     assert pc.client.released == [7] and pc.client.reports == []
+
+
+class _FullDisk(FakeRemote):
+    def download(self, path, dest, cancel=None):
+        raise OSError(28, "No space left on device")
+
+
+def test_local_fault_sends_alert_and_stops(tmp_path, monkeypatch):
+    job = dict(JOB, size=10, probe=_probe().__dict__)
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    client = FakeClient(claim=lambda: {"job": job}, heartbeat=lambda: {"cancel": False})
+    pc = fake_pc(tmp_path, client=client, remote=_FullDisk(), heartbeat_secs=0.02)
+    pc.run()
+    assert client.released == [7] and client.reports == []
+    assert len(client.alerts) == 1 and client.alerts[0][0] == "pc"
+    assert "No space left" in client.alerts[0][1]
+    assert len(client.claims) == 1
+
+
+def test_auth_alert_names_the_download_remote(tmp_path, monkeypatch):
+    job = dict(JOB, size=10, probe=_probe().__dict__)
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    client = FakeClient(claim=lambda: {"job": job}, heartbeat=lambda: {"cancel": False})
+    dead = _DeadLogin()
+    dead.remote = "gdrive-cloud:"
+    pc = fake_pc(tmp_path, client=client, remote=FakeRemote(), heartbeat_secs=0.02)
+    pc.download_rclone = dead
+    pc.run()
+    assert len(client.alerts) == 1
+    assert client.alerts[0][1].startswith("Drive login failed for gdrive-cloud:;")
+
+
+def test_failed_first_claim_keeps_resume_for_the_next(tmp_path, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    calls = []
+    pc = None
+
+    def claim():
+        calls.append(1)
+        if len(calls) == 1:
+            raise JobServiceError("tailscale not up yet")
+        pc.stop(now=False)
+        return {"job": None, "retry_after": 0.01}
+
+    pc = fake_pc(tmp_path, client=FakeClient(claim=claim), idle_secs=0.01)
+    pc.run()
+    assert [c["resume"] for c in pc.client.claims] == [True, True]
+    assert len(calls) == 2
 
 
 def test_empty_bwlimit_adds_no_flag():

@@ -112,3 +112,30 @@ def test_status_shows_alerts(conn, cfg):
 def test_status_has_no_cloud_lines_without_cloud_activity(conn, cfg):
     out = status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))
     assert "Cloud" not in out and "ALERT" not in out and "last seen" not in out
+
+
+def test_status_labels_are_not_pc_specific(conn, cfg):
+    jid = _leased_row(conn)
+    db.mark(conn, jid, "remote_ready")
+    out = status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))
+    assert "Remote results waiting for the server (1):" in out
+    db.mark(conn, jid, "leased", worker="cloud-vm", lease_until=10**10)
+    out = status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))
+    assert "With remote workers (1):" in out
+
+
+def test_status_does_not_list_the_pc_twice(conn, cfg):
+    budget = Budget(conn, cfg.daily_upload_limit)
+    jid = _leased_row(conn)
+    db.mark(conn, jid, "done", worker="pc", encoder="nvenc")
+    db.kv_set(conn, PC_SEEN_KEY, str(budget.now() - 3600))
+    db.kv_set(conn, "seen:pc", str(budget.now() - 3600))
+    db.kv_set(conn, "seen:cloud-vm", str(budget.now() - 7200))
+    out = status_report(conn, cfg, budget)
+    assert "PC last seen" in out and "pc last seen" not in out
+    assert "cloud-vm last seen" in out
+
+
+def _leased_row(conn):
+    db.upsert_listing(conn, "a.mkv", 5, "t")
+    return db.get_by_path(conn, "a.mkv")["id"]

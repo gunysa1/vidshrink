@@ -65,13 +65,13 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
 
     leased = db.rows_in(conn, "leased")
     if leased:
-        lines.append(f"With the PC ({len(leased)}):")
+        lines.append(f"With remote workers ({len(leased)}):")
         for row in leased:
             left = max(0, (row["lease_until"] or 0) - budget.now()) / 60
             lines.append(f"  {row['path']} ({row['worker']}, lease {left:.0f} min left)")
     remote = db.rows_in(conn, "remote_ready")
     if remote:
-        lines.append(f"PC results waiting for the server ({len(remote)}):")
+        lines.append(f"Remote results waiting for the server ({len(remote)}):")
         for row in remote:
             lines.append(f"  {row['path']}")
     seen = db.kv_get(conn, PC_SEEN_KEY)
@@ -98,8 +98,12 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
                      f"{cloud_downloads.limit / 1e9:.0f} GB{cloud_paused}")
     for row in conn.execute("SELECT key, value FROM kv WHERE key LIKE ? ORDER BY key",
                             (f"{WORKER_SEEN_PREFIX}%",)):
+        name = row["key"][len(WORKER_SEEN_PREFIX):]
+        if conn.execute("SELECT 1 FROM videos WHERE worker=? AND encoder='nvenc' LIMIT 1",
+                        (name,)).fetchone():
+            continue  # the PC: already shown as "PC last seen"
         ago = (budget.now() - float(row["value"])) / 3600
-        lines.append(f"{row['key'][len(WORKER_SEEN_PREFIX):]} last seen: {ago:.1f} h ago")
+        lines.append(f"{name} last seen: {ago:.1f} h ago")
     for row in conn.execute("SELECT key, value FROM kv WHERE key LIKE ? ORDER BY key",
                             (f"{ALERT_PREFIX}%",)):
         lines.append(f"ALERT {row['key'][len(ALERT_PREFIX):]}: {json.loads(row['value'])['message']}")

@@ -495,6 +495,16 @@ def test_claim_max_hours_filters_by_encoder_speed(conn, store):
     assert store.claim("cloud-vm", "x265-cloud", "cloud", max_hours=12)["job"] is None
 
 
+def test_filtered_out_candidates_cost_no_drive_call(conn, store, cfg):
+    cfg.disk_factor, cfg.disk_reserve = 2.2, 20e9
+    add(conn, "big.avi", size=50_000_000_000)
+    _, long_ = _short_and_long(conn)
+    calls = []
+    store.rclone.exists = lambda p: calls.append(p) or False
+    store.claim("cloud-vm", "x265-cloud", "cloud", free_bytes=int(60e9), max_hours=1)
+    assert calls == []
+
+
 def test_claim_without_filters_is_unchanged(conn, store):
     _, long_ = _short_and_long(conn)
     assert store.claim("cloud-vm", "x265-cloud", "cloud")["job"]["id"] == long_
