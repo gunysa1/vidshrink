@@ -259,6 +259,11 @@ class PCWorker:
         self._jobs: dict[int, LocalJob] = {}
         self._cancels: dict[int, threading.Event] = {}
         self._reserved: set[int] = set()  # ids the server holds as reservations
+        # Ids the server took back (cancel, or our lease ran out): dropped, never kept.
+        self._gone: set[int] = set()
+        # Ids whose files _forget is deleting outside the lock; _hold waits for them.
+        self._deleting: set[int] = set()
+        self._resuming = 0  # jobs offered to /resume, until the server answers
         self._to_encode: deque[LocalJob] = deque()  # downloaded, oldest first
         self._to_upload: deque[LocalJob] = deque()  # encoded, oldest first
         self._encoder_done = threading.Event()
@@ -284,8 +289,8 @@ class PCWorker:
                     cancel.set()
             else:
                 self._stop_after.set()
-                # Jobs that never started encoding are released on Stop after, so
-                # the running download has no point any more.
+                # Stop after aborts the running download (that job is released);
+                # the running encode and the uploads carry on.
                 for jid, lj in self._jobs.items():
                     if lj.state == "downloading":
                         self._cancels[jid].set()
@@ -364,6 +369,8 @@ class PCWorker:
             return [lj for lj in jobs if lj.state == state]
 
         parts = []
+        if self._resuming:
+            parts.append(f"Resuming {self._resuming} job(s)")
         waiting = len(having("downloaded"))
         encoding = having("encoding")
         if encoding:
@@ -390,31 +397,96 @@ class PCWorker:
         return [name for name in ("ffmpeg", "ffprobe", self.cfg.rclone)
                 if shutil.which(name) is None]
 
-    def _startup(self) -> None:
-        """Nothing from a previous run is reused. Its leases (found by their
-        `.job.json`) are released first, so a reserved file isn't left blocked for
-        days, then every work file is deleted."""
+    def _startup(self) -> bool:
+        """Pick up where a previous run left off: partial downloads are released and
+        deleted, finished downloads and encodes are offered to the server and, once
+        confirmed, queued at their local state. False if Stop was pressed before the
+        server answered; nothing is deleted then."""
         self.cfg.workdir.mkdir(parents=True, exist_ok=True)
         try:
             names = [p.name for p in self.cfg.workdir.iterdir()]
         except OSError:
             names = []
-        for name in names:
-            m = _LEFTOVER_JOB.match(name)
-            if m:
-                try:
-                    self.client.release(int(m.group(1)), self.cfg.worker_name)
-                except (LeaseLost, JobServiceError):
-                    pass  # not ours any more, or the server is down: it expires
-        deleted = clean_workdir(self.cfg.workdir, set())
+        resumable, incomplete = self.queue.scan()
+        offered = []
+        for lj in resumable:
+            # The server rejects an item without these; treat it like a partial one.
+            if isinstance(lj.job.get("size"), int) and isinstance(lj.job.get("modtime"), str):
+                offered.append(lj)
+            else:
+                self.queue.forget(lj.id)
+                incomplete.append(lj.id)
+        # A .job.json that can't be read still names the lease to release.
+        unreadable = {int(m.group(1)) for name in names if (m := _LEFTOVER_JOB.match(name))}
+        unreadable -= {lj.id for lj in resumable} | set(incomplete)
+        for jid in (*incomplete, *sorted(unreadable)):
+            try:
+                self.client.release(jid, self.cfg.worker_name)
+            except (LeaseLost, JobServiceError):
+                pass  # not ours any more, or the server is down: it expires
+            self.queue.forget(jid)
+        if offered and not self._resume(offered):
+            return False
+        with self._cv:
+            held = set(self._jobs)
+        deleted = clean_workdir(self.cfg.workdir, held)
         if deleted:
             self.log(f"cleaned stale work files: {', '.join(p.name for p in deleted)}")
+        return True
+
+    def _resume(self, offered: list[LocalJob]) -> bool:
+        """Ask the server to confirm `offered`, retrying until it answers; False if
+        Stop is pressed first."""
+        items = [{"id": lj.id, "size": lj.job["size"], "modtime": lj.job["modtime"],
+                  "reserve_secs": self.cfg.reserve_days * 86400} for lj in offered]
+        self._resuming = len(offered)
+        try:
+            while True:
+                try:
+                    resp = self.client.resume(self.cfg.worker_name, self.cfg.encoder,
+                                              self.download_account, items)
+                    break
+                except JobServiceError as e:
+                    self.log(f"job service unreachable, retrying resume: {e}")
+                    if self._wait_stop(self.cfg.idle_secs):
+                        return False
+        finally:
+            self._resuming = 0
+        confirmed = {int(j["id"]): j for j in resp.get("resumed") or ()}
+        refused = {int(i) for i in resp.get("refused") or ()}
+        for lj in offered:
+            job = confirmed.get(lj.id)
+            if job is None:
+                if lj.id in refused:
+                    self.log(f"resume refused, deleting: {lj.job.get('path')}")
+                self.queue.forget(lj.id)
+                continue
+            lj.job.update(job)  # the server's fresh view, e.g. expected_hours
+            with self._cv:
+                self._jobs[lj.id] = lj
+                self._cancels[lj.id] = threading.Event()
+                self._reserved.add(lj.id)
+            self._push(self._to_encode if lj.state == "downloaded" else self._to_upload, lj)
+            self.log(f"resumed ({lj.state}): {lj.job.get('path')}")
+        return True
 
     def _on_stopped(self) -> None:
-        """Every stage has exited: release each job still held and delete its files."""
+        """Every stage has exited. A job that never finished downloading is released
+        and deleted; every finished download or encode stays on disk, reserved for
+        the next start."""
+        kept = 0
         for lj in self._snapshot():
-            self._abandon(lj.job, None, None)
-            self._forget(lj)
+            with self._cv:
+                gone = lj.id in self._gone
+            if lj.state == "downloading":
+                self._abandon(lj.job, None, None)
+                self._forget(lj)
+            elif gone:
+                self._forget(lj)
+            else:
+                kept += 1
+        if kept:
+            self.log(f"stopped; keeping {kept} job(s) on disk, reserved for next time")
 
     # --- loop ---------------------------------------------------------------
     def run(self) -> None:
@@ -426,7 +498,8 @@ class PCWorker:
             return
         self._phase = "running"
         try:
-            self._startup()
+            if not self._startup():
+                return
             stages = [threading.Thread(target=self._stage, args=(fn,), daemon=True,
                                        name=f"vidshrink{fn.__name__}")
                       for fn in (self._downloader, self._encoder, self._uploader)]
@@ -507,9 +580,12 @@ class PCWorker:
     # --- held jobs -----------------------------------------------------------
     def _hold(self, job: dict) -> LocalJob:
         with self._cv:
+            while int(job["id"]) in self._deleting:  # its old files are going
+                self._cv.wait(0.5)
             lj = self.queue.add(job)
             cancel = threading.Event()
-            if self._stop_now.is_set():
+            if self._stopping():
+                # A stop landed while the claim was in flight: release, don't download.
                 cancel.set()
             self._jobs[lj.id] = lj
             self._cancels[lj.id] = cancel
@@ -527,27 +603,42 @@ class PCWorker:
         return gone
 
     def _set_state(self, lj: LocalJob, state: str) -> bool:
-        """False if the job was dropped meanwhile (a server cancel)."""
+        """False if the job was dropped meanwhile (a server cancel). A job the
+        server cancelled while its stage was finishing is forgotten here, at once."""
         with self._cv:
             if not self._held(lj):
                 return False
-            try:
-                self.queue.set_state(lj.id, state)
-            except KeyError:
-                return False
+            gone = lj.id in self._gone
+            if not gone:
+                try:
+                    self.queue.set_state(lj.id, state)
+                except KeyError:
+                    return False
+        if gone:
+            self._forget(lj)
+            return False
         self._wake.set()
         return True
 
     def _forget(self, lj: LocalJob) -> None:
         """Drop the job locally and delete its files. A no-op if it is already gone
-        (it may even have been claimed again since, under the same id)."""
+        (it may even have been claimed again since, under the same id). The files
+        are deleted outside the lock; _hold waits for that before reusing the id.
+        Never call this while holding _cv."""
         with self._cv:
             if not self._held(lj):
                 return
             del self._jobs[lj.id]
             self._cancels.pop(lj.id, None)
             self._reserved.discard(lj.id)
+            self._gone.discard(lj.id)
+            self._deleting.add(lj.id)
+        try:
             self.queue.forget(lj.id)
+        finally:
+            with self._cv:
+                self._deleting.discard(lj.id)
+                self._cv.notify_all()
         self._wake.set()
 
     def _push(self, queue: deque, lj: LocalJob, front: bool = False) -> None:
@@ -561,15 +652,27 @@ class PCWorker:
     def _take(self, queue: deque, state: str) -> LocalJob | None:
         """The next job still held and not cancelled, moved to `state`; else wait
         briefly for one and return None."""
+        dropped = []
         with self._cv:
             while queue:
                 lj = queue.popleft()
-                cancel = self._cancels.get(lj.id)
-                if (self._held(lj) and cancel is not None and not cancel.is_set()
-                        and self._set_state(lj, state)):
-                    return lj
-            self._cv.wait(0.5)
-            return None
+                if not self._held(lj):
+                    continue
+                if lj.id in self._gone:
+                    dropped.append(lj)  # the server cancelled it as it was queued
+                    continue
+                if self._cancels[lj.id].is_set():
+                    continue  # stopping: it stays held, on disk
+                try:
+                    self.queue.set_state(lj.id, state)
+                except KeyError:
+                    continue
+                return lj
+            if not dropped:
+                self._cv.wait(0.5)
+        for lj in dropped:
+            self._forget(lj)
+        return None
 
     def _server_cancel(self, job_id: int, why: str) -> None:
         """The server no longer holds job_id for us: cancel only that job's stage
@@ -579,9 +682,11 @@ class PCWorker:
             if lj is None:
                 return
             self.log(f"{why}: {lj.job.get('path')}")
+            self._gone.add(job_id)
             self._cancels[job_id].set()
-            if lj.state in _IDLE_STATES:
-                self._forget(lj)
+            idle = lj.state in _IDLE_STATES
+        if idle:
+            self._forget(lj)
 
     # --- download stage -------------------------------------------------------
     def _free_bytes(self) -> int:
@@ -621,7 +726,6 @@ class PCWorker:
                                  self._free_bytes())
 
     def _downloader(self) -> None:
-        first_claim = True
         while not self._stopping():
             backoff = self._claim_not_before - time.monotonic()
             if backoff > 0:
@@ -634,12 +738,11 @@ class PCWorker:
             try:
                 resp = self.client.claim(self.cfg.worker_name, self.cfg.encoder,
                                          download_account=self.download_account,
-                                         resume=first_claim, **extra)
+                                         **extra)
             except JobServiceError as e:
                 self.log(f"job service unreachable, retrying: {e}")
                 self._idle(self.cfg.idle_secs)
                 continue
-            first_claim = False  # only a claim that got an answer uses up resume
             self._note_download_today(resp)
             job = resp.get("job")
             if job is None:
@@ -750,7 +853,7 @@ class PCWorker:
             paused = self._uploads_paused_until - time.monotonic()
             if paused > 0:
                 if self._stop_after.is_set():
-                    self.log("uploads are paused; stopping without uploading the rest")
+                    self.log("uploads are paused; stopping, the encoded files stay reserved")
                     return
                 self._stop_now.wait(min(paused, 0.5))
                 continue
@@ -842,6 +945,8 @@ class PCWorker:
         job = lj.job
         ours = tmp if uploading else None
         if isinstance(e, (_Abandon, EncodeCancelled, TransferCancelled)):
+            if self._keep_on_stop(lj, ours, md5):
+                return
             self._abandon(job, ours, md5)
         elif isinstance(e, RcloneError):
             if e.auth_failed:
@@ -884,6 +989,24 @@ class PCWorker:
         else:
             raise e
         self._forget(lj)
+
+    def _keep_on_stop(self, lj: LocalJob, tmp: str | None, md5: str | None) -> bool:
+        """A stop (not a server cancel) interrupted a job whose download had
+        finished: drop only the cancelled stage's partial work and keep the job on
+        disk, still reserved, at its last finished state. False otherwise."""
+        with self._cv:
+            if (not self._stopping() or not self._held(lj) or lj.id in self._gone
+                    or lj.state == "downloading"):
+                return False
+        if lj.state == "encoding":
+            lj.out.unlink(missing_ok=True)
+            back = "downloaded"
+        else:  # uploading (verifying, or the transfer itself)
+            self._delete_tmp_if_ours(lj.job, tmp, md5)
+            back = "encoded"
+        if self._set_state(lj, back):
+            self.log(f"stopped; keeping {lj.job['path']} ({back}) for next time")
+        return True
 
     # --- helpers ----------------------------------------------------------------
     def _retry(self, fn, cancel: threading.Event):

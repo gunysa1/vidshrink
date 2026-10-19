@@ -1,6 +1,5 @@
 """Tray icon for the PC worker: Start / Stop now / Stop after this file / Status / Exit."""
 import atexit
-import posixpath
 import threading
 from collections.abc import Callable
 
@@ -41,28 +40,32 @@ class TrayController:
         if self.thread is not None:
             self.thread.join(30)
 
-    def status_text(self, short: bool = False) -> str:
-        """Full status for the menu; short=True names only the file (not its folder),
-        for the size-limited icon tooltip."""
+    def status_text(self, short: bool = False, limit: int = TITLE_MAX) -> str:
+        """Full status for the menu; short=True trims the stages so the whole text
+        fits in `limit` characters, for the size-limited icon tooltip."""
+        dl = getattr(self.worker, "download_today", None) if self.worker else None
+        tail = ""
+        if dl:
+            used, cap = dl
+            of_limit = "" if cap is None else f"/{cap / 1e9:.0f}"
+            tail = f" · DL today {used / 1e9:.0f}{of_limit} GB"
         if self.state == "off":
             done = self.worker.done if self.worker else 0
-            text = f"Off — {done} file(s) this session"
-        else:
-            w = self.worker
-            current = w.current_path if w.current_path else "—"
-            if short and w.current_path:
-                current = posixpath.basename(current)
-            text = f"{self.state.title()}: {w.stage or 'waiting'} — {current} ({w.done} done)"
-        dl = getattr(self.worker, "download_today", None) if self.worker else None
-        if dl:
-            used, limit = dl
-            of_limit = "" if limit is None else f"/{limit / 1e9:.0f}"
-            text += f" · DL today {used / 1e9:.0f}{of_limit} GB"
-        return text
+            return f"Off — {done} file(s) this session" + tail
+        w = self.worker
+        line = w.status_line() or "waiting"
+        head, done = f"{self.state.title()}: ", f" ({w.done} done)"
+        if short:
+            room = limit - len(head) - len(done) - len(tail)
+            if len(line) > room:
+                line = line[:max(room - 1, 0)] + "…"
+        return head + line + done + tail
 
 
 def tray_title(title: str, controller: TrayController) -> str:
-    return f"{title}: {controller.status_text(short=True)}"[:TITLE_MAX]
+    prefix = f"{title}: "
+    return (prefix + controller.status_text(short=True,
+                                            limit=TITLE_MAX - len(prefix)))[:TITLE_MAX]
 
 
 def tick(refresh: Callable, icon, log: Callable[[str], None] = print) -> None:

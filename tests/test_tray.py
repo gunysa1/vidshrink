@@ -14,6 +14,9 @@ class FakeWorker:
         self._stop = threading.Event()
         self.now = None
 
+    def status_line(self):
+        return f"Encoding {self.current_path.rsplit('/', 1)[-1]}" if self.current_path else ""
+
     def run(self):
         self.state = "working"
         self.current_path = "Movies/x.mkv"
@@ -41,7 +44,7 @@ def test_start_stop_now():
     assert c.state == "off"
     c.start()
     assert wait(lambda: c.state == "working")
-    assert "Movies/x.mkv" in c.status_text() and "encoding" in c.status_text()
+    assert "Encoding x.mkv" in c.status_text()
     c.start()  # no second worker
     assert len(workers) == 1
     c.stop_now()
@@ -62,17 +65,32 @@ def test_shutdown_when_off_is_safe():
     TrayController(FakeWorker).shutdown()
 
 
-def test_tray_title_is_basename_and_fits_windows_limit():
+def test_tray_title_fits_windows_limit():
     c = TrayController(FakeWorker)
     c.start()
     assert wait(lambda: c.state == "working")
-    long_path = "Movies/" + "d" * 150 + "/" + "x" * 140 + ".mkv"
-    c.worker.current_path = long_path
+    long_line = " · ".join(f"Uploading {'x' * 60}{i}.mkv" for i in range(4))
+    c.worker.status_line = lambda: long_line
+    c.worker.download_today = (412e9, None)
     title = tray_title("vidshrink", c)
     assert len(title) <= 127
-    assert "Movies/" not in title and "xxxx" in title
-    assert long_path in c.status_text()  # the menu status item keeps the full path
+    assert title.endswith(" · DL today 412 GB")  # the short form trims the stages
+    assert long_line in c.status_text()  # the menu status item keeps it all
     c.stop_now()
+
+
+def test_tray_shows_status_line():
+    c = TrayController(FakeWorker)
+    c.start()
+    assert wait(lambda: c.state == "working")
+    line = "Encoding X.mkv (2 waiting) · Downloading Z.mkv · Uploading Y.mkv"
+    c.worker.status_line = lambda: line
+    c.worker.done = 3
+    assert c.status_text() == f"Working: {line} (3 done)"
+    c.worker.status_line = lambda: ""
+    assert c.status_text() == "Working: waiting (3 done)"
+    c.stop_now()
+    assert wait(lambda: c.state == "off")
 
 
 def test_ticker_survives_refresh_exception():

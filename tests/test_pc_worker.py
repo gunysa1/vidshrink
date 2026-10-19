@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import threading
@@ -295,6 +296,53 @@ def test_upload_limited_keeps_encoded_files(conn, setup, monkeypatch):
         t.join(15)
 
 
+def test_stop_after_during_upload_pause_keeps_encoded_reserved(conn, setup, monkeypatch):
+    root, pc, store = setup
+
+    def limited(local, path, cancel=None):
+        raise RcloneError(1, "googleapi: Error 403: User rate limit exceeded.,"
+                          " userRateLimitExceeded")
+
+    released = []
+    orig_release = pc.client.release
+    monkeypatch.setattr(pc.rclone, "upload", limited)
+    monkeypatch.setattr(pc.client, "release", lambda job_id, worker: (
+        released.append(job_id), orig_release(job_id, worker))[1])
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    t = run_in_thread(pc)
+    assert wait_for(lambda: "Uploads paused" in pc.status_line())
+    pc.stop(now=False)
+    t.join(15)  # does not wait out the 6 h pause
+    assert not t.is_alive()
+    assert released == []
+    assert_reserved(conn, vid)
+    for ext in (".job.json", ".out.mkv", ".encoded"):
+        assert (pc.cfg.workdir / f"{vid}{ext}").exists(), ext
+
+
+def test_server_cancel_during_encode_other_job_completes(conn, cfg, setup):
+    root, pc, store = setup
+    a, b = add_videos(conn, cfg, root, "b")
+    enc = GatedEncode()
+    pc.encode = enc
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: enc.started == [a])
+        assert wait_for(lambda: (pc.cfg.workdir / f"{b}.downloaded").exists())
+        db.mark(conn, a, "skipped", worker=None, reason="operator")
+        assert wait_for(lambda: a not in pc.queue.held_ids())
+        assert wait_for(lambda: not list(pc.cfg.workdir.glob(f"{a}.*")))
+        enc.gate.set()
+        assert wait_for(lambda: db.get(conn, b)["stage"] == "remote_ready")
+        assert enc.started == [a, b]
+        assert db.get(conn, a)["stage"] == "skipped"
+        assert not (root / "Movies" / "a.vidshrink-tmp.mkv").exists()
+    finally:
+        enc.gate.set()
+        pc.stop(now=True)
+        t.join(15)
+
+
 def test_status_line_shows_every_stage(tmp_path):
     pc = fake_pc(tmp_path)
     pc.cfg.workdir.mkdir(parents=True)
@@ -308,42 +356,101 @@ def test_status_line_shows_every_stage(tmp_path):
     assert (pc.stage, pc.current_path) == ("encoding", "Movies/X.mkv")
 
 
-def test_stop_now_releases_job(conn, cfg, make_clip, setup):
+def assert_reserved(conn, vid):
+    row = db.get(conn, vid)
+    assert (row["stage"], row["worker"], row["attempts"]) == ("leased", "pc", 0)
+    assert row["reserve_secs"] == 7 * 86400
+
+
+def test_stop_now_keeps_downloaded_jobs_reserved(conn, cfg, setup):
     root, pc, store = setup
-    # A longer clip so the encode is still running when we stop; rescan picks it up.
-    shutil.copy(make_clip("long", seconds=120, width=1280, height=720), root / "Movies" / "a.mkv")
-    scan(conn, Rclone(cfg.remote), cfg,
-         lambda p, s: parse_ffprobe(run_ffprobe(str(root / p)), s), log=lambda s: None)
-    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
-    assert db.get(conn, vid)["stage"] == "queued"
+    a, b = add_videos(conn, cfg, root, "b")
+    enc = GatedEncode()
+    pc.encode = enc
+    released = []
+    orig_release = pc.client.release
+    pc.client.release = lambda job_id, worker: (released.append(job_id),
+                                                orig_release(job_id, worker))[1]
     t = run_in_thread(pc)
-    assert wait_for(lambda: pc.stage == "encoding")
+    assert wait_for(lambda: enc.started == [a])
+    assert wait_for(lambda: db.get(conn, b)["reserve_secs"] == 7 * 86400)
+    (pc.cfg.workdir / f"{a}.out.mkv").write_bytes(b"partial encode")
     pc.stop(now=True)
     t.join(15)
     assert not t.is_alive()
-    row = db.get(conn, vid)
-    assert (row["stage"], row["attempts"]) == ("queued", 0)
+    assert released == []
+    for vid in (a, b):
+        assert_reserved(conn, vid)
+        for ext in (".job.json", ".src", ".downloaded"):
+            assert (pc.cfg.workdir / f"{vid}{ext}").exists(), (vid, ext)
+    assert not (pc.cfg.workdir / f"{a}.out.mkv").exists()  # the cancelled encode's output
     assert not (root / "Movies" / "a.vidshrink-tmp.mkv").exists()
 
 
-def test_stop_after_this_file_finishes_first(conn, cfg, setup):
+def test_stop_now_releases_unfinished_download(conn, setup, monkeypatch):
+    root, pc, store = setup
+    started = threading.Event()
+
+    def slow_download(path, local, cancel=None):
+        Path(local).write_bytes(b"part")
+        started.set()
+        while not cancel.wait(0.05):
+            pass
+        raise TransferCancelled("cancelled")
+
+    monkeypatch.setattr(pc.download_rclone, "download", slow_download)
+    t = run_in_thread(pc)
+    assert started.wait(30)
+    pc.stop(now=True)
+    t.join(15)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    assert (db.get(conn, vid)["stage"], db.get(conn, vid)["attempts"]) == ("queued", 0)
+    assert not list(pc.cfg.workdir.glob(f"{vid}.*"))
+
+
+def test_stop_after_drains_uploads_keeps_downloaded(conn, cfg, setup):
     root, pc, store = setup
     a, b = add_videos(conn, cfg, root, "b")
     enc = GatedEncode()
     pc.encode = enc
     t = run_in_thread(pc)
     assert wait_for(lambda: enc.started == [a])
-    assert wait_for(lambda: (pc.cfg.workdir / f"{b}.downloaded").exists())
+    assert wait_for(lambda: db.get(conn, b)["reserve_secs"] == 7 * 86400)
     pc.stop(now=False)
     assert pc.state == "finishing"
     enc.gate.set()
     t.join(60)
     assert not t.is_alive()
-    assert db.get(conn, a)["stage"] == "remote_ready"  # the running encode finished
-    row = db.get(conn, b)
-    assert (row["stage"], row["attempts"]) == ("queued", 0)  # never encoded: released
+    assert db.get(conn, a)["stage"] == "remote_ready"  # finished, then uploaded
+    assert pc.done == 1
     assert enc.started == [a]
+    assert_reserved(conn, b)  # never encoded: kept on disk, still reserved
+    for ext in (".job.json", ".src", ".downloaded"):
+        assert (pc.cfg.workdir / f"{b}{ext}").exists()
+    assert not list(pc.cfg.workdir.glob(f"{a}.*"))
     assert pc.state == "stopped"
+
+
+def test_stop_after_while_claim_in_flight_downloads_nothing(conn, setup, monkeypatch):
+    root, pc, store = setup
+    downloads = []
+    monkeypatch.setattr(pc.download_rclone, "download",
+                        lambda *a, **k: downloads.append(a))
+    orig_admits = pc._admits
+
+    def stop_meanwhile(job):
+        # Stop after lands after the downloader's own stop check, before it holds the job.
+        pc.stop(now=False)
+        return orig_admits(job)
+
+    monkeypatch.setattr(pc, "_admits", stop_meanwhile)
+    t = run_in_thread(pc)
+    t.join(30)
+    assert not t.is_alive()
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    assert downloads == []
+    assert (db.get(conn, vid)["stage"], db.get(conn, vid)["attempts"]) == ("queued", 0)
+    assert not list(pc.cfg.workdir.glob(f"{vid}.*"))
 
 
 def test_download_quota_is_reported(conn, setup, monkeypatch):
@@ -501,7 +608,7 @@ def test_report_retries_on_server_blip(conn, setup, monkeypatch):
     assert calls["n"] >= 2
 
 
-def test_stop_now_during_upload_releases_and_cleans_tmp(conn, setup, monkeypatch):
+def test_stop_now_during_upload_keeps_encoded_and_cleans_tmp(conn, setup, monkeypatch):
     root, pc, store = setup
     tmp_on_remote = root / "Movies" / "a.vidshrink-tmp.mkv"
 
@@ -524,9 +631,10 @@ def test_stop_now_during_upload_releases_and_cleans_tmp(conn, setup, monkeypatch
     t.join(15)
     assert not t.is_alive()
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
-    row = db.get(conn, vid)
-    assert (row["stage"], row["attempts"]) == ("queued", 0)
+    assert_reserved(conn, vid)
     assert not tmp_on_remote.exists()
+    for ext in (".job.json", ".out.mkv", ".encoded"):
+        assert (pc.cfg.workdir / f"{vid}{ext}").exists(), ext
 
 
 def test_ambiguous_uploaded_then_retry_succeeds_idempotently_tmp_kept(conn, setup, monkeypatch):
@@ -862,6 +970,49 @@ def test_heartbeat_sends_nothing_with_no_held_job(tmp_path):
     t.join(5)
 
 
+def test_server_cancel_as_stage_finishes_forgets_promptly(tmp_path):
+    pc = fake_pc(tmp_path)
+    lj = hold(pc, 7, "encoding")
+    (pc.cfg.workdir / "7.out.mkv").write_bytes(b"x")
+    pc._server_cancel(7, "server cancelled the job")
+    assert 7 in pc.queue.held_ids()  # still inside its stage
+    assert pc._set_state(lj, "encoded") is False  # the stage finishes just then
+    assert 7 not in pc.queue.held_ids() and 7 not in pc._jobs
+    assert not list(pc.cfg.workdir.glob("7.*"))
+    lj8 = hold(pc, 8, "encoding")
+    pc._server_cancel(8, "server cancelled the job")
+    pc._push(pc._to_upload, lj8)  # already queued when the cancel lands
+    assert pc._take(pc._to_upload, "uploading") is None
+    assert 8 not in pc._jobs and not list(pc.cfg.workdir.glob("8.*"))
+
+
+def test_forget_deletes_files_outside_the_lock(tmp_path, monkeypatch):
+    pc = fake_pc(tmp_path)
+    lj = hold(pc, 7, "downloaded")
+    could_lock = []
+    orig_forget = pc.queue.forget
+
+    def spy(job_id):
+        def try_lock():
+            if pc._cv.acquire(timeout=1):
+                pc._cv.release()
+                could_lock.append(True)
+            else:
+                could_lock.append(False)
+
+        t = threading.Thread(target=try_lock)
+        t.start()
+        t.join()
+        return orig_forget(job_id)
+
+    monkeypatch.setattr(pc.queue, "forget", spy)
+    pc._forget(lj)
+    hold(pc, 8, "downloaded")
+    pc._server_cancel(8, "server cancelled the job")
+    assert could_lock == [True, True]
+    assert not list(pc.cfg.workdir.glob("[78].*"))
+
+
 def test_lease_secs_default_matches_server():
     from vidshrink.config import Config
     assert PCConfig(server="x", token="t").lease_secs == Config().lease_secs == 1800
@@ -1089,39 +1240,183 @@ def test_clean_workdir_missing_dir_returns_empty(tmp_path):
 
 # --- resume: reusing finished local work --------------------------------------
 
-def test_startup_releases_leftover_reservation_and_deletes_its_files(conn, setup, monkeypatch):
-    """Nothing from a previous run is reused yet: a reservation it left behind is
-    released (not left blocking the file for reserve_days) and its files deleted."""
+def leave_job(conn, store, pc, root, vid, state, worker="pc"):
+    """A job a previous run left in pc's workdir: claimed (by `worker`), with its
+    .job.json and, for "downloaded"/"encoded", its finished files and markers."""
+    job = store.claim(worker, "nvenc")["job"]
+    assert job["id"] == vid
+    wd = pc.cfg.workdir
+    wd.mkdir(parents=True, exist_ok=True)
+    (wd / f"{vid}.job.json").write_text(json.dumps(job))
+    src = root / job["path"]
+    if state == "partial":
+        (wd / f"{vid}.src").write_bytes(b"part of a download")
+        return job
+    store.report(vid, worker, "downloaded", reserve_secs=7 * 86400)
+    shutil.copy(src, wd / f"{vid}.src")
+    (wd / f"{vid}.downloaded").write_text(str(job["size"]))
+    if state == "encoded":
+        secs = x265_encode(wd / f"{vid}.src", wd / f"{vid}.out.mkv", None,
+                           wd / f"{vid}.log", threading.Event())
+        (wd / f"{vid}.encoded").write_text(str(secs))
+    return job
+
+
+def stop_on_claim(pc, monkeypatch):
+    """The first claim stops the worker (Stop after) and hands out nothing."""
+    claims = []
+
+    def claim(*a, **k):
+        claims.append(k)
+        pc.stop(now=False)
+        return {"job": None, "retry_after": 0.01}
+
+    monkeypatch.setattr(pc.client, "claim", claim)
+    return claims
+
+
+def test_restart_resumes_downloaded_job_without_redownload(conn, setup, monkeypatch):
     root, pc, store = setup
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
-    assert store.claim("pc", "nvenc")["job"]["id"] == vid
-    store.report(vid, "pc", "downloaded", reserve_secs=7 * 86400)
-    pc.cfg.workdir.mkdir(parents=True, exist_ok=True)
-    leftovers = [pc.cfg.workdir / f"{vid}{ext}" for ext in
-                 (".job.json", ".src", ".downloaded", ".out.mkv", ".encoded")]
-    for f in leftovers:
-        f.write_text("12.5")
-    released = []
-    orig_release = pc.client.release
+    leave_job(conn, store, pc, root, vid, "downloaded")
+    downloads = []
+    orig_download = pc.download_rclone.download
+    monkeypatch.setattr(pc.download_rclone, "download", lambda path, local, cancel=None: (
+        downloads.append(path), orig_download(path, local, cancel=cancel))[1])
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        assert downloads == []
+        assert wait_for(lambda: pc.done == 1)
+    finally:
+        pc.stop(now=True)
+        t.join(15)
 
-    def spy_release(job_id, worker):
-        released.append(job_id)
-        return orig_release(job_id, worker)
+
+def test_restart_resumes_encoded_job_straight_to_upload(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    leave_job(conn, store, pc, root, vid, "encoded")
 
     def must_not_encode(*a, **k):
-        raise AssertionError("encode must wait until the files were cleaned")
+        raise AssertionError("an encoded job must not be encoded again")
 
-    monkeypatch.setattr(pc.client, "release", spy_release)
     pc.encode = must_not_encode
-    monkeypatch.setattr(pc.client, "claim", lambda *a, **k: pc.stop(now=False) or {
-        "job": None, "retry_after": 0.01})
+    monkeypatch.setattr(pc.download_rclone, "download", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("an encoded job must not be downloaded again")))
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        assert wait_for(lambda: pc.done == 1)
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_resume_unreachable_keeps_local_files(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    leave_job(conn, store, pc, root, vid, "downloaded")
+    files = sorted(pc.cfg.workdir.iterdir())
+    calls = []
+    orig_resume = pc.client.resume
+
+    def flaky(worker, encoder, download_account, jobs):
+        calls.append(jobs)
+        assert sorted(pc.cfg.workdir.iterdir()) == files  # nothing deleted meanwhile
+        if len(calls) <= 2:
+            raise JobServiceError("job service down")
+        return orig_resume(worker, encoder, download_account, jobs)
+
+    monkeypatch.setattr(pc.client, "resume", flaky)
+    claims = []
+    orig_claim = pc.client.claim
+    monkeypatch.setattr(pc.client, "claim", lambda *a, **k: (
+        claims.append(len(calls)), orig_claim(*a, **k))[1])
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        assert len(calls) == 3
+        assert calls[0] == [{"id": vid, "size": db.get(conn, vid)["size"],
+                             "modtime": db.get(conn, vid)["modtime"],
+                             "reserve_secs": 7 * 86400}]
+        assert claims and min(claims) == 3  # the downloader waited for the answer
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_resume_unreachable_then_stop_deletes_nothing(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    leave_job(conn, store, pc, root, vid, "downloaded")
+    files = sorted(pc.cfg.workdir.iterdir())
+
+    def down(*a, **k):
+        pc.stop(now=True)
+        raise JobServiceError("job service down")
+
+    monkeypatch.setattr(pc.client, "resume", down)
+    claims = stop_on_claim(pc, monkeypatch)
     t = run_in_thread(pc)
     t.join(15)
     assert not t.is_alive()
-    assert released == [vid]
+    assert claims == []
+    assert sorted(pc.cfg.workdir.iterdir()) == files
+    assert_reserved(conn, vid)
+
+
+def test_refused_resume_deletes_local_files(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    leave_job(conn, store, pc, root, vid, "downloaded")
+    db.mark(conn, vid, "leased", worker="other", encoder="nvenc")  # someone else has it
+    conn.commit()
+    released = []
+    monkeypatch.setattr(pc.client, "release", lambda job_id, worker: released.append(job_id))
+    stop_on_claim(pc, monkeypatch)
+    t = run_in_thread(pc)
+    t.join(15)
+    assert not t.is_alive()
+    assert not list(pc.cfg.workdir.glob(f"{vid}.*"))
+    assert released == []
+    assert db.get(conn, vid)["worker"] == "other"
+
+
+def test_partial_download_released_on_start(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    leave_job(conn, store, pc, root, vid, "partial")
+    stray = pc.cfg.workdir / "999999.src"
+    stray.write_bytes(b"a job that no longer exists")
+    resumes = []
+    monkeypatch.setattr(pc.client, "resume", lambda *a, **k: resumes.append(a))
+    stop_on_claim(pc, monkeypatch)
+    t = run_in_thread(pc)
+    t.join(15)
+    assert not t.is_alive()
+    assert resumes == []  # nothing left to resume
     row = db.get(conn, vid)
-    assert (row["stage"], row["worker"], row["reserve_secs"]) == ("queued", None, None)
-    assert not any(f.exists() for f in leftovers)
+    assert (row["stage"], row["worker"], row["attempts"]) == ("queued", None, 0)
+    assert not list(pc.cfg.workdir.glob(f"{vid}.*")) and not stray.exists()
+
+
+def test_claims_never_send_resume(conn, setup, monkeypatch):
+    root, pc, store = setup
+    resumes = []
+    orig_claim = pc.client.claim
+
+    def spy_claim(worker, encoder, download_account="main", resume=False, **filters):
+        resumes.append(resume)
+        return orig_claim(worker, encoder, download_account=download_account, resume=resume,
+                          **filters)
+
+    monkeypatch.setattr(pc.client, "claim", spy_claim)
+    t = run_in_thread(pc)
+    assert wait_for(lambda: len(resumes) >= 2)
+    pc.stop(now=True)
+    t.join(10)
+    assert not any(resumes)
 
 
 def test_resume_full_size_src_without_marker_is_downloaded_again(conn, cfg, setup, monkeypatch):
@@ -1179,25 +1474,6 @@ def test_resume_cleans_stale_files_of_another_job_at_start(conn, setup):
     assert wait_for(lambda: not stale.exists())
     pc.stop(now=True)
     t.join(10)
-
-
-def test_first_claim_after_start_sends_resume_true_then_false(conn, setup, monkeypatch):
-    root, pc, store = setup
-    orig_claim = pc.client.claim
-    resumes = []
-
-    def spy_claim(worker, encoder, download_account="main", resume=False, **filters):
-        resumes.append(resume)
-        return orig_claim(worker, encoder, download_account=download_account, resume=resume,
-                          **filters)
-
-    monkeypatch.setattr(pc.client, "claim", spy_claim)
-    t = run_in_thread(pc)
-    assert wait_for(lambda: len(resumes) >= 2)
-    pc.stop(now=True)
-    t.join(10)
-    assert resumes[0] is True
-    assert all(r is False for r in resumes[1:])
 
 
 # --- cloud worker settings ---------------------------------------------------
@@ -1322,24 +1598,6 @@ def test_auth_alert_names_the_download_remote(tmp_path, monkeypatch):
     pc.run()
     assert len(client.alerts) == 1
     assert client.alerts[0][1].startswith("Drive login failed for gdrive-cloud:;")
-
-
-def test_failed_first_claim_keeps_resume_for_the_next(tmp_path, monkeypatch):
-    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
-    calls = []
-    pc = None
-
-    def claim():
-        calls.append(1)
-        if len(calls) == 1:
-            raise JobServiceError("tailscale not up yet")
-        pc.stop(now=False)
-        return {"job": None, "retry_after": 0.01}
-
-    pc = fake_pc(tmp_path, client=FakeClient(claim=claim), idle_secs=0.01)
-    pc.run()
-    assert [c["resume"] for c in pc.client.claims] == [True, True]
-    assert len(calls) == 2
 
 
 def test_empty_bwlimit_adds_no_flag():
