@@ -47,9 +47,10 @@ def test_rclone_lists_non_ascii_names_under_cp1252(tmp_path, cp1252, cancellable
 
 def test_spawn_kwargs_current_platform():
     if sys.platform == "win32":
-        assert procflags.spawn_kwargs() == {"creationflags": subprocess.CREATE_NO_WINDOW}
+        base = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        assert procflags.spawn_kwargs() == {"creationflags": base}
         assert procflags.spawn_kwargs(new_group=True) == {
-            "creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+            "creationflags": base | subprocess.CREATE_NEW_PROCESS_GROUP}
     else:
         assert procflags.spawn_kwargs() == {}
         assert procflags.spawn_kwargs(new_group=True) == {"start_new_session": True}
@@ -59,8 +60,9 @@ def test_spawn_kwargs_win32(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
     monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False)
-    assert procflags.spawn_kwargs() == {"creationflags": 0x08000000}
-    assert procflags.spawn_kwargs(new_group=True) == {"creationflags": 0x08000200}
+    monkeypatch.setattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000, raising=False)
+    assert procflags.spawn_kwargs() == {"creationflags": 0x08004000}
+    assert procflags.spawn_kwargs(new_group=True) == {"creationflags": 0x08004200}
 
 
 class _Done:
