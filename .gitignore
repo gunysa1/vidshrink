@@ -6,3 +6,7 @@ work/
 .pytest-tmp/
 .worktrees/
 serve.token
+
+# local logs and reports
+*.log
+reports/

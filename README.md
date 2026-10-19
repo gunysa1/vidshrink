@@ -1,66 +1,119 @@
 # vidshrink
 
-Re-encodes the videos on `gdrive:` that save the most space per hour of encoding to HEVC,
-and replaces each original in place after automated checks. The original goes to Drive's trash.
+vidshrink shrinks a large Google Drive video library by re-encoding it to HEVC.
+Files that save the most space per hour of encoding go first. Each original is
+replaced in place, and only after automated checks pass. The replaced original goes
+to Drive's trash, not straight to deletion.
 
-Design: `docs/superpowers/specs/2026-09-27-vidshrink-design.md`
+It is built for one library on one Drive account, accessed through
+[rclone](https://rclone.org). It runs unattended for months alongside a Plex server
+that reads the same Drive.
 
-## Setup
+## How it works
 
-vidshrink needs `ffmpeg`/`ffprobe` on `PATH`. Either install the distro package:
-
-```bash
-sudo apt-get install -y ffmpeg
+```
+                 ┌──────────────── home server ────────────────┐
+ gdrive: ◀──────▶│ vidshrink run    x265 encodes, swaps, deletes│
+  (rclone)       │ vidshrink serve  job service (HTTP + token)  │
+                 │ state.db         SQLite, the source of truth │
+                 └───────────▲──────────────────▲───────────────┘
+                     LAN     │                  │ Tailscale
+                 ┌───────────┴─────┐   ┌────────┴─────────────┐
+                 │ Windows PC       │   │ cloud VM (Oracle A1) │
+                 │ NVENC, tray app  │   │ x265, systemd unit   │
+                 └──────────────────┘   └──────────────────────┘
 ```
 
-or drop a static build in `~/.local/bin` (useful when apt isn't available yet). The
-systemd unit below adds `~/.local/bin` to `PATH` so either source works.
+1. **Scan.** `vidshrink scan` lists the library, probes each new or changed file
+   with ffprobe and ranks it by expected GB saved per encode hour.
+2. **Encode.** The server's worker (`vidshrink run`) takes the best job, downloads
+   it, encodes it with x265 and verifies the result: duration, every stream, a full
+   clean decode, and at least 20% smaller. Then it uploads a temporary file next to
+   the original.
+3. **Swap.** Only the server swaps: it checks that the original is unchanged,
+   moves it to Drive's trash, and renames the temporary file into its place.
+4. **Remote workers.** A Windows PC (NVENC) and a cloud VM (x265) can lease jobs from
+   the server's job service. They download, encode, verify and upload the temporary
+   file themselves, then report back. The server checks the upload on Drive and does
+   the swap. Remote workers never delete or replace originals.
+
+More detail: [docs/architecture.md](docs/architecture.md).
+
+## Safety rules
+
+- Only the server ever deletes or replaces an original, and only after its own
+  checks on Drive. Deletes go to the Drive trash.
+- A remote worker may delete only its own `.vidshrink-tmp.mkv`, and only one it can
+  prove it uploaded (size and md5 match its report).
+- Daily Drive budgets are kept per account (uploads 700 GB; main-account downloads
+  500 GB, shared with Plex). A `downloadQuotaExceeded` error pauses downloads for 12 h.
+- Dolby Vision, interlaced, already-efficient (HEVC/AV1) and low-bitrate files are
+  skipped.
+
+## Requirements
+
+- Python 3.11 or newer
+- rclone with a configured Google Drive remote (default name `gdrive:`)
+- ffmpeg and ffprobe on `PATH`; the server uses a BtbN n9.0.2 static build
+- Linux with systemd user units for the server. The PC worker runs on Windows, the
+  cloud worker on Linux (x86 or ARM).
+
+## Quick start (server)
 
 ```bash
 uv venv .venv && uv pip install --python .venv/bin/python -e '.[dev]'
-.venv/bin/pytest -q
+.venv/bin/pytest -q                          # tests never touch a real Drive
+
+.venv/bin/vidshrink scan                     # list, probe and rank (read-only on Drive)
+.venv/bin/vidshrink status                   # queue, projections, failures, budgets
+.venv/bin/vidshrink run --dry-run --limit 3  # encode and upload tmp files only
+.venv/bin/vidshrink run --limit 10           # replace 10 files
 ```
 
-## Use
-
-Before the first live run, optionally list Drive's duplicate names (Drive allows several
-files with the same name in one folder; vidshrink skips those paths). This changes nothing:
-
-```bash
-rclone dedupe --dedupe-mode list gdrive:
-```
-
-```bash
-.venv/bin/vidshrink scan                    # list + probe + rank (read-only on Drive)
-.venv/bin/vidshrink status                  # queue, projections, failures, today's upload
-.venv/bin/vidshrink run --dry-run --limit 3 # upload *.vidshrink-tmp.mkv next to originals
-.venv/bin/vidshrink run --limit 10          # replace 10 files
-```
-
-
-## Drive download quota (shared with Plex)
-
-Google limits how much one account can download per day, and the Plex `rclone mount`
-uses the same account. vidshrink therefore caps its own downloads at
-`daily_download_limit` (500 GB per Pacific day by default):
-
-- `scan` reads only what ffprobe asks for (1 MB chunks, no read-ahead), measures the
-  bytes actually served, and stops when the cap is reached, leaving the rest for the
-  next scan.
-- `run` charges each whole-file download to the same cap and waits for the next day
-  when it is used up.
-- If Drive answers `downloadQuotaExceeded`, both stop downloading for 12 h.
-
-`vidshrink status` shows "Downloaded today". In September 2026 an uncapped scan used up
-the quota and locked Plex out for about a day.
-
-## Service
+To run it as a service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp deploy/vidshrink.service ~/.config/systemd/user/
+cp deploy/vidshrink.service deploy/vidshrink-serve.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now vidshrink
-sudo loginctl enable-linger "$USER"         # keep running after logout
+systemctl --user enable --now vidshrink vidshrink-serve
+sudo loginctl enable-linger "$USER"          # keep running after logout
 journalctl --user -u vidshrink -f
 ```
+
+Settings live in `src/vidshrink/config.py` (`Config`): remote name, excluded
+folders, CRF and preset, size limits, daily budgets and lease times.
+
+## Commands
+
+| Command | Where | What it does |
+|---|---|---|
+| `vidshrink scan` | server | list, probe and rank the library |
+| `vidshrink run [--limit N] [--dry-run]` | server | encode, verify and swap, best first |
+| `vidshrink status` | server | stages, queue, workers, alerts, today's budgets |
+| `vidshrink serve` | server | job service for remote workers |
+| `vidshrink token` | server | print the job-service token |
+| `vidshrink pc-worker [--config PATH]` | PC / cloud | headless remote worker |
+| `vidshrink tray` | PC | tray app with Start / Stop now / Stop after this file |
+| `vidshrink calibrate` | PC | pick the NVENC CQ that matches x265 quality (VMAF) |
+
+## Documentation
+
+- [docs/architecture.md](docs/architecture.md): components, job lifecycle, scoring,
+  budgets and the job-service API
+- [docs/operations.md](docs/operations.md): day-to-day running, restarts, requeues
+  and troubleshooting
+- [docs/pc-setup.md](docs/pc-setup.md): set up the Windows NVENC worker
+- [docs/cloud-worker-setup.md](docs/cloud-worker-setup.md): set up the cloud x265
+  worker (Oracle Cloud Always Free)
+- `docs/superpowers/specs/`: design documents, one per feature
+- `docs/superpowers/plans/`: the implementation plans built from them
+
+## Tests
+
+```bash
+.venv/bin/pytest -q
+```
+
+The suite uses local rclone remotes and short generated clips. It never touches a
+real Drive. The full run takes about 12 minutes.

@@ -61,22 +61,16 @@ picks the right one), then check `rclone version`.
 
 ### vidshrink
 
-The repo has no remote: the code is pushed from the server, which already has SSH access
-to the VM (the VM gets no access to the server). On the VM:
+The code is public on GitHub, so the VM clones it directly (the VM needs no access to the server):
 
 ```bash
 sudo apt install -y python3-venv git xz-utils
-git init ~/vidshrink
-git -C ~/vidshrink config receive.denyCurrentBranch updateInstead
+git clone https://github.com/gunysa1/vidshrink.git ~/vidshrink
 ```
 
-Then, on the server, from the vidshrink checkout (repeat the push to update the VM):
+To update the VM later: `git -C ~/vidshrink pull`, then restart the unit.
 
-```bash
-git push ubuntu@<vm>:vidshrink master
-```
-
-Back on the VM:
+Then:
 
 ```bash
 cd ~/vidshrink
