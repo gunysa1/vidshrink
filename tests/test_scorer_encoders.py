@@ -1,3 +1,5 @@
+import pytest
+
 from dataclasses import replace
 
 from vidshrink import db, scorer
@@ -39,3 +41,27 @@ def test_expected_hours_and_score(conn):
 def test_legacy_family_nvenc(conn):
     assert scorer.ratio_for(conn, "legacy", "nvenc") == 0.70 * 0.85
     assert scorer.expected_hours(conn, replace(P, width=640, height=480), "nvenc") == 0.05
+
+
+def test_cloud_ratio_shares_x265_keys(conn):
+    scorer.learn_result(conn, P, 10e9, 4e9, 3600, "x265-cloud")
+    assert scorer.ratio_for(conn, "h264", "x265") == pytest.approx(0.575)  # default prior 0.55 blended with 0.6
+    assert scorer.ratio_for(conn, "h264", "x265-cloud") == pytest.approx(0.575)
+
+
+def test_cloud_speed_has_own_keys(conn):
+    scorer.learn_result(conn, P, 10e9, 4e9, 2 * P.duration, "x265-cloud")
+    assert scorer.speed_for(conn, "1080p", "x265-cloud") == pytest.approx(2.275)  # (2.55 prior + 2.0) / 2
+    assert scorer.speed_for(conn, "1080p", "x265") == scorer.DEFAULT_SPEED["1080p"]
+
+
+def test_x265_speed_leaves_cloud_speed_default(conn):
+    scorer.learn_result(conn, P, 10e9, 4e9, 2 * P.duration, "x265")
+    assert scorer.speed_for(conn, "1080p", "x265-cloud") == pytest.approx(
+        scorer.DEFAULT_SPEED["1080p"] * 1.5)
+
+
+def test_cloud_default_speed_is_slower(conn):
+    for r in scorer.DEFAULT_SPEED:
+        assert scorer.speed_for(conn, r, "x265-cloud") == pytest.approx(
+            scorer.DEFAULT_SPEED[r] * 1.5)

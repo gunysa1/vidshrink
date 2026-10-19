@@ -496,8 +496,8 @@ class Worker:
             self.log(f"SWAP FAILED, original kept: {row['path']}: {e}")
             return
         # The original is already in Drive's trash; the encode may be the only copy.
-        # A PC encode (nvenc) only ever existed here as the Drive tmp, never locally.
-        kept = (tmp_path(row["path"]) + " on Drive" if row["encoder"] == "nvenc"
+        # A remote encode (PC or cloud) only ever existed here as the Drive tmp, never locally.
+        kept = (tmp_path(row["path"]) + " on Drive" if row["encoder"] in scorer.REMOTE_ENCODERS
                 else self._out(row["id"]))
         db.mark(self.conn, row["id"], "swapping", reason=f"swap: needs attention: {e}"[:500])
         self.log(f"!!! SWAP NEEDS ATTENTION: original of {row['path']} is gone and the "

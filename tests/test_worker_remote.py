@@ -30,11 +30,11 @@ def env(conn, cfg, make_clip):
     return root, worker
 
 
-def as_remote_ready(conn, root, md5=PC_MD5):
+def as_remote_ready(conn, root, md5=PC_MD5, encoder="nvenc"):
     row = db.get_by_path(conn, "Movies/a.mkv")
     (root / "Movies" / "a.vidshrink-tmp.mkv").write_bytes(PC_OUT)
     db.mark(conn, row["id"], "remote_ready", out_size=len(PC_OUT), out_md5=md5,
-            encode_secs=7.0, final_path="Movies/a.mkv", encoder="nvenc")
+            encode_secs=7.0, final_path="Movies/a.mkv", encoder=encoder)
     return row["id"]
 
 
@@ -47,6 +47,17 @@ def test_server_swaps_verified_pc_result(conn, env):
     assert db.get(conn, vid)["stage"] == "done"
     assert scorer.speed_for(conn, "sd", "nvenc") != scorer.DEFAULT_SPEED_NVENC["sd"]
     assert scorer.speed_for(conn, "sd") == scorer.DEFAULT_SPEED["sd"]
+
+
+def test_server_swaps_verified_cloud_result(conn, env):
+    root, worker = env
+    vid = as_remote_ready(conn, root, encoder="x265-cloud")
+    assert worker.run(limit=1) == 1
+    assert (root / "Movies" / "a.mkv").read_bytes() == PC_OUT
+    assert db.get(conn, vid)["stage"] == "done"
+    assert scorer.speed_for(conn, "sd", "x265-cloud") != scorer.DEFAULT_SPEED["sd"] * 1.5
+    assert scorer.speed_for(conn, "sd") == scorer.DEFAULT_SPEED["sd"]
+    assert scorer.speed_for(conn, "sd", "nvenc") == scorer.DEFAULT_SPEED_NVENC["sd"]
 
 
 def test_server_rejects_mismatched_pc_result(conn, env):
