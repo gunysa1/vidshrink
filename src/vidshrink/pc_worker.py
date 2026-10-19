@@ -10,14 +10,16 @@ import threading
 import time
 import tomllib
 import traceback
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from vidshrink.config import Config
 from vidshrink.encode import (EncodeCancelled, EncodeError, build_command,
                               build_nvenc_command, run_encode_cancellable)
 from vidshrink.jobs import JobClient, JobServiceError, LeaseLost
+from vidshrink.local_queue import LocalJob, LocalQueue
 from vidshrink.paths import md5_file, tmp_path
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
 from vidshrink.rclone import Rclone, RcloneError, TMP_SUFFIX, TransferCancelled
@@ -201,7 +203,25 @@ class _LocalFault(Exception):
 EncodeFn = Callable[[Path, Path, Probe, Path, threading.Event], float]
 
 
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+
+# Local states of a held job that is waiting in a stage's queue rather than being
+# worked on: a server cancel can drop it at once, since no stage owns it.
+_IDLE_STATES = ("downloaded", "encoded")
+_LEFTOVER_JOB = re.compile(r"^(\d+)\.job\.json$")
+
+
 class PCWorker:
+    """Three stage threads, one job at a time each -- download, encode, then
+    verify+upload+report -- with on-disk queues between them (LocalQueue), plus
+    one heartbeat thread covering every held job."""
+
     def __init__(self, cfg: PCConfig, client: JobClient, rclone: Rclone,
                  encode: EncodeFn | None = None, log: Callable[[str], None] = print,
                  download_rclone: Rclone | None = None):
@@ -216,17 +236,36 @@ class PCWorker:
                                  or ("pc" if cfg.download_remote else "main"))
         self.encode = encode or (self._nvenc if cfg.encoder == "nvenc" else self._x265)
         self.log = log
-        self.state = "idle"
-        self.stage = ""
-        self.current_path: str | None = None
         self.done = 0
         # (bytes downloaded today, daily limit) from the server's last claim/heartbeat
         # answer, for the tray's status; None until the server has told us.
         self.download_today: tuple[float, float] | None = None
+        server = Config()
+        # The prefetch limits. The claim filter reads them from here too, so the
+        # two can never disagree.
+        self.queue = LocalQueue(cfg.workdir, int(cfg.queue_disk_gb * 1e9), cfg.queue_hours,
+                                server.disk_factor, server.disk_reserve)
+        # After Drive's upload limit the server blocks uploads this long; so do we.
+        self.upload_pause_secs = server.rate_limit_block_secs
+        self._phase = "new"  # "new", "running", "stopped"
         self._stop_now = threading.Event()
         self._stop_after = threading.Event()
-        self._wake = threading.Event()  # wakes an idle wait promptly on either stop mode
-        self._current_cancel: threading.Event | None = None  # the running job's cancel, if any
+        # Wakes the downloader's idle wait promptly: either stop mode, or the queue
+        # changed (a job moved on or was dropped, so there may be room to claim).
+        self._wake = threading.Event()
+        # Guards everything below plus every local state change, so a server cancel
+        # and a stage taking a job never race.
+        self._cv = threading.Condition(threading.RLock())
+        self._jobs: dict[int, LocalJob] = {}
+        self._cancels: dict[int, threading.Event] = {}
+        self._reserved: set[int] = set()  # ids the server holds as reservations
+        self._to_encode: deque[LocalJob] = deque()  # downloaded, oldest first
+        self._to_upload: deque[LocalJob] = deque()  # encoded, oldest first
+        self._encoder_done = threading.Event()
+        self._upload_stage = ""  # "verifying" or "uploading" while the uploader works
+        self._uploads_paused_until = 0.0  # time.monotonic() deadline
+        self._fault_exc: _LocalFault | None = None
+        self._claim_not_before = 0.0  # time.monotonic(); see _back_off_claims
         # Consecutive unexpected (catch-all) errors per job id, in memory: a job that
         # keeps raising something we didn't anticipate gets released once, then
         # reported failed (poison-job guard) rather than released forever.
@@ -238,20 +277,111 @@ class PCWorker:
 
     # --- control -------------------------------------------------------------
     def stop(self, now: bool) -> None:
-        if now:
-            self._stop_now.set()
-            cancel = self._current_cancel
-            if cancel is not None:
-                cancel.set()
-        else:
-            self._stop_after.set()
-            if self.state == "working":
-                self.state = "finishing"
+        with self._cv:
+            if now:
+                self._stop_now.set()
+                for cancel in self._cancels.values():
+                    cancel.set()
+            else:
+                self._stop_after.set()
+                # Jobs that never started encoding are released on Stop after, so
+                # the running download has no point any more.
+                for jid, lj in self._jobs.items():
+                    if lj.state == "downloading":
+                        self._cancels[jid].set()
+            self._cv.notify_all()
         self._wake.set()
+
+    def _stopping(self) -> bool:
+        return self._stop_now.is_set() or self._stop_after.is_set()
 
     def _check(self, cancel: threading.Event) -> None:
         if cancel.is_set():
             raise _Abandon()
+
+    def _fault(self, e: _LocalFault) -> None:
+        """A local fault in any stage stops every stage; run() sends the alert."""
+        self.log(f"stopping: local fault: {e}")
+        with self._cv:
+            if self._fault_exc is None:
+                self._fault_exc = e
+        self.stop(now=True)
+
+    def _wait_stop(self, secs: float) -> bool:
+        """Wait up to secs, waking early on either stop mode; True iff woken early."""
+        end = time.monotonic() + secs
+        while (remaining := end - time.monotonic()) > 0:
+            if self._stop_now.wait(min(remaining, 0.2)) or self._stop_after.is_set():
+                return True
+        return False
+
+    def _idle(self, secs: float) -> None:
+        """The downloader's wait: ends early on a stop or a queue change."""
+        self._wake.wait(secs)
+        self._wake.clear()
+
+    # --- status ----------------------------------------------------------------
+    @property
+    def state(self) -> str:
+        if self._phase == "stopped":
+            return "stopped"
+        if self._phase == "running" and self._stop_after.is_set():
+            return "finishing"
+        return "working" if self._snapshot() else "idle"
+
+    def _snapshot(self) -> list[LocalJob]:
+        with self._cv:
+            return list(self._jobs.values())
+
+    def _focus(self) -> tuple[str, LocalJob | None]:
+        """The encoder's job, or the most active stage's when nothing encodes."""
+        jobs = self._snapshot()
+        for state in ("encoding", "uploading", "downloading"):
+            for lj in jobs:
+                if lj.state == state:
+                    stage = (self._upload_stage or state) if state == "uploading" else state
+                    return stage, lj
+        return ("waiting for work" if self._phase == "running" else ""), None
+
+    @property
+    def stage(self) -> str:
+        """Compatibility for the tray: see _focus."""
+        return self._focus()[0]
+
+    @property
+    def current_path(self) -> str | None:
+        lj = self._focus()[1]
+        return lj.job.get("path") if lj is not None else None
+
+    def status_line(self) -> str:
+        """Every stage at once, e.g. "Encoding X (3 waiting) · Uploading Y"."""
+        jobs = self._snapshot()
+
+        def name(lj: LocalJob) -> str:
+            return PurePosixPath(lj.job.get("path", "")).name
+
+        def having(state: str) -> list[LocalJob]:
+            return [lj for lj in jobs if lj.state == state]
+
+        parts = []
+        waiting = len(having("downloaded"))
+        encoding = having("encoding")
+        if encoding:
+            parts.append(f"Encoding {name(encoding[0])}"
+                         + (f" ({waiting} waiting)" if waiting else ""))
+        elif waiting:
+            parts.append(f"{waiting} downloaded waiting")
+        parts += [f"Downloading {name(lj)}" for lj in having("downloading")]
+        parts += [f"{(self._upload_stage or 'uploading').title()} {name(lj)}"
+                  for lj in having("uploading")]
+        encoded = len(having("encoded"))
+        if encoded and time.monotonic() < self._uploads_paused_until:
+            parts.append(f"Uploads paused ({encoded} waiting)")
+        elif encoded:
+            parts.append(f"{encoded} encoded waiting")
+        if not parts and self._phase == "running":
+            parts.append("Waiting for work")
+        return " · ".join(parts)
 
     # --- startup --------------------------------------------------------------
     def _missing_tools(self) -> list[str]:
@@ -260,59 +390,86 @@ class PCWorker:
         return [name for name in ("ffmpeg", "ffprobe", self.cfg.rclone)
                 if shutil.which(name) is None]
 
+    def _startup(self) -> None:
+        """Nothing from a previous run is reused. Its leases (found by their
+        `.job.json`) are released first, so a reserved file isn't left blocked for
+        days, then every work file is deleted."""
+        self.cfg.workdir.mkdir(parents=True, exist_ok=True)
+        try:
+            names = [p.name for p in self.cfg.workdir.iterdir()]
+        except OSError:
+            names = []
+        for name in names:
+            m = _LEFTOVER_JOB.match(name)
+            if m:
+                try:
+                    self.client.release(int(m.group(1)), self.cfg.worker_name)
+                except (LeaseLost, JobServiceError):
+                    pass  # not ours any more, or the server is down: it expires
+        deleted = clean_workdir(self.cfg.workdir, set())
+        if deleted:
+            self.log(f"cleaned stale work files: {', '.join(p.name for p in deleted)}")
+
+    def _on_stopped(self) -> None:
+        """Every stage has exited: release each job still held and delete its files."""
+        for lj in self._snapshot():
+            self._abandon(lj.job, None, None)
+            self._forget(lj)
+
     # --- loop ---------------------------------------------------------------
     def run(self) -> None:
+        """Returns once every stage thread has exited."""
         missing = self._missing_tools()
         if missing:
             self.log(f"required tool(s) not found on PATH: {', '.join(missing)}")
-            self.state = "stopped"
+            self._phase = "stopped"
             return
-        self.cfg.workdir.mkdir(parents=True, exist_ok=True)
-        first_claim = True
+        self._phase = "running"
         try:
-            while not self._stop_now.is_set() and not self._stop_after.is_set():
-                resume = first_claim
+            self._startup()
+            stages = [threading.Thread(target=self._stage, args=(fn,), daemon=True,
+                                       name=f"vidshrink{fn.__name__}")
+                      for fn in (self._downloader, self._encoder, self._uploader)]
+            hb_stop = threading.Event()
+            hb = threading.Thread(target=self._heartbeat, args=(hb_stop,), daemon=True,
+                                  name="vidshrink_heartbeat")
+            for t in (*stages, hb):
+                t.start()
+            for t in stages:
+                t.join()
+            hb_stop.set()
+            hb.join(5)
+            self._on_stopped()
+            e = self._fault_exc
+            if e is not None:
                 try:
-                    # Only passed when set, so the PC's claim is exactly what it always was.
-                    extra = {}
-                    if self.cfg.disk_check:
-                        extra["free_bytes"] = shutil.disk_usage(self.cfg.workdir).free
-                    if self.cfg.max_hours > 0:
-                        extra["max_hours"] = self.cfg.max_hours
-                    resp = self.client.claim(self.cfg.worker_name, self.cfg.encoder,
-                                             download_account=self.download_account,
-                                             resume=resume, **extra)
-                except JobServiceError as e:
-                    self.log(f"job service unreachable, retrying: {e}")
-                    self._wake.wait(self.cfg.idle_secs)
-                    self._wake.clear()
-                    continue
-                first_claim = False  # only a claim that got an answer uses up resume
-                self._note_download_today(resp)
-                job = resp.get("job")
-                if job is None:
-                    self.stage = "waiting for work"
-                    wait = min(resp.get("retry_after") or self.cfg.idle_secs, self.cfg.idle_secs)
-                    self._wake.wait(wait)
-                    self._wake.clear()
-                    continue
-                self.state = "finishing" if self._stop_after.is_set() else "working"
-                try:
-                    self._do_job(job)
-                except _LocalFault as e:
-                    self.log(f"stopping: local fault: {e}")
-                    try:
-                        self.client.alert(self.cfg.worker_name,
-                                          e.alert or f"Local fault, worker stopped: {e}")
-                    except (JobServiceError, LeaseLost):
-                        pass  # best-effort: the worker stops either way
-                    return
-                except Exception as e:
-                    self._handle_unexpected(job, e)
-                self.state = "idle"
+                    self.client.alert(self.cfg.worker_name,
+                                      e.alert or f"Local fault, worker stopped: {e}")
+                except (JobServiceError, LeaseLost):
+                    pass  # best-effort: the worker stops either way
         finally:
-            self.state = "stopped"
-            self.stage = ""
+            self._phase = "stopped"
+
+    def _stage(self, loop: Callable[[], None]) -> None:
+        try:
+            loop()
+        except Exception as e:  # a bug in the loop itself, not in one job
+            tb = "".join(traceback.format_exception_only(type(e), e)).strip()
+            self._fault(_LocalFault(f"{loop.__name__} crashed: {tb}"))
+
+    def _run_job(self, lj: LocalJob, step: Callable[[LocalJob], None]) -> None:
+        """One stage's work on one job. A local fault stops every stage; anything
+        unanticipated goes through the poison-job guard for this job alone."""
+        try:
+            step(lj)
+        except _LocalFault as e:
+            self._fault(e)
+        except Exception as e:
+            # Back off first: forgetting wakes the downloader. And forget before
+            # the release, after which this id may be claimed again.
+            self._back_off_claims()
+            self._forget(lj)
+            self._handle_unexpected(lj.job, e)
 
     def _handle_unexpected(self, job: dict, e: Exception) -> None:
         """Never let a bug in one job take the whole worker down. The first time a
@@ -340,9 +497,395 @@ class PCWorker:
                 self.client.release(job_id, self.cfg.worker_name)
             except (LeaseLost, JobServiceError):
                 pass
-        self._wake.wait(self.cfg.idle_secs)
-        self._wake.clear()
+        self._back_off_claims()
 
+    def _back_off_claims(self) -> None:
+        """Hold the next claim for idle_secs, so a failing job isn't re-claimed in
+        a tight loop; the other stages carry on meanwhile."""
+        self._claim_not_before = time.monotonic() + self.cfg.idle_secs
+
+    # --- held jobs -----------------------------------------------------------
+    def _hold(self, job: dict) -> LocalJob:
+        with self._cv:
+            lj = self.queue.add(job)
+            cancel = threading.Event()
+            if self._stop_now.is_set():
+                cancel.set()
+            self._jobs[lj.id] = lj
+            self._cancels[lj.id] = cancel
+        return lj
+
+    def _held(self, lj: LocalJob) -> bool:
+        return self._jobs.get(lj.id) is lj
+
+    def _cancel_of(self, lj: LocalJob) -> threading.Event:
+        with self._cv:
+            if self._held(lj):
+                return self._cancels[lj.id]
+        gone = threading.Event()
+        gone.set()
+        return gone
+
+    def _set_state(self, lj: LocalJob, state: str) -> bool:
+        """False if the job was dropped meanwhile (a server cancel)."""
+        with self._cv:
+            if not self._held(lj):
+                return False
+            try:
+                self.queue.set_state(lj.id, state)
+            except KeyError:
+                return False
+        self._wake.set()
+        return True
+
+    def _forget(self, lj: LocalJob) -> None:
+        """Drop the job locally and delete its files. A no-op if it is already gone
+        (it may even have been claimed again since, under the same id)."""
+        with self._cv:
+            if not self._held(lj):
+                return
+            del self._jobs[lj.id]
+            self._cancels.pop(lj.id, None)
+            self._reserved.discard(lj.id)
+            self.queue.forget(lj.id)
+        self._wake.set()
+
+    def _push(self, queue: deque, lj: LocalJob, front: bool = False) -> None:
+        with self._cv:
+            if front:
+                queue.appendleft(lj)
+            else:
+                queue.append(lj)
+            self._cv.notify_all()
+
+    def _take(self, queue: deque, state: str) -> LocalJob | None:
+        """The next job still held and not cancelled, moved to `state`; else wait
+        briefly for one and return None."""
+        with self._cv:
+            while queue:
+                lj = queue.popleft()
+                cancel = self._cancels.get(lj.id)
+                if (self._held(lj) and cancel is not None and not cancel.is_set()
+                        and self._set_state(lj, state)):
+                    return lj
+            self._cv.wait(0.5)
+            return None
+
+    def _server_cancel(self, job_id: int, why: str) -> None:
+        """The server no longer holds job_id for us: cancel only that job's stage
+        work. A job waiting in a queue is dropped here; a stage drops its own."""
+        with self._cv:
+            lj = self._jobs.get(job_id)
+            if lj is None:
+                return
+            self.log(f"{why}: {lj.job.get('path')}")
+            self._cancels[job_id].set()
+            if lj.state in _IDLE_STATES:
+                self._forget(lj)
+
+    # --- download stage -------------------------------------------------------
+    def _free_bytes(self) -> int:
+        return shutil.disk_usage(self.cfg.workdir).free
+
+    def _claim_filters(self) -> dict | None:
+        """Extra claim arguments, or None while the queue is full. With the queue
+        empty they are exactly what they always were; otherwise free_bytes and
+        max_hours shrink to the room left under the queue's own limits."""
+        jobs = self._snapshot()
+        extra = {}
+        if self.cfg.max_hours > 0:
+            extra["max_hours"] = self.cfg.max_hours
+        if not jobs:
+            if self.cfg.disk_check:
+                extra["free_bytes"] = self._free_bytes()
+            return extra
+        on_disk = sum(_file_size(lj.src) + _file_size(lj.out) for lj in jobs)
+        room = self.queue.queue_disk_bytes - on_disk
+        if room <= 0:
+            return None
+        extra["free_bytes"] = min(self._free_bytes(), room)
+        # The hours limit applies only behind the encoder (see LocalQueue.admits).
+        if any(lj.state in ("downloading", "downloaded") for lj in jobs):
+            hours = sum(float(lj.job.get("expected_hours") or 0.0) for lj in jobs
+                        if lj.state in ("downloading", "downloaded", "encoding"))
+            remaining = self.queue.queue_hours - hours
+            if remaining <= 0:
+                return None
+            extra["max_hours"] = min(remaining, extra.get("max_hours", remaining))
+        return extra
+
+    def _admits(self, job: dict) -> bool:
+        if not self._snapshot():
+            return True  # the first job into an empty queue always fits
+        return self.queue.admits(job["size"], float(job.get("expected_hours") or 0.0),
+                                 self._free_bytes())
+
+    def _downloader(self) -> None:
+        first_claim = True
+        while not self._stopping():
+            backoff = self._claim_not_before - time.monotonic()
+            if backoff > 0:
+                self._wait_stop(backoff)
+                continue
+            extra = self._claim_filters()
+            if extra is None:
+                self._idle(self.cfg.idle_secs)  # full: wait for a job to move on
+                continue
+            try:
+                resp = self.client.claim(self.cfg.worker_name, self.cfg.encoder,
+                                         download_account=self.download_account,
+                                         resume=first_claim, **extra)
+            except JobServiceError as e:
+                self.log(f"job service unreachable, retrying: {e}")
+                self._idle(self.cfg.idle_secs)
+                continue
+            first_claim = False  # only a claim that got an answer uses up resume
+            self._note_download_today(resp)
+            job = resp.get("job")
+            if job is None:
+                self._idle(min(resp.get("retry_after") or self.cfg.idle_secs,
+                               self.cfg.idle_secs))
+                continue
+            if self._stopping() or not self._admits(job):
+                # Stopped meanwhile, or the queue filled up after the filter was
+                # computed: hand it straight back.
+                try:
+                    self.client.release(job["id"], self.cfg.worker_name)
+                except (LeaseLost, JobServiceError):
+                    pass
+                if not self._stopping():
+                    self._idle(self.cfg.idle_secs)
+                continue
+            try:
+                lj = self._hold(job)
+            except OSError as e:  # can't even write its .job.json: a local fault
+                try:
+                    self.client.release(job["id"], self.cfg.worker_name)
+                except (LeaseLost, JobServiceError):
+                    pass
+                self._fault(_LocalFault(str(e)))
+                return
+            self._run_job(lj, self._download)
+
+    def _download(self, lj: LocalJob) -> None:
+        job, src = lj.job, lj.src
+        cancel = self._cancel_of(lj)
+        downloaded = self.cfg.workdir / f"{lj.id}.downloaded"
+        try:
+            path = job["path"]
+            # A fresh claim: nothing already on disk under this id is trustworthy.
+            for f in (src, downloaded, lj.out, self.cfg.workdir / f"{lj.id}.encoded"):
+                f.unlink(missing_ok=True)
+            self.log(f"downloading {path} ({job['size'] / 1e9:.1f} GB)")
+            self._check(cancel)
+            self._retry(lambda: self.download_rclone.download(path, src, cancel=cancel),
+                        cancel)
+            self._check(cancel)
+            if src.stat().st_size != job["size"]:
+                self._report(job, "changed")
+                self._forget(lj)
+                return
+            self._write_marker(downloaded, job["size"])
+        except Exception as e:
+            self._job_error(lj, e, remote=self.download_rclone.remote)
+            return
+        self._report_downloaded(lj)
+
+    def _report_downloaded(self, lj: LocalJob) -> None:
+        """Turn the lease into a reservation, then hand the job to the encoder."""
+        try:
+            self._retry_job_call(lambda: self.client.report(
+                lj.id, self.cfg.worker_name, "downloaded",
+                download_account=self.download_account,
+                reserve_secs=self.cfg.reserve_days * 86400))
+        except LeaseLost:
+            self.log(f"lease lost after downloading, dropping: {lj.job['path']}")
+            self._forget(lj)
+            return
+        except JobServiceError as e:
+            # Keep it: the next heartbeat tells us if the lease is gone.
+            self.log(f"could not report downloaded for {lj.job['path']}: {e}")
+        else:
+            with self._cv:
+                if self._held(lj):
+                    self._reserved.add(lj.id)
+        if self._set_state(lj, "downloaded"):
+            self._push(self._to_encode, lj)
+
+    # --- encode stage ---------------------------------------------------------
+    def _encoder(self) -> None:
+        try:
+            # Stop after: the encode already running finishes; no new one starts.
+            while not self._stopping():
+                lj = self._take(self._to_encode, "encoding")
+                if lj is not None:
+                    self._run_job(lj, self._encode_one)
+        finally:
+            self._encoder_done.set()
+            with self._cv:
+                self._cv.notify_all()
+
+    def _encode_one(self, lj: LocalJob) -> None:
+        job = lj.job
+        cancel = self._cancel_of(lj)
+        try:
+            probe = Probe(**job["probe"])
+            self.log(f"encoding {job['path']}")
+            self._check(cancel)
+            secs = self.encode(lj.src, lj.out, probe, lj.log, cancel)
+            self._write_marker(self.cfg.workdir / f"{lj.id}.encoded", secs)
+        except Exception as e:
+            self._job_error(lj, e)
+            return
+        if self._set_state(lj, "encoded"):
+            self._push(self._to_upload, lj)
+
+    # --- upload stage ---------------------------------------------------------
+    def _uploader(self) -> None:
+        while not self._stop_now.is_set():
+            if self._stop_after.is_set():
+                with self._cv:
+                    if self._encoder_done.is_set() and not self._to_upload:
+                        return  # Stop after: every encoded file is uploaded
+            paused = self._uploads_paused_until - time.monotonic()
+            if paused > 0:
+                if self._stop_after.is_set():
+                    self.log("uploads are paused; stopping without uploading the rest")
+                    return
+                self._stop_now.wait(min(paused, 0.5))
+                continue
+            lj = self._take(self._to_upload, "uploading")
+            if lj is not None:
+                self._run_job(lj, self._upload_one)
+
+    def _upload_one(self, lj: LocalJob) -> None:
+        job, jid, out = lj.job, lj.id, lj.out
+        cancel = self._cancel_of(lj)
+        uploading = False
+        md5 = None
+        tmp = None
+        try:
+            path, tmp = job["path"], job["tmp_path"]
+            probe = Probe(**job["probe"])
+            secs = self._read_marker(self.cfg.workdir / f"{jid}.encoded")
+            if secs is None:
+                raise FileNotFoundError(2, "no finished-encode marker for", str(out))
+            self._upload_stage = "verifying"
+            self.log(f"verifying ({secs / 60:.0f} min encode)")
+            out_size = out.stat().st_size
+            verdict = compare(probe, parse_ffprobe(run_ffprobe(str(out)), out_size),
+                              job["size"], out_size, self.cfg.min_saving, decode_errors(out))
+            if verdict.problems:
+                self.log(f"failed checks: {'; '.join(verdict.problems)}")
+                self._report(job, "failed", reason="; ".join(verdict.problems))
+                self._forget(lj)
+                return
+            if verdict.not_worth_it:
+                self.log(f"not worth it: only {1 - out_size / job['size']:.0%} smaller")
+                self._report(job, "not_worth_it",
+                             reason=f"only {1 - out_size / job['size']:.0%} smaller")
+                self._forget(lj)
+                return
+            md5 = md5_file(out)
+            self._check(cancel)
+            self._upload_stage = "uploading"
+            self.log(f"uploading {out_size / 1e9:.1f} GB "
+                     f"({1 - out_size / job['size']:.0%} smaller)")
+            uploading = True
+            self._retry(lambda: self.rclone.upload(out, tmp, cancel=cancel), cancel)
+            if self.rclone.md5(tmp) != md5:
+                self._delete_tmp_if_ours(job, tmp, md5)
+                self._report(job, "failed", reason="checksum mismatch after upload")
+                self._forget(lj)
+                return
+            self._check(cancel)
+            self._report_uploaded(job, jid, path, tmp, out_size, md5, secs)
+            self._forget(lj)
+        except Exception as e:
+            if (isinstance(e, RcloneError) and e.rate_limited and uploading
+                    and not e.auth_failed):
+                self._pause_uploads(lj, tmp, md5)
+            else:
+                self._job_error(lj, e, tmp=tmp, md5=md5, uploading=uploading,
+                                remote=self.rclone.remote)
+        finally:
+            self._upload_stage = ""
+
+    def _pause_uploads(self, lj: LocalJob, tmp: str | None, md5: str | None) -> None:
+        """Drive's upload limit: keep the encoded file and the lease, tell the server
+        (which blocks uploads for everyone), and retry only after the block."""
+        job = lj.job
+        self._delete_tmp_if_ours(job, tmp, md5)
+        self.log(f"Drive's upload limit hit; uploads paused for "
+                 f"{self.upload_pause_secs / 3600:.0f} h, keeping {job['path']}")
+        try:
+            self._retry_job_call(lambda: self.client.report(
+                lj.id, self.cfg.worker_name, "upload_paused",
+                download_account=self.download_account))
+        except LeaseLost:
+            self.log(f"lease lost reporting upload_paused, dropping: {job['path']}")
+            self._forget(lj)
+            return
+        except JobServiceError as e:
+            self.log(f"could not report upload_paused for {job['path']}: {e}")
+        self._uploads_paused_until = time.monotonic() + self.upload_pause_secs
+        if self._set_state(lj, "encoded"):
+            self._push(self._to_upload, lj, front=True)
+
+    # --- per-job outcomes -------------------------------------------------------
+    def _job_error(self, lj: LocalJob, e: Exception, *, tmp: str | None = None,
+                   md5: str | None = None, uploading: bool = False,
+                   remote: str = "") -> None:
+        """What a stage does with an exception from one job, as the one-job worker
+        always did. Raises _LocalFault to stop every stage; re-raises anything
+        unanticipated for the poison-job guard."""
+        job = lj.job
+        ours = tmp if uploading else None
+        if isinstance(e, (_Abandon, EncodeCancelled, TransferCancelled)):
+            self._abandon(job, ours, md5)
+        elif isinstance(e, RcloneError):
+            if e.auth_failed:
+                # The PC's Drive login is dead: every job would fail the same way,
+                # so release this one (no attempt used) and stop until it's fixed.
+                self._abandon(job, ours, md5)
+                self._forget(lj)
+                raise _LocalFault(
+                    f"Drive login failed (run `rclone config reconnect` "
+                    f"for the remote, then Start again): {e}",
+                    alert=f"Drive login failed for {remote}; re-authorize that rclone "
+                          f"remote, then restart the worker: {e}") from e
+            if e.rate_limited:
+                # Surprising on a download (the limit is normally hit on upload),
+                # but still not this video's fault: release and back off like any
+                # other transient blip, without burning an attempt or touching any
+                # tmp (nothing was uploaded yet).
+                self.log(f"rate limited during download (unexpected); releasing "
+                         f"and backing off: {job['path']}")
+                self._abandon(job, None, None)
+                self._forget(lj)
+                self._back_off_claims()
+                return
+            if e.download_quota:
+                self._report(job, "download_quota")
+            else:
+                self._report(job, "failed", reason=str(e))
+        elif isinstance(e, (EncodeError, ProbeError)):
+            self._report(job, "failed", reason=str(e))
+        elif isinstance(e, FileNotFoundError) and e.filename in (str(lj.src), str(lj.out)):
+            # A missing work file (e.g. ffmpeg exited 0 without writing the output)
+            # is this video's problem, not the PC's: report it, keep working.
+            self._report(job, "failed", reason=f"missing work file: {e}")
+        elif isinstance(e, OSError):
+            # A local problem (missing tool, full disk, permissions, ...), not this
+            # video's fault: release it (no attempt burned) and stop the worker.
+            self._abandon(job, ours, md5)
+            self._forget(lj)
+            raise _LocalFault(str(e)) from e
+        else:
+            raise e
+        self._forget(lj)
+
+    # --- helpers ----------------------------------------------------------------
     def _retry(self, fn, cancel: threading.Event):
         """Retry an rclone transfer with backoff, like rclone.with_retries, but
         aborts (no new attempt) once Stop now or a server cancel fires during the
@@ -396,33 +939,38 @@ class PCWorker:
         if "download_used" in resp and "download_limit" in resp:
             self.download_today = (resp["download_used"], resp["download_limit"])
 
-    def _heartbeat(self, job_id: int, stop: threading.Event, cancel: threading.Event,
-                   server_cancelled: threading.Event) -> None:
+    def _heartbeat(self, stop: threading.Event) -> None:
+        """One heartbeat_many for every held job, every heartbeat_secs, until stop."""
         failing_since = None  # time.monotonic() of the first failure in a row
         while not stop.wait(self.cfg.heartbeat_secs):
+            with self._cv:
+                ids = sorted(self._jobs)
+                reserved = set(self._reserved)
+            if not ids:
+                failing_since = None
+                continue
             try:
-                resp = self.client.heartbeat(job_id, self.cfg.worker_name,
-                                              download_account=self.download_account)
+                resp = self.client.heartbeat_many(ids, self.cfg.worker_name,
+                                                  download_account=self.download_account)
                 failing_since = None
                 self._note_download_today(resp)
-                if resp.get("cancel"):
-                    self.log("server cancelled the job")
-                    server_cancelled.set()
-                    cancel.set()
-                    return
+                for job_id in resp.get("cancel") or ():
+                    self._server_cancel(job_id, "server cancelled the job")
             except Exception as e:  # never let a heartbeat blip kill the thread
                 now = time.monotonic()
                 if failing_since is None:
                     failing_since = now
-                if now - failing_since >= self.cfg.lease_secs:
-                    # The server has expired our lease by now (and may have handed
-                    # the job on): stop, as for a server cancel, so only a tmp that
-                    # provably holds our bytes is ever deleted.
-                    self.log(f"heartbeats failing for {now - failing_since:.0f} s, past "
-                             f"the lease; abandoning the job: {e}")
-                    server_cancelled.set()
-                    cancel.set()
-                    return
+                down = now - failing_since
+                for job_id in ids:
+                    # By now the server has expired this lease (or reservation)
+                    # and may have handed the job on: drop it, as for a server
+                    # cancel, so only a tmp that provably holds our bytes is ever
+                    # deleted.
+                    limit = (self.cfg.reserve_days * 86400 if job_id in reserved
+                             else self.cfg.lease_secs)
+                    if down >= limit:
+                        self._server_cancel(job_id, f"heartbeats failing for {down:.0f} s, "
+                                                    f"past the lease; abandoning the job: {e}")
                 self.log(f"heartbeat failed (will retry): {e}")
 
     def _nvenc(self, src: Path, out: Path, probe: Probe, log_path: Path,
@@ -508,146 +1056,6 @@ class PCWorker:
             self.log(f"refusing to delete suspicious tmp path: {tmp!r}")
             return False
         return True
-
-    def _do_job(self, job: dict) -> None:
-        jid = job["id"]
-        cancel = threading.Event()
-        # Publish before checking: if stop() is called between these two lines, it
-        # still sees (and sets) THIS job's cancel, instead of a stale or absent one.
-        self._current_cancel = cancel
-        if self._stop_now.is_set():
-            cancel.set()
-        src = self.cfg.workdir / f"{jid}.src"
-        out = self.cfg.workdir / f"{jid}.out.mkv"
-        log_path = self.cfg.workdir / f"{jid}.log"
-        marker = self.cfg.workdir / f"{jid}.encoded"
-        downloaded = self.cfg.workdir / f"{jid}.downloaded"
-        self.current_path = job.get("path")
-        deleted = clean_workdir(self.cfg.workdir, {jid})
-        if deleted:
-            self.log(f"cleaned stale work files: {', '.join(p.name for p in deleted)}")
-        hb_stop = threading.Event()
-        server_cancelled = threading.Event()
-        hb = threading.Thread(target=self._heartbeat, args=(jid, hb_stop, cancel,
-                                                             server_cancelled), daemon=True)
-        hb.start()
-        uploading = False
-        md5 = None
-        tmp = None
-        try:
-            path, tmp = job["path"], job["tmp_path"]
-            probe = Probe(**job["probe"])
-            secs = self._read_marker(marker) if out.exists() else None
-            if secs is not None:
-                self.log(f"resuming {path}: reusing finished encode")
-            else:
-                if downloaded.exists() and src.exists() and src.stat().st_size == job["size"]:
-                    self.log(f"resuming {path}: reusing download")
-                else:
-                    # Normal path. A leftover out without a (valid) marker is an
-                    # unfinished encode from a previous run; a leftover src
-                    # without a (valid) marker may be a shutdown-truncated
-                    # download that happens to sit at the full size (rclone's
-                    # local backend preallocates it) -- neither is trustworthy,
-                    # so clear them all before starting over.
-                    src.unlink(missing_ok=True)
-                    downloaded.unlink(missing_ok=True)
-                    out.unlink(missing_ok=True)
-                    marker.unlink(missing_ok=True)
-                    self.stage = "downloading"
-                    self.log(f"downloading {path} ({job['size'] / 1e9:.1f} GB)")
-                    self._check(cancel)
-                    self._retry(lambda: self.download_rclone.download(path, src, cancel=cancel),
-                               cancel)
-                    self._check(cancel)
-                    if src.stat().st_size != job["size"]:
-                        self._report(job, "changed")
-                        return
-                    self._write_marker(downloaded, job["size"])
-                self.stage = "encoding"
-                self.log(f"encoding {path}")
-                secs = self.encode(src, out, probe, log_path, cancel)
-                self._write_marker(marker, secs)
-            self.stage = "verifying"
-            self.log(f"verifying ({secs / 60:.0f} min encode)")
-            out_size = out.stat().st_size
-            verdict = compare(probe, parse_ffprobe(run_ffprobe(str(out)), out_size),
-                              job["size"], out_size, self.cfg.min_saving, decode_errors(out))
-            if verdict.problems:
-                self.log(f"failed checks: {'; '.join(verdict.problems)}")
-                self._report(job, "failed", reason="; ".join(verdict.problems))
-                return
-            if verdict.not_worth_it:
-                self.log(f"not worth it: only {1 - out_size / job['size']:.0%} smaller")
-                self._report(job, "not_worth_it",
-                             reason=f"only {1 - out_size / job['size']:.0%} smaller")
-                return
-            md5 = md5_file(out)
-            self._check(cancel)
-            self.stage = "uploading"
-            self.log(f"uploading {out_size / 1e9:.1f} GB "
-                     f"({1 - out_size / job['size']:.0%} smaller)")
-            uploading = True
-            self._retry(lambda: self.rclone.upload(out, tmp, cancel=cancel), cancel)
-            if self.rclone.md5(tmp) != md5:
-                self._delete_tmp_if_ours(job, tmp, md5)
-                self._report(job, "failed", reason="checksum mismatch after upload")
-                return
-            self._check(cancel)
-            self._report_uploaded(job, jid, path, tmp, out_size, md5, secs)
-        except (_Abandon, EncodeCancelled, TransferCancelled):
-            self._abandon(job, tmp if uploading else None, md5)
-        except RcloneError as e:
-            if e.auth_failed:
-                # The PC's Drive login is dead: every job would fail the same way,
-                # so release this one (no attempt used) and stop until it's fixed.
-                self._abandon(job, tmp if uploading else None, md5)
-                remote = (self.download_rclone if self.stage == "downloading"
-                          else self.rclone).remote
-                raise _LocalFault(
-                    f"Drive login failed (run `rclone config reconnect` "
-                    f"for the remote, then Start again): {e}",
-                    alert=f"Drive login failed for {remote}; re-authorize that rclone "
-                          f"remote, then restart the worker: {e}") from e
-            if e.rate_limited and uploading:
-                self._delete_tmp_if_ours(job, tmp, md5)
-                self._report(job, "upload_limited")
-            elif e.rate_limited:
-                # Surprising on a download (the limit is normally hit on upload),
-                # but still not this video's fault: release and back off like any
-                # other transient blip, without burning an attempt or touching any
-                # tmp (nothing was uploaded yet).
-                self.log(f"rate limited during download (unexpected); releasing "
-                         f"and backing off: {job['path']}")
-                self._abandon(job, None, None)
-                self._wake.wait(self.cfg.idle_secs)
-                self._wake.clear()
-            elif e.download_quota:
-                self._report(job, "download_quota")
-            else:
-                self._report(job, "failed", reason=str(e))
-        except (EncodeError, ProbeError) as e:
-            self._report(job, "failed", reason=str(e))
-        except FileNotFoundError as e:
-            if e.filename not in (str(src), str(out)):
-                self._abandon(job, tmp if uploading else None, md5)
-                raise _LocalFault(str(e)) from e
-            # A missing work file (e.g. ffmpeg exited 0 without writing the output)
-            # is this video's problem, not the PC's: report it, keep working.
-            self._report(job, "failed", reason=f"missing work file: {e}")
-        except OSError as e:
-            # A local problem (missing tool, full disk, permissions, ...), not this
-            # video's fault: release it (no attempt burned) and stop the worker.
-            self._abandon(job, tmp if uploading else None, md5)
-            raise _LocalFault(str(e)) from e
-        finally:
-            hb_stop.set()
-            hb.join(5)
-            self._current_cancel = None
-            for f in (src, out, log_path, marker, downloaded):
-                f.unlink(missing_ok=True)
-            self.current_path = None
-            self.stage = ""
 
     def _delete_tmp_if_ours(self, job: dict, tmp: str | None, md5: str | None) -> None:
         if not tmp or not self._safe_tmp(job, tmp):
