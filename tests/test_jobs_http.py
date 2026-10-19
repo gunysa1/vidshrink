@@ -250,3 +250,35 @@ def test_serve_sweeps_expired_leases_on_its_own(cfg, monkeypatch):
         holder["server"].server_close()
         t.join(timeout=5)
         check_conn.close()
+
+
+def test_claim_filters_pass_through_http(conn, cfg, job_service):
+    from dataclasses import replace
+    cfg.disk_factor, cfg.disk_reserve = 2.2, 20e9
+    from tests.test_jobs_store import BASE
+    add(conn, "long.mkv", size=500_000_000_000, probe=replace(BASE, duration=20 * 3600.0))
+    short = add(conn, "short.mkv", probe=replace(BASE, duration=2 * 3600.0))
+    c = JobClient(job_service.url, job_service.token)
+    r = c.claim("cloud-vm", "x265-cloud", "cloud", free_bytes=10**12, max_hours=12)
+    assert r["job"]["id"] == short
+    assert c.claim("cloud-vm", "x265-cloud", "cloud", free_bytes=int(30e9))["job"] is None
+
+
+def test_claim_rejects_bad_filter_types(job_service):
+    c = JobClient(job_service.url, job_service.token)
+    with pytest.raises(JobServiceError) as e:
+        c.claim("cloud-vm", "x265-cloud", "cloud", free_bytes="lots")
+    assert e.value.status == 400
+
+
+def test_alert_endpoint_stores_alert(conn, job_service):
+    c = JobClient(job_service.url, job_service.token)
+    c.alert("cloud-vm", "re-authorize gdrive:")
+    assert "re-authorize" in db.kv_get(conn, "alert:cloud-vm")
+
+
+def test_alert_requires_token(job_service):
+    c = JobClient(job_service.url, "wrong")
+    with pytest.raises(JobServiceError) as e:
+        c.alert("cloud-vm", "x")
+    assert e.value.status == 401

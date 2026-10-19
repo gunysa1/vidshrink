@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -5,7 +6,7 @@ import pytest
 
 from vidshrink import db, scorer
 from vidshrink.budget import Budget
-from vidshrink.jobs import PC_SEEN_KEY, JobStore, LeaseLost
+from vidshrink.jobs import ALERT_PREFIX, NO_WORK_RETRY_SECS, PC_SEEN_KEY, JobStore, LeaseLost
 from vidshrink.probe import Probe
 from vidshrink.rclone import Rclone
 
@@ -461,3 +462,59 @@ def test_pc_heartbeat_still_refreshes_pc_seen(conn, store):
     store.clock.t += 100
     store.heartbeat(jid, "pc")
     assert db.kv_get(conn, PC_SEEN_KEY) == str(store.clock.t)
+
+
+def test_claim_skips_jobs_that_do_not_fit_free_bytes(conn, store, cfg):
+    cfg.disk_factor, cfg.disk_reserve = 2.2, 20e9
+    add(conn, "big.mkv", size=50_000_000_000)
+    small = add(conn, "small.mkv", size=10_000_000_000)
+    r = store.claim("cloud-vm", "x265-cloud", "cloud", free_bytes=int(60e9))
+    assert r["job"]["id"] == small
+
+
+def test_claim_no_fit_returns_no_job_and_charges_nothing(conn, store, cfg):
+    cfg.disk_factor, cfg.disk_reserve = 2.2, 20e9
+    big = add(conn, "big.mkv", size=50_000_000_000)
+    r = store.claim("cloud-vm", "x265-cloud", "cloud", free_bytes=int(60e9))
+    assert r["job"] is None and r["retry_after"] == NO_WORK_RETRY_SECS
+    assert store.cloud_downloads.used() == 0
+    assert db.get(conn, big)["stage"] == "queued"
+
+
+def _short_and_long(conn):
+    long_ = add(conn, "long.mkv", size=500_000_000_000,
+                probe=replace(BASE, duration=20 * 3600.0))
+    short = add(conn, "short.mkv", size=5_000_000_000, probe=replace(BASE, duration=2 * 3600.0))
+    return short, long_
+
+
+def test_claim_max_hours_filters_by_encoder_speed(conn, store):
+    short, _ = _short_and_long(conn)
+    r = store.claim("cloud-vm", "x265-cloud", "cloud", max_hours=12)
+    assert r["job"]["id"] == short
+    assert store.claim("cloud-vm", "x265-cloud", "cloud", max_hours=12)["job"] is None
+
+
+def test_claim_without_filters_is_unchanged(conn, store):
+    _, long_ = _short_and_long(conn)
+    assert store.claim("cloud-vm", "x265-cloud", "cloud")["job"]["id"] == long_
+
+
+def test_alert_is_stored_and_cleared_by_next_claim(conn, store):
+    key = f"{ALERT_PREFIX}cloud-vm"
+    store.alert("cloud-vm", "re-authorize gdrive:")
+    stored = json.loads(db.kv_get(conn, key))
+    assert stored["message"] == "re-authorize gdrive:" and stored["t"] == store.clock.t
+    assert store.claim("cloud-vm", "x265-cloud", "cloud")["job"] is None
+    assert db.kv_get(conn, key) is not None
+    add(conn, "a.mkv")
+    assert store.claim("cloud-vm", "x265-cloud", "cloud")["job"] is not None
+    assert db.kv_get(conn, key) is None
+
+
+def test_resumed_claim_clears_alert(conn, store):
+    add(conn, "a.mkv")
+    store.claim("cloud-vm", "x265-cloud", "cloud")
+    store.alert("cloud-vm", "x")
+    assert store.claim("cloud-vm", "x265-cloud", "cloud", resume=True)["resumed"] is True
+    assert db.kv_get(conn, f"{ALERT_PREFIX}cloud-vm") is None

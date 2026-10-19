@@ -20,6 +20,7 @@ from vidshrink.rclone import Rclone, RcloneError
 
 PC_SEEN_KEY = "pc_last_seen"
 WORKER_SEEN_PREFIX = "seen:"
+ALERT_PREFIX = "alert:"
 NO_WORK_RETRY_SECS = 600.0
 # Rows in any of these stages occupy a final_path/tmp_path stem; a queued row that
 # shares a stem with one of them (same basename, different extension) can't be
@@ -121,13 +122,27 @@ class JobStore:
         return {"download_used": downloads.used(), "download_limit": downloads.limit}
 
     def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main",
-             resume: bool = False) -> dict:
+             resume: bool = False, free_bytes: int | None = None,
+             max_hours: float | None = None) -> dict:
         downloads = self._download_budget(download_account)
+        result = None
         if resume:
             resumed = self._try_resume(worker, encoder)
             if resumed is not None:
-                return {**resumed, **self._download_today(downloads)}
-        return {**self._claim(worker, encoder, downloads), **self._download_today(downloads)}
+                result = resumed
+        if result is None:
+            result = self._claim(worker, encoder, downloads, free_bytes, max_hours)
+        if result["job"] is not None:
+            db.kv_delete(self.conn, f"{ALERT_PREFIX}{worker}")
+        return {**result, **self._download_today(downloads)}
+
+    def alert(self, worker: str, message: str) -> None:
+        """A worker reports a problem it can't fix itself (e.g. its Drive auth expired).
+        Stored for the status page; cleared by the worker's next successful claim."""
+        message = message[:500]
+        db.kv_set(self.conn, f"{ALERT_PREFIX}{worker}",
+                  json.dumps({"t": self.now(), "message": message}))
+        self.log(f"ALERT from {worker}: {message}")
 
     def _try_resume(self, worker: str, encoder: str) -> dict | None:
         """A job this worker still holds a live lease on (e.g. after a PC restart):
@@ -157,7 +172,8 @@ class JobStore:
                         "probe": json.loads(row["probe_json"])},
                 "resumed": True, "retry_after": 0.0}
 
-    def _claim(self, worker: str, encoder: str, downloads: Budget) -> dict:
+    def _claim(self, worker: str, encoder: str, downloads: Budget,
+               free_bytes: int | None = None, max_hours: float | None = None) -> dict:
         self._seen(worker, encoder)
         self.expire_leases()
         if downloads.blocked():
@@ -175,6 +191,12 @@ class JobStore:
                 db.mark_if(self.conn, row["id"], ("queued",), "failed",
                            reason=f"target {final} already exists")
                 continue
+            if free_bytes is not None and (
+                    row["size"] * self.cfg.disk_factor + self.cfg.disk_reserve > free_bytes):
+                continue  # wouldn't fit on the worker's disk
+            if max_hours is not None and scorer.expected_hours(
+                    self.conn, Probe.from_json(row["probe_json"]), encoder) > max_hours:
+                continue  # would take the worker too long
             if not downloads.allows(row["size"]):
                 return {"job": None, "retry_after": downloads.seconds_until_reset()}
             with db.transaction(self.conn):
@@ -413,9 +435,21 @@ def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer
                     return
                 body = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/claim":
+                    free_bytes, max_hours = body.get("free_bytes"), body.get("max_hours")
+                    if free_bytes is not None:
+                        if isinstance(free_bytes, bool) or not isinstance(free_bytes, int):
+                            raise TypeError("free_bytes must be an integer")
+                    if max_hours is not None:
+                        if isinstance(max_hours, bool) or not isinstance(max_hours, (int, float)):
+                            raise TypeError("max_hours must be a number")
+                        max_hours = float(max_hours)
                     self._send(200, store.claim(body["worker"], body.get("encoder", "nvenc"),
                                                 body.get("download_account", "main"),
-                                                resume=bool(body.get("resume", False))))
+                                                resume=bool(body.get("resume", False)),
+                                                free_bytes=free_bytes, max_hours=max_hours))
+                elif self.path == "/alert":
+                    store.alert(str(body["worker"]), str(body["message"]))
+                    self._send(200, {"ok": True})
                 elif self.path == "/heartbeat":
                     self._send(200, store.heartbeat(int(body["id"]), body["worker"],
                                                     body.get("download_account", "main")))
@@ -464,10 +498,18 @@ class JobClient:
         return self._call("GET", "/health")
 
     def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main",
-             resume: bool = False) -> dict:
-        return self._call("POST", "/claim", {"worker": worker, "encoder": encoder,
-                                             "download_account": download_account,
-                                             "resume": resume})
+             resume: bool = False, free_bytes: int | None = None,
+             max_hours: float | None = None) -> dict:
+        body = {"worker": worker, "encoder": encoder, "download_account": download_account,
+                "resume": resume}
+        if free_bytes is not None:
+            body["free_bytes"] = free_bytes
+        if max_hours is not None:
+            body["max_hours"] = max_hours
+        return self._call("POST", "/claim", body)
+
+    def alert(self, worker: str, message: str) -> None:
+        self._call("POST", "/alert", {"worker": worker, "message": message})
 
     def heartbeat(self, job_id: int, worker: str, download_account: str = "main") -> dict:
         return self._call("POST", "/heartbeat", {"id": job_id, "worker": worker,

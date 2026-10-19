@@ -202,6 +202,10 @@ def kv_set(conn, key: str, value: str) -> None:
     )
 
 
+def kv_delete(conn, key: str) -> None:
+    conn.execute("DELETE FROM kv WHERE key=?", (key,))
+
+
 def upload_bytes(conn, day: str) -> int:
     row = conn.execute("SELECT bytes FROM uploads WHERE day=?", (day,)).fetchone()
     return 0 if row is None else row["bytes"]
