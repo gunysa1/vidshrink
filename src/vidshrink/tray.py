@@ -56,7 +56,8 @@ class TrayController:
         dl = getattr(self.worker, "download_today", None) if self.worker else None
         if dl:
             used, limit = dl
-            text += f" · DL today {used / 1e9:.0f}/{limit / 1e9:.0f} GB"
+            of_limit = "" if limit is None else f"/{limit / 1e9:.0f}"
+            text += f" · DL today {used / 1e9:.0f}{of_limit} GB"
         return text
 
 

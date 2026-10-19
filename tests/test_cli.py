@@ -67,14 +67,14 @@ def test_status_shows_pc_download_budget_when_used(conn, cfg):
     pc_downloads = Budget(conn, cfg.daily_pc_download_limit, budget.now, kind="pc_download")
     pc_downloads.add(7 * 10**9)
     out = status_report(conn, cfg, budget)
-    assert "PC account downloaded today: 7 / 750 GB" in out
+    assert "PC account downloaded today: 7 GB (no cap)" in out
 
 
 def test_status_shows_pc_download_budget_when_pc_seen_recently_even_if_unused(conn, cfg):
     budget = Budget(conn, cfg.daily_upload_limit)
     db.kv_set(conn, PC_SEEN_KEY, str(budget.now()))
     out = status_report(conn, cfg, budget)
-    assert "PC account downloaded today: 0 / 750 GB" in out
+    assert "PC account downloaded today: 0 GB (no cap)" in out
 
 
 def test_status_hides_pc_download_budget_when_never_seen_and_unused(conn, cfg):
@@ -94,7 +94,7 @@ def test_status_shows_cloud_downloads(conn, cfg):
     budget = Budget(conn, cfg.daily_upload_limit)
     Budget(conn, cfg.daily_cloud_download_limit, budget.now, kind="cloud_download").add(12 * 10**9)
     out = status_report(conn, cfg, budget)
-    assert "Cloud account downloaded today: 12 / 750 GB" in out and "PAUSED" not in out.split("Cloud")[1]
+    assert "Cloud account downloaded today: 12 GB (no cap)" in out and "PAUSED" not in out.split("Cloud")[1]
 
 
 def test_status_shows_worker_last_seen(conn, cfg):
@@ -139,3 +139,12 @@ def test_status_does_not_list_the_pc_twice(conn, cfg):
 def _leased_row(conn):
     db.upsert_listing(conn, "a.mkv", 5, "t")
     return db.get_by_path(conn, "a.mkv")["id"]
+
+
+def test_status_shows_no_cap(conn, cfg):
+    budget = Budget(conn, cfg.daily_upload_limit)
+    Budget(conn, cfg.daily_pc_download_limit, budget.now, kind="pc_download").add(168 * 10**9)
+    Budget(conn, cfg.daily_cloud_download_limit, budget.now, kind="cloud_download").add(34 * 10**9)
+    out = status_report(conn, cfg, budget)
+    assert "PC account downloaded today: 168 GB (no cap)" in out
+    assert "Cloud account downloaded today: 34 GB (no cap)" in out

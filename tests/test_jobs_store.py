@@ -341,6 +341,14 @@ def test_claim_pc_account_charges_pc_downloads_not_main(conn, store):
     assert (r["download_used"], r["download_limit"]) == (5_000_000_000, store.cfg.daily_pc_download_limit)
 
 
+def test_claim_not_refused_by_pc_volume(conn, store):
+    store.pc_downloads.add(900 * 10**9)
+    vid = add(conn, "a.mkv", size=5_000_000_000)
+    r = store.claim("pc", download_account="pc")
+    assert r["job"]["id"] == vid
+    assert r["download_limit"] is None
+
+
 def test_claim_pc_account_works_while_main_exhausted(conn, cfg, store):
     store.downloads.add(cfg.daily_download_limit)
     vid = add(conn, "a.mkv", size=5_000_000_000)

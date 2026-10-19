@@ -21,6 +21,18 @@ def test_day_is_pacific(conn):
     assert Budget(conn, 100, Clock(t)).day() == "2026-09-27"
 
 
+def test_uncapped_budget_allows_any_amount(conn):
+    b = Budget(conn, None, Clock(noon()), kind="pc_download")
+    b.add(10**13)
+    assert b.allows(10**13)
+
+
+def test_uncapped_budget_still_blocks(conn):
+    b = Budget(conn, None, Clock(noon()), kind="pc_download")
+    b.block(3600)
+    assert not b.allows(1)
+
+
 def test_allows_until_limit(conn):
     b = Budget(conn, 100, Clock(noon()))
     assert b.allows(100)

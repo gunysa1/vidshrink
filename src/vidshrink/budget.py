@@ -11,7 +11,7 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 class Budget:
     """Bytes per Pacific day against a limit, for uploads or downloads (kept apart)."""
 
-    def __init__(self, conn, limit: int, now: Callable[[], float] = time.time,
+    def __init__(self, conn, limit: int | None, now: Callable[[], float] = time.time,
                  kind: str = "upload"):
         self.conn = conn
         self.limit = limit
@@ -42,7 +42,7 @@ class Budget:
         if self.now() < self._blocked_until():
             return False
         used = self.used()
-        return used == 0 or used + n <= self.limit
+        return self.limit is None or used == 0 or used + n <= self.limit
 
     def seconds_until_reset(self) -> float:
         now = self.now()

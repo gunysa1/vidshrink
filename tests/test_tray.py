@@ -97,5 +97,17 @@ def test_status_text_shows_download_today_when_known():
     assert c.status_text().endswith(" · DL today 412/750 GB")
 
 
+def test_tray_status_uncapped():
+    c = TrayController(FakeWorker)
+    c.start()
+    assert wait(lambda: c.state == "working")
+    c.worker.download_today = (2e11, None)
+    text = c.status_text()
+    assert text.endswith(" · DL today 200 GB")
+    assert "/" not in text.split("·")[-1]
+    c.stop_now()
+    assert wait(lambda: c.state == "off")
+
+
 def test_no_dead_session_done_attribute():
     assert not hasattr(TrayController(FakeWorker), "session_done")

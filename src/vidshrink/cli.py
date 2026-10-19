@@ -20,6 +20,11 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _gb_of_limit(b: Budget) -> str:
+    used = f"{b.used() / 1e9:.0f}"
+    return f"{used} GB (no cap)" if b.limit is None else f"{used} / {b.limit / 1e9:.0f} GB"
+
+
 def status_report(conn, cfg: Config, budget: Budget) -> str:
     lines = ["Stages:"]
     for row in conn.execute("SELECT stage, COUNT(*) n, SUM(size) s FROM videos GROUP BY stage ORDER BY n DESC"):
@@ -89,13 +94,11 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
     pc_recently_seen = bool(seen) and (budget.now() - float(seen)) / 86400 <= cfg.pc_absent_days
     if pc_downloads.used() > 0 or pc_recently_seen:
         pc_paused = " (PAUSED: Drive download quota hit)" if pc_downloads.blocked() else ""
-        lines.append(f"PC account downloaded today: {pc_downloads.used() / 1e9:.0f} / "
-                     f"{pc_downloads.limit / 1e9:.0f} GB{pc_paused}")
+        lines.append(f"PC account downloaded today: {_gb_of_limit(pc_downloads)}{pc_paused}")
     cloud_downloads = Budget(conn, cfg.daily_cloud_download_limit, budget.now, kind="cloud_download")
     if cloud_downloads.used() > 0 or cloud_downloads.blocked():
         cloud_paused = " (PAUSED: Drive download quota hit)" if cloud_downloads.blocked() else ""
-        lines.append(f"Cloud account downloaded today: {cloud_downloads.used() / 1e9:.0f} / "
-                     f"{cloud_downloads.limit / 1e9:.0f} GB{cloud_paused}")
+        lines.append(f"Cloud account downloaded today: {_gb_of_limit(cloud_downloads)}{cloud_paused}")
     for row in conn.execute("SELECT key, value FROM kv WHERE key LIKE ? ORDER BY key",
                             (f"{WORKER_SEEN_PREFIX}%",)):
         name = row["key"][len(WORKER_SEEN_PREFIX):]
