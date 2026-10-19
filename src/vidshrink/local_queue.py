@@ -133,9 +133,12 @@ class LocalQueue:
             return False
         if size * self.disk_factor + self.disk_reserve > free_bytes:
             return False
-        waiting = [j for j in held if j.state != "encoded"]
-        if waiting:
-            hours = sum(float(j.job.get("expected_hours") or 0.0) for j in waiting)
+        # Jobs behind the encoder. With none, a job is always admitted so a long
+        # film can be claimed, and one file can be prefetched behind a long encode.
+        behind = [j for j in held if j.state in ("downloading", "downloaded")]
+        if behind:
+            hours = sum(float(j.job.get("expected_hours") or 0.0) for j in held
+                        if j.state in ("downloading", "downloaded", "encoding"))
             if hours + expected_hours > self.queue_hours:
                 return False
         return True

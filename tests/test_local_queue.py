@@ -101,3 +101,22 @@ def test_clean_workdir_keeps_all_held_ids(tmp_path):
     deleted = clean_workdir(tmp_path, {1, 3})
     assert {p.name for p in deleted} == {"2.src", "2.downloaded", "2.job.json"}
     assert (tmp_path / "1.job.json").exists() and (tmp_path / "3.src").exists()
+
+
+def test_admits_ignores_uploading_jobs_for_hours(tmp_path):
+    q = _queue(tmp_path, hours=24.0)
+    q.add(_job(1, hours=30.0))
+    q.set_state(1, "uploading")
+    q.add(_job(2, hours=20.0))
+    assert q.admits(100, 3.0, 10**9)
+    assert not q.admits(100, 5.0, 10**9)
+
+
+def test_admits_one_file_behind_long_encode(tmp_path):
+    q = _queue(tmp_path, hours=24.0)
+    q.add(_job(1, hours=30.0))
+    q.set_state(1, "encoding")
+    assert q.admits(100, 1.0, 10**9)
+    q.add(_job(2, hours=1.0))
+    q.set_state(2, "downloaded")
+    assert not q.admits(100, 1.0, 10**9)
