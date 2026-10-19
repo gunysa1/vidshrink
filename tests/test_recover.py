@@ -95,6 +95,45 @@ def test_first_interruption_is_free(conn, cfg, setup):
     assert not (cfg.workdir / f"{vid}.src").exists()
 
 
+def test_recover_keeps_complete_download(conn, cfg, setup):
+    root, worker, row = setup
+    vid = row("d.mkv", "downloaded", size=7)
+    (cfg.workdir / f"{vid}.src").write_bytes(b"x" * 7)
+    worker.recover()
+    r = db.get(conn, vid)
+    assert (r["stage"], r["attempts"], r["reason"]) == ("downloaded", 0, None)
+    assert (cfg.workdir / f"{vid}.src").exists()
+
+
+def test_recover_requeues_truncated_download(conn, cfg, setup):
+    root, worker, row = setup
+    vid = row("d.mkv", "downloaded", size=7)
+    (cfg.workdir / f"{vid}.src").write_bytes(b"xxx")
+    worker.recover()
+    r = db.get(conn, vid)
+    assert (r["stage"], r["attempts"], r["reason"]) == \
+        ("queued", 0, "interrupted during downloaded")
+    assert not (cfg.workdir / f"{vid}.src").exists()
+
+
+def test_recover_interrupted_encode_with_complete_src_goes_to_downloaded(conn, cfg, setup):
+    root, worker, row = setup
+    vid = row("e.mkv", "encoding", size=7)
+    (cfg.workdir / f"{vid}.src").write_bytes(b"x" * 7)
+    (cfg.workdir / f"{vid}.out.mkv").write_bytes(b"partial")
+    worker.recover()
+    r = db.get(conn, vid)
+    assert (r["stage"], r["attempts"], r["reason"]) == ("downloaded", 0, INTERRUPTED)
+    assert (cfg.workdir / f"{vid}.src").exists()
+    assert not (cfg.workdir / f"{vid}.out.mkv").exists()
+    # Interrupted again while encoding: now it costs an attempt and starts over.
+    db.mark(conn, vid, "encoding")
+    worker.recover()
+    r = db.get(conn, vid)
+    assert (r["stage"], r["attempts"]) == ("queued", 1)
+    assert not (cfg.workdir / f"{vid}.src").exists()
+
+
 class Crash(BaseException):
     """Stands in for the process dying: nothing in prepare() catches it."""
 

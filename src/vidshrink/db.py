@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
 
-IN_PROGRESS = ("downloading", "encoding", "verifying", "uploading", "swapping")
+IN_PROGRESS = ("downloading", "downloaded", "encoding", "verifying", "uploading", "swapping")
 REMOTE_STAGES = ("leased", "remote_ready")
 DUPLICATE_REASON = "duplicate name on Drive"
 _GONE_ELIGIBLE = ("unprobed", "probed", "queued", "skipped", "probe_failed")

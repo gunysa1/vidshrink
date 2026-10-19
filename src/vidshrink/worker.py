@@ -233,6 +233,13 @@ class Worker:
                     if self.upload_and_swap(ready[0], dry_run):
                         done += 1
                     continue
+                waiting = db.rows_in(self.conn, "downloaded")
+                if waiting and len(ready) < self.cfg.max_ready:
+                    # A download reused after a restart (Task 7 moves this off the loop).
+                    self.encode_and_verify(waiting[0])
+                    done += self._remote_done_during_encode
+                    self._remote_done_during_encode = 0
+                    continue
                 row = self._next_job() if len(ready) < self.cfg.max_ready else None
                 if row is not None and self.download_budget.allows(row["size"]):
                     self.prepare(row)
@@ -270,20 +277,32 @@ class Worker:
             self.sleep(self.cfg.disk_wait_secs)
 
     def prepare(self, row) -> None:
+        """Download then encode one row, start to finish (start_download, _download,
+        finish_download and encode_and_verify run in order on this thread)."""
+        if not self.start_download(row):
+            return
+        try:
+            self._download(row)
+        except (RcloneError, OSError) as e:
+            self.finish_download(row, error=e)
+            return
+        if self.finish_download(row):
+            self.encode_and_verify(db.get(self.conn, row["id"]))
+
+    def start_download(self, row) -> bool:
+        """Mark the row `downloading` if it can start now; False if it was skipped."""
         vid, path = row["id"], row["path"]
         final = final_path(path)
-        probe = Probe.from_json(row["probe_json"])
-        src, out = self._src(vid), self._out(vid)
         try:
             if final != path and self.rclone.exists(final):
                 db.mark_if(self.conn, vid, ("queued",), "failed",
                           reason=f"target {final} already exists")
-                return
+                return False
             self._wait_for_disk(row["size"])
             self.log(f"downloading {path} ({row['size'] / 1e9:.1f} GB)")
-            # The interruption marker (reason) stays through downloading/encoding/
-            # verifying and is cleared only when the work completes (-> ready), so a
-            # second interruption in a row is recognised by recover().
+            # The interruption marker (reason) stays through downloading/downloaded/
+            # encoding/verifying and is cleared only when the work completes (-> ready),
+            # so a second interruption in a row is recognised by recover().
             # Atomic: re-check the busy-stem guard and switch to downloading in one
             # transaction, so a lease or another row's progress can't slip in between
             # the check and the mark (requirement A: no double assignment).
@@ -295,18 +314,50 @@ class Worker:
                 else:
                     started = db.mark_if(self.conn, vid, ("queued",), "downloading",
                                          encoder="x265")
-            if not started:
-                self.log(f"skipping {path}: no longer queued or its target is busy "
-                         f"(leased to another worker?)")
-                return
-            self._retry(lambda: self.rclone.download(path, src))
+        except DiskTooSmall as e:
+            self._cleanup(vid)
+            db.mark_if(self.conn, vid, ("queued",), "failed", reason=str(e)[:500])
+            self.log(f"failed: {path}: {e}")
+            return False
+        except (RcloneError, OSError) as e:
+            self._on_error(row, e)
+            return False
+        if not started:
+            self.log(f"skipping {path}: no longer queued or its target is busy "
+                     f"(leased to another worker?)")
+        return started
+
+    def _download(self, row) -> None:
+        """Only the rclone transfer: no database access, so it may run off the main thread."""
+        self._retry(lambda: self.rclone.download(row["path"], self._src(row["id"])))
+
+    def finish_download(self, row, error: Exception | None = None) -> bool:
+        """After the transfer (or its `error`): count it, check the size, mark `downloaded`."""
+        vid, path = row["id"], row["path"]
+        if error is not None:
+            self._on_error(row, error)
+            return False
+        try:
             self.download_budget.add(row["size"])
-            if src.stat().st_size != row["size"]:
+            if self._src(vid).stat().st_size != row["size"]:
                 self._cleanup(vid)
                 db.mark(self.conn, vid, "unprobed", reason="changed since scan",
                         probe_json=None, score=None)
                 self.log(f"changed since scan, will re-probe: {path}")
-                return
+                return False
+        except OSError as e:
+            self._on_error(row, e)
+            return False
+        db.mark(self.conn, vid, "downloaded")
+        return True
+
+    def encode_and_verify(self, row) -> None:
+        """`downloaded` -> encoding -> verifying -> ready, failed or not_worth_it."""
+        vid, path = row["id"], row["path"]
+        final = final_path(path)
+        probe = Probe.from_json(row["probe_json"])
+        src, out = self._src(vid), self._out(vid)
+        try:
             self.log(f"encoding {path}")
             db.mark(self.conn, vid, "encoding")
             # Service PC (remote_ready) results every idle_poll_secs while this
@@ -331,12 +382,18 @@ class Worker:
                 self.log(f"not worth it: {path} ({saved:.0%})")
                 return
             md5 = md5_file(out)
-        except DiskTooSmall as e:
-            self._cleanup(vid)
-            db.mark_if(self.conn, vid, ("queued",), "failed", reason=str(e)[:500])
-            self.log(f"failed: {path}: {e}")
+        except (RcloneError, EncodeError, ProbeError, OSError) as e:
+            self._on_error(row, e)
             return
-        except FileNotFoundError as e:
+        self._cleanup(vid, keep_output=True)
+        db.mark(self.conn, vid, "ready", out_size=out_size, out_md5=md5, final_path=final,
+                reason=None)
+        self.failures = 0
+
+    def _on_error(self, row, e: Exception) -> None:
+        """Settle a row whose download/encode raised `e`; re-raises when a tool vanished."""
+        vid = row["id"]
+        if isinstance(e, FileNotFoundError):
             if e.filename not in self._tools():
                 # A missing work file (e.g. ffmpeg exited 0 without output) is this
                 # file's problem; crashing would re-download it on every restart.
@@ -346,22 +403,16 @@ class Worker:
             # without burning an attempt and leave the row to be picked up again.
             self._cleanup(vid)
             db.mark(self.conn, vid, "queued")
-            raise
-        except (RcloneError, EncodeError, ProbeError, OSError) as e:
-            if isinstance(e, RcloneError) and e.download_quota:
-                # Not this file's fault: pause all downloads, keep the file queued.
-                self._cleanup(vid)
-                self.download_budget.block(self.cfg.download_block_secs)
-                db.mark(self.conn, vid, "queued")
-                self.log("Drive download quota exceeded; pausing downloads "
-                         f"for {self.cfg.download_block_secs / 3600:.0f} h")
-                return
-            self._fail(row, str(e))
+            raise e
+        if isinstance(e, RcloneError) and e.download_quota:
+            # Not this file's fault: pause all downloads, keep the file queued.
+            self._cleanup(vid)
+            self.download_budget.block(self.cfg.download_block_secs)
+            db.mark(self.conn, vid, "queued")
+            self.log("Drive download quota exceeded; pausing downloads "
+                     f"for {self.cfg.download_block_secs / 3600:.0f} h")
             return
-        self._cleanup(vid, keep_output=True)
-        db.mark(self.conn, vid, "ready", out_size=out_size, out_md5=md5, final_path=final,
-                reason=None)
-        self.failures = 0
+        self._fail(row, str(e))
 
     def upload_and_swap(self, row, dry_run: bool) -> bool:
         vid, path = row["id"], row["path"]
@@ -439,17 +490,28 @@ class Worker:
         self.log(f"done: {row['final_path']} saved {(row['size'] - row['out_size']) / 1e9:.1f} GB")
 
     def recover(self, dry_run: bool = False) -> int:
-        for row in db.rows_in(self.conn, "downloading", "encoding", "verifying"):
+        for row in db.rows_in(self.conn, "downloading", "downloaded", "encoding", "verifying"):
+            vid = row["id"]
+            complete = self._src(vid).exists() and self._src(vid).stat().st_size == row["size"]
+            if row["stage"] == "downloaded" and complete:
+                continue  # a finished download waiting its turn: reuse it
             reason = f"{INTERRUPTED_PREFIX}{row['stage']}"
+            keep_src = row["stage"] in ("encoding", "verifying") and complete
             if (row["reason"] or "").startswith(INTERRUPTED_PREFIX):
                 # Second interruption in a row for this file: it may be what's
                 # crashing us, so it costs an attempt like any other failure.
                 self._fail(row, reason)
+            elif keep_src:
+                # Only the partial encode is lost; the download is still good.
+                self._out(vid).unlink(missing_ok=True)
+                self._logfile(vid).unlink(missing_ok=True)
+                db.mark(self.conn, vid, "downloaded", reason=reason)
+                self.log(f"downloaded: {row['path']}: {reason} (first time, no attempt used)")
             else:
                 # A reboot or restart isn't this file's fault: requeue for free, but
                 # remember it so a repeat does count.
-                self._cleanup(row["id"])
-                db.mark(self.conn, row["id"], "queued", reason=reason)
+                self._cleanup(vid)
+                db.mark(self.conn, vid, "queued", reason=reason)
                 self.log(f"queued: {row['path']}: {reason} (first time, no attempt used)")
         for row in db.rows_in(self.conn, "uploading"):
             tmp = tmp_path(row["path"])

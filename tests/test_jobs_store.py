@@ -323,6 +323,15 @@ def test_claim_skips_same_stem_collision(conn, store):
     assert r2["job"]["id"] == mp4
 
 
+def test_downloaded_row_blocks_same_stem_claim(conn, store):
+    avi = add(conn, "Movies/a.avi")
+    db.mark(conn, avi, "downloaded")
+    mp4 = add(conn, "Movies/a.mp4")
+    assert store.claim("pc")["job"] is None
+    db.mark(conn, avi, "done")
+    assert store.claim("pc")["job"]["id"] == mp4
+
+
 def test_claim_waits_when_upload_budget_used_up(conn, cfg, store):
     add(conn, "a.mkv")
     store.uploads.add(cfg.daily_upload_limit)
