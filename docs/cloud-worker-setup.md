@@ -24,7 +24,34 @@ Let user services run without a login session:
 sudo loginctl enable-linger ubuntu
 ```
 
-## 2. Tailscale (server and VM)
+## 2. Reaching the job service
+
+Two options. Either way, nothing at home is opened to the internet.
+
+### Option A: SSH tunnel from the server (no sudo, used in production)
+
+The server dials out to the VM and forwards the VM's `127.0.0.1:8765` to its own job
+service. The VM can reach only that one port. On the server, add an SSH alias for the VM
+(key authentication) to `~/.ssh/config`:
+
+```
+Host vidshrink-cloud
+    HostName <vm public IP>
+    User ubuntu
+```
+
+Then install and start the tunnel unit:
+
+```bash
+cp deploy/vidshrink-tunnel.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now vidshrink-tunnel
+```
+
+On the VM, `curl http://127.0.0.1:8765/health` should now answer 401 (no token), and
+200 with `-H "Authorization: Bearer $TOKEN"`. In the worker config, use
+`server = "http://127.0.0.1:8765"`.
+
+### Option B: Tailscale (server and VM)
 
 Install Tailscale on the server and on the VM and log both into the same tailnet
 (`sudo tailscale up`; open the printed link in a browser). Then, on the VM, check the job

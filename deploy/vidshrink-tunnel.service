@@ -1,0 +1,18 @@
+[Unit]
+Description=vidshrink: SSH tunnel giving the cloud worker the job service on its localhost:8765
+After=network-online.target vidshrink-serve.service
+Wants=network-online.target
+
+# Runs on the server. Needs an SSH alias "vidshrink-cloud" in ~/.ssh/config pointing at
+# the VM (key auth). The server dials out, so nothing at home is exposed and the VM can
+# reach only this one port.
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+    -R 127.0.0.1:8765:127.0.0.1:8765 vidshrink-cloud
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
