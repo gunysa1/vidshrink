@@ -19,6 +19,7 @@ from vidshrink.probe import Probe
 from vidshrink.rclone import Rclone, RcloneError
 
 PC_SEEN_KEY = "pc_last_seen"
+WORKER_SEEN_PREFIX = "seen:"
 NO_WORK_RETRY_SECS = 600.0
 # Rows in any of these stages occupy a final_path/tmp_path stem; a queued row that
 # shares a stem with one of them (same basename, different extension) can't be
@@ -41,16 +42,29 @@ class JobStore:
         self.uploads = Budget(conn, cfg.daily_upload_limit, now)
         self.downloads = Budget(conn, cfg.daily_download_limit, now, kind="download")
         self.pc_downloads = Budget(conn, cfg.daily_pc_download_limit, now, kind="pc_download")
+        self.cloud_downloads = Budget(conn, cfg.daily_cloud_download_limit, now,
+                                      kind="cloud_download")
 
     def _download_budget(self, account: str) -> Budget:
         if account == "main":
             return self.downloads
         if account == "pc":
             return self.pc_downloads
+        if account == "cloud":
+            return self.cloud_downloads
         raise ValueError(f"unknown download_account {account!r}")
 
-    def _seen(self) -> None:
-        db.kv_set(self.conn, PC_SEEN_KEY, str(self.now()))
+    def _seen(self, worker: str, encoder: str | None) -> None:
+        """Note this worker was just heard from. Only NVENC (the PC) refreshes
+        PC_SEEN_KEY, which tells the server whether to leave long jobs to the PC."""
+        now = str(self.now())
+        db.kv_set(self.conn, f"{WORKER_SEEN_PREFIX}{worker}", now)
+        if encoder == "nvenc":
+            db.kv_set(self.conn, PC_SEEN_KEY, now)
+
+    def _row_encoder(self, job_id: int) -> str | None:
+        row = db.get(self.conn, job_id)
+        return row["encoder"] if row is not None else None
 
     def _leased_by(self, job_id: int, worker: str, now: float):
         """The row, iff it is validly leased by worker right now (stage, worker AND an
@@ -94,7 +108,7 @@ class JobStore:
         scored = []
         for row in db.rows_in(self.conn, "queued"):
             probe = Probe.from_json(row["probe_json"])
-            if probe.is_hdr:
+            if probe.is_hdr and encoder == "nvenc":
                 continue
             family = scorer.codec_family(probe.codec)
             res = scorer.resolution_class(probe.width, probe.height)
@@ -110,19 +124,19 @@ class JobStore:
              resume: bool = False) -> dict:
         downloads = self._download_budget(download_account)
         if resume:
-            resumed = self._try_resume(worker)
+            resumed = self._try_resume(worker, encoder)
             if resumed is not None:
                 return {**resumed, **self._download_today(downloads)}
         return {**self._claim(worker, encoder, downloads), **self._download_today(downloads)}
 
-    def _try_resume(self, worker: str) -> dict | None:
+    def _try_resume(self, worker: str, encoder: str) -> dict | None:
         """A job this worker still holds a live lease on (e.g. after a PC restart):
         hand it straight back, with no download charged, instead of leasing a fresh
         one and leaving the old row to expire. Oldest lease_until first, in case a
         worker somehow holds more than one (it shouldn't, but pick deterministically
         if so). None if nothing qualifies, so the caller falls through to a normal
         claim."""
-        self._seen()
+        self._seen(worker, encoder)
         now = self.now()
         row = self.conn.execute(
             "SELECT * FROM videos WHERE stage='leased' AND worker=? AND lease_until>=?"
@@ -144,7 +158,7 @@ class JobStore:
                 "resumed": True, "retry_after": 0.0}
 
     def _claim(self, worker: str, encoder: str, downloads: Budget) -> dict:
-        self._seen()
+        self._seen(worker, encoder)
         self.expire_leases()
         if downloads.blocked():
             return {"job": None, "retry_after": downloads.seconds_until_reset()}
@@ -186,7 +200,7 @@ class JobStore:
 
     def heartbeat(self, job_id: int, worker: str, download_account: str = "main") -> dict:
         downloads = self._download_budget(download_account)
-        self._seen()
+        self._seen(worker, self._row_encoder(job_id))
         now = self.now()
         with db.transaction(self.conn):
             ok = self._is_leased_by(job_id, worker, now) and self._update_leased(
@@ -195,7 +209,7 @@ class JobStore:
 
     def report(self, job_id: int, worker: str, outcome: str, download_account: str = "main",
                **data) -> None:
-        self._seen()
+        self._seen(worker, self._row_encoder(job_id))
         now = self.now()
         with db.transaction(self.conn):
             if outcome == "uploaded":
@@ -246,21 +260,22 @@ class JobStore:
             elif outcome == "download_quota":
                 self._download_budget(download_account).block(self.cfg.download_block_secs)
                 self._mark_leased_or_raise(job_id, worker, now, "queued", clear)
-                if download_account == "pc":
-                    self.log("PC's own Drive account hit its download quota; "
-                             "PC downloads paused")
+                if download_account == "main":
+                    self.log(f"{worker} hit Drive's download quota; "
+                             "downloads paused for everyone")
                 else:
-                    self.log("PC hit Drive's download quota; downloads paused for everyone")
+                    self.log(f"{worker}'s Drive account ({download_account}) hit its "
+                             "download quota; its downloads paused")
             elif outcome == "upload_limited":
                 self.uploads.block(self.cfg.rate_limit_block_secs)
                 self._mark_leased_or_raise(job_id, worker, now, "queued", clear)
-                self.log("PC hit Drive's upload limit; uploads paused for everyone")
+                self.log(f"{worker} hit Drive's upload limit; uploads paused for everyone")
             else:
                 raise ValueError(f"unknown outcome {outcome!r}")
         self.log(f"{worker} reported {outcome}: {row['path']}")
 
     def release(self, job_id: int, worker: str) -> None:
-        self._seen()
+        self._seen(worker, self._row_encoder(job_id))
         now = self.now()
         with db.transaction(self.conn):
             row = self._leased_by(job_id, worker, now)

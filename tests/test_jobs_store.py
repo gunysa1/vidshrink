@@ -421,3 +421,43 @@ def test_claim_and_heartbeat_report_download_today(conn, cfg, store):
                                                            cfg.daily_download_limit)
     empty = store.claim("pc")  # no work left: still reports the totals
     assert empty["job"] is None and empty["download_used"] == 5_000_001_000
+
+
+def test_cloud_account_has_its_own_budget(conn, store):
+    add(conn, "a.mkv", size=7_000_000_000)
+    assert store.claim("cloud-vm", "x265-cloud", "cloud")["job"] is not None
+    assert store.cloud_downloads.used() == 7_000_000_000
+    assert store.downloads.used() == 0
+    assert store.pc_downloads.used() == 0
+
+
+def test_cloud_download_quota_blocks_only_cloud(conn, store):
+    jid = add(conn, "a.mkv")
+    store.claim("cloud-vm", "x265-cloud", "cloud")
+    store.report(jid, "cloud-vm", "download_quota", download_account="cloud")
+    assert store.cloud_downloads.blocked()
+    assert not store.downloads.blocked()
+    assert not store.pc_downloads.blocked()
+
+
+def test_hdr_offered_to_x265_cloud_not_nvenc(conn, store):
+    hdr = add(conn, "hdr.mkv", probe=replace(BASE, color_transfer="smpte2084"))
+    assert store.claim("pc")["job"] is None
+    assert store.claim("cloud-vm", "x265-cloud", "cloud")["job"]["id"] == hdr
+
+
+def test_cloud_activity_does_not_refresh_pc_seen(conn, store):
+    jid = add(conn, "a.mkv")
+    assert store.claim("cloud-vm", "x265-cloud", "cloud")["job"]["id"] == jid
+    store.heartbeat(jid, "cloud-vm", "cloud")
+    store.report(jid, "cloud-vm", "failed", download_account="cloud", reason="x")
+    assert db.kv_get(conn, PC_SEEN_KEY) is None
+    assert db.kv_get(conn, "seen:cloud-vm") == str(store.clock.t)
+
+
+def test_pc_heartbeat_still_refreshes_pc_seen(conn, store):
+    jid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.clock.t += 100
+    store.heartbeat(jid, "pc")
+    assert db.kv_get(conn, PC_SEEN_KEY) == str(store.clock.t)

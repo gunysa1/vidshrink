@@ -28,6 +28,7 @@ class Config:
     # The PC's own (second) Google account, used only for downloads, with its own
     # separate quota -- so PC jobs no longer spend the main account's 500 GB/day.
     daily_pc_download_limit: int = 750_000_000_000  # raised 2026-10-08 after a clean day on the main account
+    daily_cloud_download_limit: int = 750_000_000_000  # the cloud VM's own Drive account, same cap as the PC's
     max_ready: int = 2
     max_attempts: int = 2
     max_consecutive_failures: int = 5
