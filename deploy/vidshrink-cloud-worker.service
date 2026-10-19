@@ -1,12 +1,16 @@
 [Unit]
 Description=vidshrink cloud worker (x265)
-After=network-online.target tailscaled.service
-Wants=network-online.target tailscaled.service
+# No After=/Wants= on network-online.target or tailscaled.service: they do nothing
+# in a user manager. The worker retries until the job service is reachable.
 
 [Service]
 Type=simple
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/vidshrink/.venv/bin/vidshrink pc-worker --config %h/.config/vidshrink/config.toml
+# Stop sends SIGINT to the main process only (the Ctrl-C path: release the job,
+# clean up); ffmpeg/rclone children get SIGTERM once it has exited.
+KillMode=mixed
+KillSignal=SIGINT
 # A clean exit (a local fault such as a dead Drive login) is not restarted;
 # re-authorize, then start the unit by hand.
 Restart=on-failure

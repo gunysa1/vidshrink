@@ -61,10 +61,25 @@ picks the right one), then check `rclone version`.
 
 ### vidshrink
 
+The repo has no remote: the code is pushed from the server, which already has SSH access
+to the VM (the VM gets no access to the server). On the VM:
+
 ```bash
-cd ~
-git clone <repo-url> vidshrink
-cd vidshrink
+sudo apt install -y python3-venv git xz-utils
+git init ~/vidshrink
+git -C ~/vidshrink config receive.denyCurrentBranch updateInstead
+```
+
+Then, on the server, from the vidshrink checkout (repeat the push to update the VM):
+
+```bash
+git push ubuntu@<vm>:vidshrink master
+```
+
+Back on the VM:
+
+```bash
+cd ~/vidshrink
 python3 -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/vidshrink --help
@@ -109,16 +124,17 @@ paste the token at "config_token". Set the root so it points at the same Drive r
 server's `gdrive:` (copy the non-secret options such as `root_folder_id` from the server's
 config; not its token).
 
-Download remote: model `gdrive-cloud:` on the PC's existing download remote for its own
-second account. Use the same non-secret options (`root_folder_id`, shared-with-me
-settings and so on), but a fresh authorization:
+Download remote, `gdrive-cloud:`, follows the PC's recipe (`docs/pc-setup.md`, the
+second-account section) with a fresh authorization:
 
 ```bash
 rclone authorize "drive"
 ```
 
-Log in as the new download account, then on the VM create the remote `gdrive-cloud`
-(type `drive`, scope read only) and paste the token.
+Log in as the new download account, then on the VM run `rclone config` and create the
+remote `gdrive-cloud` with: type `drive`, scope `drive.readonly`, and in the advanced
+options `shared_with_me = true`. The default rclone client is fine for this read-only
+account. Paste the token at "config_token".
 
 ### Check that the paths line up
 
@@ -139,8 +155,10 @@ Create the work directory and `~/.config/vidshrink/config.toml`:
 
 ```bash
 mkdir -p ~/vidshrink-work ~/.config/vidshrink
-chmod 600 ~/.config/vidshrink/config.toml   # after creating it
+install -m 600 /dev/null ~/.config/vidshrink/config.toml
 ```
+
+Then write this into it (the file is already private, mode 600):
 
 ```toml
 server = "http://<server-tailnet-name>:8765"
