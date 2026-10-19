@@ -1366,6 +1366,51 @@ def test_resume_unreachable_then_stop_deletes_nothing(conn, setup, monkeypatch):
     assert_reserved(conn, vid)
 
 
+def test_resume_malformed_reply_keeps_files_and_retries(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    leave_job(conn, store, pc, root, vid, "downloaded")
+    files = sorted(pc.cfg.workdir.iterdir())
+    calls = []
+    orig_resume = pc.client.resume
+
+    def malformed(worker, encoder, download_account, jobs):
+        calls.append(1)
+        assert sorted(pc.cfg.workdir.iterdir()) == files  # nothing deleted meanwhile
+        if len(calls) == 1:
+            return {}  # an empty 200 body
+        if len(calls) == 2:
+            return {"resumed": []}  # no "refused" list
+        return orig_resume(worker, encoder, download_account, jobs)
+
+    monkeypatch.setattr(pc.client, "resume", malformed)
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        assert len(calls) == 3
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_resume_unlisted_id_kept(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    leave_job(conn, store, pc, root, vid, "downloaded")
+    files = sorted(pc.cfg.workdir.iterdir())
+    logs = []
+    pc.log = logs.append
+    monkeypatch.setattr(pc.client, "resume", lambda *a: {"resumed": [], "refused": []})
+    stop_on_claim(pc, monkeypatch)
+    t = run_in_thread(pc)
+    t.join(15)
+    assert not t.is_alive()
+    assert sorted(pc.cfg.workdir.iterdir()) == files  # kept, not cleaned
+    assert vid not in pc.queue.held_ids()  # but not worked on
+    assert any("neither resumed nor refused" in m for m in logs)
+    assert_reserved(conn, vid)
+
+
 def test_refused_resume_deletes_local_files(conn, setup, monkeypatch):
     root, pc, store = setup
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]

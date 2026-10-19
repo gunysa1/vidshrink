@@ -143,6 +143,11 @@ class LocalQueue:
                 return False
         return True
 
+    def drop(self, job_id: int) -> None:
+        """Stop holding the job in memory; its files stay on disk."""
+        with self._lock:
+            self._jobs.pop(job_id, None)
+
     def forget(self, job_id: int) -> None:
         """Drop the job and delete every file of that id."""
         from vidshrink.pc_worker import _NUMBERED_PATTERNS  # lazy: pc_worker imports us

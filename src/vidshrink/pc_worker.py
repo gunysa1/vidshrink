@@ -425,18 +425,21 @@ class PCWorker:
             except (LeaseLost, JobServiceError):
                 pass  # not ours any more, or the server is down: it expires
             self.queue.forget(jid)
-        if offered and not self._resume(offered):
+        unlisted: set[int] = set()
+        if offered and (unlisted := self._resume(offered)) is None:
             return False
         with self._cv:
             held = set(self._jobs)
-        deleted = clean_workdir(self.cfg.workdir, held)
+        deleted = clean_workdir(self.cfg.workdir, held | unlisted)
         if deleted:
             self.log(f"cleaned stale work files: {', '.join(p.name for p in deleted)}")
         return True
 
-    def _resume(self, offered: list[LocalJob]) -> bool:
-        """Ask the server to confirm `offered`, retrying until it answers; False if
-        Stop is pressed first."""
+    def _resume(self, offered: list[LocalJob]) -> set[int] | None:
+        """Ask the server to confirm `offered`, retrying until it gives a proper
+        answer; None if Stop is pressed first. Local files are deleted only for an
+        explicit refusal. Returns the ids the answer named neither way: they are
+        left on disk, untouched, and not worked on."""
         items = [{"id": lj.id, "size": lj.job["size"], "modtime": lj.job["modtime"],
                   "reserve_secs": self.cfg.reserve_days * 86400} for lj in offered]
         self._resuming = len(offered)
@@ -445,21 +448,30 @@ class PCWorker:
                 try:
                     resp = self.client.resume(self.cfg.worker_name, self.cfg.encoder,
                                               self.download_account, items)
+                    if not (isinstance(resp, dict) and isinstance(resp.get("resumed"), list)
+                            and isinstance(resp.get("refused"), list)):
+                        raise JobServiceError(f"malformed resume reply: {resp!r:.200}")
                     break
                 except JobServiceError as e:
                     self.log(f"job service unreachable, retrying resume: {e}")
                     if self._wait_stop(self.cfg.idle_secs):
-                        return False
+                        return None
         finally:
             self._resuming = 0
-        confirmed = {int(j["id"]): j for j in resp.get("resumed") or ()}
-        refused = {int(i) for i in resp.get("refused") or ()}
+        confirmed = {int(j["id"]): j for j in resp["resumed"]}
+        refused = {int(i) for i in resp["refused"]}
+        unlisted = set()
         for lj in offered:
             job = confirmed.get(lj.id)
             if job is None:
                 if lj.id in refused:
                     self.log(f"resume refused, deleting: {lj.job.get('path')}")
-                self.queue.forget(lj.id)
+                    self.queue.forget(lj.id)
+                else:
+                    self.log(f"resume neither resumed nor refused {lj.job.get('path')}; "
+                             f"leaving its files for the next start")
+                    self.queue.drop(lj.id)
+                    unlisted.add(lj.id)
                 continue
             lj.job.update(job)  # the server's fresh view, e.g. expected_hours
             with self._cv:
@@ -468,7 +480,7 @@ class PCWorker:
                 self._reserved.add(lj.id)
             self._push(self._to_encode if lj.state == "downloaded" else self._to_upload, lj)
             self.log(f"resumed ({lj.state}): {lj.job.get('path')}")
-        return True
+        return unlisted
 
     def _on_stopped(self) -> None:
         """Every stage has exited. A job that never finished downloading is released
@@ -667,6 +679,7 @@ class PCWorker:
                     self.queue.set_state(lj.id, state)
                 except KeyError:
                     continue
+                self._wake.set()  # the claim filter depends on what waits behind
                 return lj
             if not dropped:
                 self._cv.wait(0.5)
