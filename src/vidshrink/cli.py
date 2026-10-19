@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 import threading
@@ -8,7 +9,7 @@ from pathlib import Path
 from vidshrink import db, scorer
 from vidshrink.budget import Budget
 from vidshrink.config import Config
-from vidshrink.jobs import PC_SEEN_KEY, JobStore, load_or_create_token, make_server
+from vidshrink.jobs import ALERT_PREFIX, PC_SEEN_KEY, WORKER_SEEN_PREFIX, JobStore, load_or_create_token, make_server
 from vidshrink.probe import Probe
 from vidshrink.rclone import Rclone, free_port, serve_http, served_stats
 from vidshrink.paths import tmp_path
@@ -90,6 +91,18 @@ def status_report(conn, cfg: Config, budget: Budget) -> str:
         pc_paused = " (PAUSED: Drive download quota hit)" if pc_downloads.blocked() else ""
         lines.append(f"PC account downloaded today: {pc_downloads.used() / 1e9:.0f} / "
                      f"{pc_downloads.limit / 1e9:.0f} GB{pc_paused}")
+    cloud_downloads = Budget(conn, cfg.daily_cloud_download_limit, budget.now, kind="cloud_download")
+    if cloud_downloads.used() > 0 or cloud_downloads.blocked():
+        cloud_paused = " (PAUSED: Drive download quota hit)" if cloud_downloads.blocked() else ""
+        lines.append(f"Cloud account downloaded today: {cloud_downloads.used() / 1e9:.0f} / "
+                     f"{cloud_downloads.limit / 1e9:.0f} GB{cloud_paused}")
+    for row in conn.execute("SELECT key, value FROM kv WHERE key LIKE ? ORDER BY key",
+                            (f"{WORKER_SEEN_PREFIX}%",)):
+        ago = (budget.now() - float(row["value"])) / 3600
+        lines.append(f"{row['key'][len(WORKER_SEEN_PREFIX):]} last seen: {ago:.1f} h ago")
+    for row in conn.execute("SELECT key, value FROM kv WHERE key LIKE ? ORDER BY key",
+                            (f"{ALERT_PREFIX}%",)):
+        lines.append(f"ALERT {row['key'][len(ALERT_PREFIX):]}: {json.loads(row['value'])['message']}")
     return "\n".join(lines)
 
 

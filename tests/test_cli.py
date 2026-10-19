@@ -4,7 +4,7 @@ from pathlib import Path
 from vidshrink import db
 from vidshrink.budget import Budget
 from vidshrink.cli import main, status_report
-from vidshrink.jobs import PC_SEEN_KEY
+from vidshrink.jobs import PC_SEEN_KEY, JobStore
 
 
 def test_scan_run_status_end_to_end(cfg, make_clip, capsys, monkeypatch):
@@ -88,3 +88,27 @@ def test_status_hides_pc_download_budget_once_pc_absent_long_enough(conn, cfg):
     db.kv_set(conn, PC_SEEN_KEY, str(budget.now() - (cfg.pc_absent_days + 1) * 86400))
     out = status_report(conn, cfg, budget)
     assert "PC account downloaded today" not in out
+
+
+def test_status_shows_cloud_downloads(conn, cfg):
+    budget = Budget(conn, cfg.daily_upload_limit)
+    Budget(conn, cfg.daily_cloud_download_limit, budget.now, kind="cloud_download").add(12 * 10**9)
+    out = status_report(conn, cfg, budget)
+    assert "Cloud account downloaded today: 12 / 750 GB" in out and "PAUSED" not in out.split("Cloud")[1]
+
+
+def test_status_shows_worker_last_seen(conn, cfg):
+    budget = Budget(conn, cfg.daily_upload_limit)
+    db.kv_set(conn, "seen:cloud-vm", str(budget.now() - 7200))
+    assert "cloud-vm last seen: 2.0 h ago" in status_report(conn, cfg, budget)
+
+
+def test_status_shows_alerts(conn, cfg):
+    JobStore(conn, cfg, None).alert("cloud-vm", "Drive auth expired")
+    out = status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))
+    assert "ALERT cloud-vm: Drive auth expired" in out
+
+
+def test_status_has_no_cloud_lines_without_cloud_activity(conn, cfg):
+    out = status_report(conn, cfg, Budget(conn, cfg.daily_upload_limit))
+    assert "Cloud" not in out and "ALERT" not in out and "last seen" not in out
