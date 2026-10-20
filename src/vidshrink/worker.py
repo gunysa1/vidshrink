@@ -374,12 +374,22 @@ class Worker:
         total = shutil.disk_usage(self.cfg.workdir).total
         if need > total:
             raise DiskTooSmall(f"needs {need / 1e9:.0f} GB disk, only {total / 1e9:.0f} GB total")
-        while shutil.disk_usage(self.cfg.workdir).free < need:
+        while shutil.disk_usage(self.cfg.workdir).free < need + self._pending_output():
             if not block:
                 return False
             self.log(f"waiting for {need / 1e9:.0f} GB free disk")
             self.sleep(self.cfg.disk_wait_secs)
         return True
+
+    def _pending_output(self) -> int:
+        """Disk the unfinished encodes still need: up to each source's size of output
+        beyond what its out file holds now. Free space doesn't show it yet, and a
+        download fetched ahead mustn't take it (the serial worker never overlapped)."""
+        pending = 0
+        for row in db.rows_in(self.conn, "downloaded", "encoding"):
+            out = self._out(row["id"])
+            pending += max(0, row["size"] - (out.stat().st_size if out.exists() else 0))
+        return pending
 
     def start_download(self, row, block: bool = True) -> bool:
         """Mark the row `downloading` if it can start now; False if it was skipped

@@ -606,3 +606,32 @@ def test_interrupted_run_leaves_unfinished_transfers_for_recover(conn, cfg, env,
     assert db.get(conn, waiting["id"])["stage"] == "downloaded"
     r = db.get(conn, fetched["id"])
     assert (r["stage"], r["attempts"]) == ("queued", 0)
+
+
+@pytest.mark.parametrize("spare", [-1, 0])
+def test_prefetch_disk_check_reserves_running_encode_output(conn, cfg, env, monkeypatch, spare):
+    from collections import namedtuple
+    _, worker = env
+    cfg.workdir.mkdir(parents=True, exist_ok=True)
+    worker.cfg.disk_factor, worker.cfg.disk_reserve = 1.0, 0
+    encoding = db.get_by_path(conn, "Movies/a.mkv")
+    nxt = db.get_by_path(conn, "Movies/b.mp4")
+    db.mark(conn, encoding["id"], "encoding")
+    written = encoding["size"] // 4
+    worker._out(encoding["id"]).write_bytes(b"x" * written)   # the encode has a way to go
+    # Free space covers the next download alone, but only covers it plus the running
+    # encode's remaining output when spare >= 0.
+    free = nxt["size"] + (encoding["size"] - written) + spare
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: usage(10**15, 0, free))
+    assert free < nxt["size"] + encoding["size"] and free >= nxt["size"] - 1
+    worker._start_transfers()
+    if spare < 0:
+        assert worker._down is None
+        assert db.get(conn, nxt["id"])["stage"] == "queued"
+    else:
+        assert worker._down is not None
+        assert db.get(conn, nxt["id"])["stage"] == "downloading"
+        assert worker._down[1].wait(30)
+        assert worker._finish_transfers() == 0
+        assert db.get(conn, nxt["id"])["stage"] == "downloaded"
