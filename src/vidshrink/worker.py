@@ -1,5 +1,6 @@
 import fcntl
 import shutil
+import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ from vidshrink.jobs import BUSY_STAGES, PC_SEEN_KEY, JobStore
 from vidshrink.paths import final_path, is_valid_md5, md5_file, tmp_path  # re-exported for callers/tests
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
 from vidshrink.rclone import Rclone, RcloneError, with_retries
+from vidshrink.transfer import Transfer
 from vidshrink.verify import compare, decode_errors
 
 
@@ -60,11 +62,17 @@ class Worker:
         self.sleep = sleep
         self.log = log
         self.jobs = JobStore(conn, cfg, rclone, now=budget.now, log=log)
-        self.failures = 0  # consecutive prepare/upload failures with no success between
+        self.failures = 0  # consecutive download/encode/upload failures with no success between
         self._remote_fail_at = None  # self.clock() of the last remote_ready check we couldn't
         # complete (RcloneError), so we don't hammer Drive every loop iteration for it
-        self._remote_done_during_encode = 0  # remote_ready rows swapped via _encode_tick()
+        self._done_during_encode = 0  # rows finished (swapped) via _encode_tick()
         self._dry_run = False  # set for the duration of run(); guards _encode_tick's swap
+        # Background transfers, as (row snapshot, Transfer): at most one download
+        # (fetching the next file) and one upload. Only the main thread records them.
+        self._down: tuple | None = None
+        self._up: tuple | None = None
+        self._deferred: Exception | None = None  # raised by a transfer finished in a tick;
+        # re-raised by the main loop once the encode returns, as it would have been there
 
     # --- work files -------------------------------------------------------
     def _src(self, vid: int) -> Path:
@@ -186,8 +194,18 @@ class Worker:
 
     def _encode_tick(self) -> None:
         """Called every idle_poll_secs while the server's own ffmpeg encode runs, so
-        a PC upload doesn't wait hours behind a long movie. Never raises into
-        run_encode: any failure here must not interrupt the server's own encode."""
+        the next download, an upload and a PC upload don't wait hours behind a long
+        movie. Never raises into run_encode: any failure here must not interrupt the
+        server's own encode."""
+        if self._deferred is None:  # else the loop crashes as soon as the encode ends
+            try:
+                self._done_during_encode += self._finish_transfers()
+                self._start_transfers()
+            except Exception as e:
+                self.log(f"transfer check during encode failed: {e!r}")
+                self._deferred = e
+        if self._dry_run:
+            return  # a dry run must not swap/delete anything for real
         try:
             self.jobs.expire_leases()
             while True:
@@ -195,9 +213,78 @@ class Worker:
                 if result == 0:
                     break
                 if result > 0:
-                    self._remote_done_during_encode += 1
+                    self._done_during_encode += 1
         except Exception as e:
             self.log(f"PC result check during encode failed: {e!r}")
+
+    # --- background transfers (recorded on the main thread only) -----------
+    def _finish_transfers(self) -> int:
+        """Record finished transfers; returns how many rows that completed."""
+        finished = 0
+        if self._down is not None and self._down[1].done():
+            (row, transfer), self._down = self._down, None
+            try:
+                transfer.result()
+            except Exception as e:
+                self.finish_download(row, error=e)
+            else:
+                self.finish_download(row)
+        if self._up is not None and self._up[1].done():
+            (row, transfer), self._up = self._up, None
+            try:
+                transfer.result()
+            except Exception as e:
+                finished += self.finish_upload(row, e, self._dry_run)
+            else:
+                finished += self.finish_upload(row, None, self._dry_run)
+        return finished
+
+    def _start_transfers(self, block: bool = False) -> None:
+        """Start an upload of a ready row and fetch the next file ahead, each if none
+        is running and the budgets allow. Waits for disk only when `block` is set and
+        no upload is running (recording it is what frees the disk after a swap)."""
+        if self.failures >= self.cfg.max_consecutive_failures:
+            return  # the loop is about to stop
+        ready = db.rows_in(self.conn, "ready")
+        if self._up is None and ready and self.budget.allows(ready[0]["out_size"]):
+            self._up = (ready[0], self.start_upload(ready[0]))
+        if (self._down is not None or db.rows_in(self.conn, "downloaded")
+                or len(ready) >= self.cfg.max_ready):
+            return
+        row = self._next_job()
+        if row is not None and self.download_budget.allows(row["size"]):
+            if self.start_download(row, block=block and self._up is None):
+                cancel = threading.Event()
+                self._down = (db.get(self.conn, row["id"]), Transfer(
+                    lambda: self._download(row, cancel), cancel=cancel))
+
+    def _wait_transfers(self) -> None:
+        """Wait up to idle_poll_secs for a running transfer to finish."""
+        running = [t for _, t in filter(None, (self._down, self._up))]
+        deadline = time.monotonic() + self.cfg.idle_poll_secs
+        while not any(t.done() for t in running) and time.monotonic() < deadline:
+            running[0].wait(min(0.5, max(0.0, deadline - time.monotonic())))
+
+    def _drain_transfers(self) -> int:
+        """On a normal exit: let running transfers finish and record them."""
+        finished = 0
+        while self._down is not None or self._up is not None:
+            self._wait_transfers()
+            finished += self._finish_transfers()
+        return finished
+
+    def _cancel_transfers(self) -> None:
+        """On a crash or Ctrl-C: stop running transfers without recording them. Their
+        rows stay downloading/uploading, which recover() settles on the next start."""
+        for pending in (self._down, self._up):
+            if pending is not None:
+                pending[1].cancel()
+        self._down = self._up = None
+
+    def _raise_deferred(self) -> None:
+        if self._deferred is not None:
+            e, self._deferred = self._deferred, None
+            raise e
 
     def _pc_holds_work(self) -> bool:
         return bool(db.rows_in(self.conn, "leased", "remote_ready")) or (
@@ -210,87 +297,93 @@ class Worker:
         with _lock(self.cfg.workdir):
             done = self.recover(dry_run)
             self.failures = 0
-            last_reconcile = self.clock()
-            while limit is None or done < limit:
-                if self.failures >= self.cfg.max_consecutive_failures:
-                    self.log(f"!!! STOPPING: {self.failures} failures in a row with no success; "
-                             f"something is wrong beyond a single file (see reasons in status)")
-                    break
-                if (not dry_run and self.clock() - last_reconcile >= self.cfg.swap_retry_secs
-                        and db.rows_in(self.conn, "swapping")):
-                    done += self._reconcile_swaps()
-                    last_reconcile = self.clock()
-                self.jobs.expire_leases()
-                if not dry_run:
-                    serviced = self._service_remote()
-                    if serviced > 0:
-                        done += 1
-                        continue
-                    if serviced < 0:
-                        continue
-                ready = db.rows_in(self.conn, "ready")
-                if ready and self.budget.allows(ready[0]["out_size"]):
-                    if self.upload_and_swap(ready[0], dry_run):
-                        done += 1
-                    continue
-                waiting = db.rows_in(self.conn, "downloaded")
-                if waiting and len(ready) < self.cfg.max_ready:
-                    # A download reused after a restart (Task 7 moves this off the loop).
-                    self.encode_and_verify(waiting[0])
-                    done += self._remote_done_during_encode
-                    self._remote_done_during_encode = 0
-                    continue
-                row = self._next_job() if len(ready) < self.cfg.max_ready else None
-                if row is not None and self.download_budget.allows(row["size"]):
-                    self.prepare(row)
-                    done += self._remote_done_during_encode
-                    self._remote_done_during_encode = 0
-                    continue
-                if not ready and row is None:
-                    if dry_run or not self._pc_holds_work():
-                        break
-                    self.sleep(self.cfg.idle_poll_secs)
-                    continue
-                waits = {}
-                if ready:
-                    waits["upload"] = self.budget.seconds_until_reset()
-                if row is not None:
-                    waits["download"] = self.download_budget.seconds_until_reset()
-                kind = min(waits, key=waits.get)
-                wait = waits[kind]
-                if self._pc_holds_work():
-                    # Wake up regularly anyway: a PC result (remote_ready) needs no
-                    # budget of ours to verify and swap, and must not sit for hours.
-                    wait = min(wait, self.cfg.idle_poll_secs)
-                self.log(f"{' and '.join(waits)} budget used up; "
-                         f"sleeping {wait / 3600:.1f} h")
-                self.sleep(wait)
-            return done
+            try:
+                done += self._loop(done, limit, dry_run)
+                return done + self._drain_transfers()
+            except BaseException:
+                self._cancel_transfers()
+                raise
 
-    def _wait_for_disk(self, size: int) -> None:
+    def _loop(self, done: int, limit: int | None, dry_run: bool) -> int:
+        """The work loop; returns how many rows it completed. Downloads and uploads
+        run in the background (see _start_transfers) while this thread encodes."""
+        start = done
+        last_reconcile = self.clock()
+        while limit is None or done < limit:
+            done += self._finish_transfers()
+            self._raise_deferred()
+            if self.failures >= self.cfg.max_consecutive_failures:
+                self.log(f"!!! STOPPING: {self.failures} failures in a row with no success; "
+                         f"something is wrong beyond a single file (see reasons in status)")
+                break
+            if (not dry_run and self.clock() - last_reconcile >= self.cfg.swap_retry_secs
+                    and db.rows_in(self.conn, "swapping")):
+                done += self._reconcile_swaps()
+                last_reconcile = self.clock()
+            self.jobs.expire_leases()
+            if limit is not None and done >= limit:
+                break
+            if not dry_run:
+                serviced = self._service_remote()
+                if serviced > 0:
+                    done += 1
+                    continue
+                if serviced < 0:
+                    continue
+            # Waiting for disk is fine only with nothing else under way: no transfer
+            # to record and no download waiting to be encoded.
+            idle = self._down is None and self._up is None
+            self._start_transfers(block=idle and not db.rows_in(self.conn, "downloaded"))
+            ready = db.rows_in(self.conn, "ready")
+            waiting = db.rows_in(self.conn, "downloaded")
+            if waiting and len(ready) < self.cfg.max_ready:
+                self.encode_and_verify(waiting[0])
+                done += self._done_during_encode
+                self._done_during_encode = 0
+                continue
+            if self._down is not None or self._up is not None:
+                self._wait_transfers()
+                continue
+            row = self._next_job() if len(ready) < self.cfg.max_ready else None
+            if row is not None and self.download_budget.allows(row["size"]):
+                continue  # it was settled (e.g. failed, or taken by the PC) instead
+            if not ready and row is None:
+                if dry_run or not self._pc_holds_work():
+                    break
+                self.sleep(self.cfg.idle_poll_secs)
+                continue
+            waits = {}
+            if ready:
+                waits["upload"] = self.budget.seconds_until_reset()
+            if row is not None:
+                waits["download"] = self.download_budget.seconds_until_reset()
+            kind = min(waits, key=waits.get)
+            wait = waits[kind]
+            if self._pc_holds_work():
+                # Wake up regularly anyway: a PC result (remote_ready) needs no
+                # budget of ours to verify and swap, and must not sit for hours.
+                wait = min(wait, self.cfg.idle_poll_secs)
+            self.log(f"{' and '.join(waits)} budget used up; "
+                     f"sleeping {wait / 3600:.1f} h")
+            self.sleep(wait)
+        return done - start
+
+    def _wait_for_disk(self, size: int, block: bool = True) -> bool:
+        """True once there is room for `size`; without `block`, False instead of waiting."""
         need = self.cfg.disk_factor * size + self.cfg.disk_reserve
         total = shutil.disk_usage(self.cfg.workdir).total
         if need > total:
             raise DiskTooSmall(f"needs {need / 1e9:.0f} GB disk, only {total / 1e9:.0f} GB total")
         while shutil.disk_usage(self.cfg.workdir).free < need:
+            if not block:
+                return False
             self.log(f"waiting for {need / 1e9:.0f} GB free disk")
             self.sleep(self.cfg.disk_wait_secs)
+        return True
 
-    def prepare(self, row) -> None:
-        """Download then encode one row, start to finish (start_download, _download,
-        finish_download and encode_and_verify run in order on this thread)."""
-        if not self.start_download(row):
-            return
-        try:
-            self._download(row)
-        except (RcloneError, OSError) as e:
-            self.finish_download(row, error=e)
-            return
-        if self.finish_download(row):
-            self.encode_and_verify(db.get(self.conn, row["id"]))
-
-    def start_download(self, row) -> bool:
-        """Mark the row `downloading` if it can start now; False if it was skipped."""
+    def start_download(self, row, block: bool = True) -> bool:
+        """Mark the row `downloading` if it can start now; False if it was skipped
+        (or, without `block`, if the disk is too full to start right now)."""
         vid, path = row["id"], row["path"]
         final = final_path(path)
         try:
@@ -298,7 +391,8 @@ class Worker:
                 db.mark_if(self.conn, vid, ("queued",), "failed",
                           reason=f"target {final} already exists")
                 return False
-            self._wait_for_disk(row["size"])
+            if not self._wait_for_disk(row["size"], block):
+                return False  # fetching ahead: try again later rather than wait here
             self.log(f"downloading {path} ({row['size'] / 1e9:.1f} GB)")
             # The interruption marker (reason) stays through downloading/downloaded/
             # encoding/verifying and is cleared only when the work completes (-> ready),
@@ -327,9 +421,10 @@ class Worker:
                      f"(leased to another worker?)")
         return started
 
-    def _download(self, row) -> None:
+    def _download(self, row, cancel: threading.Event | None = None) -> None:
         """Only the rclone transfer: no database access, so it may run off the main thread."""
-        self._retry(lambda: self.rclone.download(row["path"], self._src(row["id"])))
+        self._retry(lambda: self.rclone.download(row["path"], self._src(row["id"]),
+                                                 cancel=cancel))
 
     def finish_download(self, row, error: Exception | None = None) -> bool:
         """After the transfer (or its `error`): count it, check the size, mark `downloaded`."""
@@ -360,12 +455,11 @@ class Worker:
         try:
             self.log(f"encoding {path}")
             db.mark(self.conn, vid, "encoding")
-            # Service PC (remote_ready) results every idle_poll_secs while this
-            # potentially hours-long encode runs, so they don't wait behind it; never
-            # during a dry run, which must not swap/delete anything for real.
-            tick = None if self._dry_run else self._encode_tick
+            # Record transfers, start the next ones and service PC (remote_ready)
+            # results every idle_poll_secs while this potentially hours-long encode
+            # runs, so they don't wait behind it.
             secs = run_encode(build_command(src, out, probe, self.cfg), self._logfile(vid),
-                              tick=tick, tick_secs=self.cfg.idle_poll_secs)
+                              tick=self._encode_tick, tick_secs=self.cfg.idle_poll_secs)
             db.mark(self.conn, vid, "verifying", encode_secs=secs)
             out_size = out.stat().st_size
             out_probe = parse_ffprobe(run_ffprobe(str(out)), out_size)
@@ -383,15 +477,17 @@ class Worker:
                 return
             md5 = md5_file(out)
         except (RcloneError, EncodeError, ProbeError, OSError) as e:
-            self._on_error(row, e)
+            self._on_error(row, e, keep_src=True)
             return
         self._cleanup(vid, keep_output=True)
         db.mark(self.conn, vid, "ready", out_size=out_size, out_md5=md5, final_path=final,
                 reason=None)
         self.failures = 0
 
-    def _on_error(self, row, e: Exception) -> None:
-        """Settle a row whose download/encode raised `e`; re-raises when a tool vanished."""
+    def _on_error(self, row, e: Exception, keep_src: bool = False) -> None:
+        """Settle a row whose download/encode raised `e`; re-raises when a tool vanished.
+        `keep_src`: the download is complete (the encode failed), so when a tool vanished
+        the row goes back to `downloaded` with it, for the next start to reuse."""
         vid = row["id"]
         if isinstance(e, FileNotFoundError):
             if e.filename not in self._tools():
@@ -401,8 +497,13 @@ class Worker:
                 return
             # A tool (rclone/ffmpeg/ffprobe) vanished: not this file's fault, so crash
             # without burning an attempt and leave the row to be picked up again.
-            self._cleanup(vid)
-            db.mark(self.conn, vid, "queued")
+            if keep_src:
+                self._out(vid).unlink(missing_ok=True)
+                self._logfile(vid).unlink(missing_ok=True)
+                db.mark(self.conn, vid, "downloaded")
+            else:
+                self._cleanup(vid)
+                db.mark(self.conn, vid, "queued")
             raise e
         if isinstance(e, RcloneError) and e.download_quota:
             # Not this file's fault: pause all downloads, keep the file queued.
@@ -414,13 +515,24 @@ class Worker:
             return
         self._fail(row, str(e))
 
-    def upload_and_swap(self, row, dry_run: bool) -> bool:
-        vid, path = row["id"], row["path"]
-        tmp = tmp_path(path)
+    def start_upload(self, row) -> Transfer:
+        """Mark a ready row `uploading` and start uploading it in the background;
+        finish_upload records the outcome."""
+        vid, tmp = row["id"], tmp_path(row["path"])
         db.mark(self.conn, vid, "uploading")
         self.log(f"uploading {tmp} ({row['out_size'] / 1e9:.1f} GB)")
+        cancel = threading.Event()
+        return Transfer(lambda: self._retry(
+            lambda: self.rclone.upload(self._out(vid), tmp, cancel=cancel)), cancel=cancel)
+
+    def finish_upload(self, row, error: Exception | None, dry_run: bool) -> bool:
+        """After the upload (or its `error`): check the md5, count it, then swap (or,
+        in a dry run, stop at `dry_run`). True if the row is finished."""
+        vid, path = row["id"], row["path"]
+        tmp = tmp_path(path)
         try:
-            self._retry(lambda: self.rclone.upload(self._out(vid), tmp))
+            if error is not None:
+                raise error
             remote_md5 = self.rclone.md5(tmp)
         except RcloneError as e:
             if e.rate_limited:

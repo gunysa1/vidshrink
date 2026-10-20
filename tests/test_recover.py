@@ -116,18 +116,21 @@ def test_recover_requeues_truncated_download(conn, cfg, setup):
     assert not (cfg.workdir / f"{vid}.src").exists()
 
 
-def test_recover_interrupted_encode_with_complete_src_goes_to_downloaded(conn, cfg, setup):
+@pytest.mark.parametrize("stage", ["encoding", "verifying"])
+def test_recover_interrupted_encode_with_complete_src_goes_to_downloaded(conn, cfg, setup,
+                                                                         stage):
     root, worker, row = setup
-    vid = row("e.mkv", "encoding", size=7)
+    vid = row("e.mkv", stage, size=7)
     (cfg.workdir / f"{vid}.src").write_bytes(b"x" * 7)
     (cfg.workdir / f"{vid}.out.mkv").write_bytes(b"partial")
     worker.recover()
     r = db.get(conn, vid)
-    assert (r["stage"], r["attempts"], r["reason"]) == ("downloaded", 0, INTERRUPTED)
+    assert (r["stage"], r["attempts"], r["reason"]) == \
+        ("downloaded", 0, f"interrupted during {stage}")
     assert (cfg.workdir / f"{vid}.src").exists()
     assert not (cfg.workdir / f"{vid}.out.mkv").exists()
-    # Interrupted again while encoding: now it costs an attempt and starts over.
-    db.mark(conn, vid, "encoding")
+    # Interrupted again before finishing: now it costs an attempt and starts over.
+    db.mark(conn, vid, stage)
     worker.recover()
     r = db.get(conn, vid)
     assert (r["stage"], r["attempts"]) == ("queued", 1)
@@ -135,7 +138,7 @@ def test_recover_interrupted_encode_with_complete_src_goes_to_downloaded(conn, c
 
 
 class Crash(BaseException):
-    """Stands in for the process dying: nothing in prepare() catches it."""
+    """Stands in for the process dying: nothing in the worker catches it."""
 
 
 def test_crash_loop_is_parked(conn, cfg, setup):
@@ -149,8 +152,9 @@ def test_crash_loop_is_parked(conn, cfg, setup):
     worker.rclone.download = download
     seen = []
     for _ in range(3):
+        assert worker.start_download(db.get(conn, vid))
         with pytest.raises(Crash):
-            worker.prepare(db.get(conn, vid))
+            worker._download(db.get(conn, vid))
         assert db.get(conn, vid)["stage"] == "downloading"
         worker.recover()                   # service restarts after the crash
         r = db.get(conn, vid)
@@ -176,7 +180,11 @@ def test_interruption_marker_survives_until_work_completes(conn, cfg, setup, mak
         return real_download(*a, **k)
 
     worker.rclone.download = download
-    worker.prepare(db.get(conn, vid))
+    assert worker.start_download(db.get(conn, vid))
+    worker._download(db.get(conn, vid))
+    assert worker.finish_download(db.get(conn, vid))
+    assert db.get(conn, vid)["reason"] == INTERRUPTED
+    worker.encode_and_verify(db.get(conn, vid))
     assert seen == [INTERRUPTED]                  # still marked while work is under way
     r = db.get(conn, vid)
     assert r["stage"] == "ready" and r["reason"] is None

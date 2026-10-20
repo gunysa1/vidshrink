@@ -108,10 +108,10 @@ def test_swap_refuses_when_tmp_no_longer_matches_out_md5(conn, env):
     assert db.get(conn, row["id"])["stage"] != "done"
 
 
-def test_prepare_leaves_row_queued_if_its_stem_becomes_busy(conn, env, make_clip):
+def test_start_download_leaves_row_queued_if_its_stem_becomes_busy(conn, env, make_clip):
     """Requirement 1(ii): a row whose final_path becomes busy (another row with the
     same stem gets leased) after _next_job() returned it must be left queued, with
-    nothing downloaded, when prepare() re-checks atomically. Uses two rows whose
+    nothing downloaded, when start_download() re-checks atomically. Uses two rows whose
     shared final_path ("Movies/x.mkv") doesn't already exist on Drive, so this
     exercises the busy-stem race rather than the unrelated "target already exists"
     check."""
@@ -131,10 +131,10 @@ def test_prepare_leaves_row_queued_if_its_stem_becomes_busy(conn, env, make_clip
     assert not worker.rclone.exists("Movies/x.mkv")
 
     # Another row claims the shared stem (Movies/x.mkv) after _next_job() returned
-    # the mov row but before prepare() got to switch it to downloading.
+    # the mov row but before start_download() got to switch it to downloading.
     db.mark(conn, avi_row["id"], "leased", worker="pc", lease_until=time.time() + 600)
 
-    worker.prepare(mov_row_snapshot)
+    assert worker.start_download(mov_row_snapshot) is False
 
     after = db.get(conn, mov_row_snapshot["id"])
     assert after["stage"] == "queued"
@@ -206,17 +206,17 @@ def test_run_sweeps_expired_leases(conn, env):
     assert db.get(conn, vid)["encoder"] == "x265"
 
 
-def test_prepare_does_not_overwrite_a_row_leased_in_the_meantime(conn, env):
+def test_start_download_does_not_overwrite_a_row_leased_in_the_meantime(conn, env):
     """Requirement A: no double assignment. A row that was queued when _next_job()
-    picked it may get leased to the PC before prepare() marks it downloading;
-    prepare() must detect this via mark_if and leave the row (and files) alone."""
+    picked it may get leased to the PC before start_download() marks it downloading;
+    start_download() must detect this via mark_if and leave the row (and files) alone."""
     root, worker = env
     worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
     row = db.get_by_path(conn, "Movies/a.mkv")  # snapshot while still queued
     assert row["stage"] == "queued"
     db.mark(conn, row["id"], "leased", worker="pc", lease_until=time.time() + 600)
 
-    worker.prepare(row)
+    assert worker.start_download(row) is False
 
     after = db.get(conn, row["id"])
     assert after["stage"] == "leased"
