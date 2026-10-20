@@ -95,8 +95,12 @@ token = "<the token from vidshrink token>"
 cq = 23
 # Only needed if ffmpeg isn't on PATH:
 ffmpeg_dir = 'C:\Users\you\AppData\Local\vidshrink\ffmpeg\bin'
-# A fast local disk with 200 GB free for source/output files while encoding:
+# A fast local disk with 300 GB free for queued source and output files:
 workdir = 'D:\vidshrink'
+# Download-ahead limits (these are the defaults):
+queue_disk_gb = 300    # source files waiting plus results not yet uploaded
+queue_hours = 24       # expected encode hours of jobs held but not yet started
+reserve_days = 7       # how long finished downloads stay reserved while the PC is off
 # Optional: cap the PC's upload bandwidth so Plex stays usable, e.g. "6M"
 # (uploads only). To cap downloads too, give "UP:DOWN", e.g. "6M:40M" (MiB/s).
 bwlimit = "6M"
@@ -183,11 +187,12 @@ only keeps the two separate:
    main user.
 
 With `download_remote` set, the PC's downloads count against a separate budget
-on the PC's own account (750 GB/day, `daily_pc_download_limit` in `config.py`),
-and the main account's 500 GB/day is left free for the server and Plex. It
-started at 300 GB/day; on 2026-10-07 the PC account downloaded its full 300 GB
-with no download-quota error on the main account (probed every 15 min for a
-day), so Google charges these downloads to the PC account, not the owner. `vidshrink status` on the server shows both:
+on the PC's own account, which has no daily cap (usage is still recorded), and
+the main account's 500 GB/day is left free for the server and Plex. On
+2026-10-07 the PC account downloaded 300 GB with no download-quota error on
+the main account (probed every 15 min for a day), so Google charges these
+downloads to the PC account, not the owner. A `downloadQuotaExceeded` from
+Google still pauses the account for 12 h. `vidshrink status` on the server shows both:
 `Downloaded today` is the main account, `PC account downloaded today` is the
 PC's.
 
@@ -207,11 +212,18 @@ login) pointing at:
 The tray icon's menu:
 
 - **Start** — begin claiming and working jobs.
-- **Stop now** — abandon whatever is in progress (if any) and stop; the job
-  is released back to the queue immediately.
-- **Stop after this file** — finish the job currently in progress, then stop
-  without claiming another.
+- **Stop now** — cancel the running download, encode and upload and stop.
+  Finished downloads and encodes stay on disk and stay reserved. Unfinished
+  downloads are released back to the queue immediately.
+- **Stop after this file** — stop claiming, finish the current encode, upload
+  every encoded file, then stop. Downloaded files stay on disk and reserved.
 - **Exit** — same as Stop now, then closes the tray icon.
+
+The tray shows every stage at once, for example "Encoding X (3 waiting) ·
+Uploading Y". The PC downloads ahead while it encodes, so the workdir holds
+several files. On the next Start it offers its finished downloads and encodes to
+the server and encodes them first. It deletes them only if the server says
+another worker took the job, or it is done or failed.
 
 **Logging off or shutting down the PC is handled on a best-effort basis**: the
 tray tries to stop cleanly (like Stop now) on logoff/shutdown, but Windows

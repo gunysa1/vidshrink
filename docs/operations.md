@@ -11,12 +11,17 @@ journalctl --user -u vidshrink -n 50 --no-pager -o cat
 - counts per stage, the queue and projections
 - jobs leased to remote workers, and results waiting for the server
 - when each worker was last seen, and any worker alerts (`ALERT <worker>: …`)
-- today's upload and download totals per account
+- today's upload and download totals per account; the PC and cloud accounts show
+  "X GB (no cap)"
+- a worker's tray line (or log) shows every stage at once, for example
+  "Encoding X (3 waiting) · Uploading Y"
 
 ## Restarting the server worker
 
 An encode that's running when `vidshrink.service` stops is thrown away; the
-first interruption costs no attempt. Restart between jobs where you can.
+first interruption costs no attempt. It goes back to `downloaded` and starts again
+from the beginning. A finished download or encode is kept. Restart between jobs
+where you can.
 
 ```bash
 journalctl --user -u vidshrink -f      # wait for a "done:" or "not worth it:" line
@@ -34,11 +39,31 @@ systemctl --user restart vidshrink-serve
 # then restart vidshrink between jobs, as above
 ```
 
+Deploy in this order:
+
+1. The server first. Restart `vidshrink-serve` any time, and `vidshrink` between jobs.
+2. Then the cloud VM and the PC. Old remote workers keep working against the new
+   server, one job at a time, until they are updated.
+
 Remote workers update separately:
 
-- **PC:** `git pull` in its checkout, then restart the tray or `pc-worker`.
+- **PC:** `git pull` in its checkout, then restart the tray or `pc-worker`. Restart
+  between jobs, or use Stop after this file first.
 - **Cloud VM:** `git -C ~/vidshrink pull`, then restart the unit (see
   [cloud-worker-setup.md](cloud-worker-setup.md)).
+
+## Stopping a remote worker
+
+- **Stop now** cancels the running download, encode and upload. Finished downloads
+  and encodes stay on disk and stay reserved. Unfinished downloads are released.
+- **Stop after this file** stops claiming, finishes the current encode and uploads
+  every encoded file. Downloaded files stay on disk and stay reserved.
+- **On the next start** the worker offers its finished downloads and encodes to the
+  server and encodes them before downloading anything new. It deletes local files only
+  for jobs the server refuses (taken by another worker, done or failed). If the
+  server is unreachable it retries.
+- **Reservations end** after `reserve_days` (PC 7, cloud 1). Then the server requeues
+  the file for any worker.
 
 ## Requeueing failed files
 
@@ -83,8 +108,8 @@ An alert clears on that worker's next successful claim.
 Plex reads the same main account, so its daily download quota is shared:
 
 - The server caps its own downloads at 500 GB per Pacific day.
-- The PC and the cloud worker download through their own accounts, with their own
-  budgets.
+- The PC and the cloud worker download through their own accounts. Those have no
+  daily cap, and usage is still recorded.
 - A `downloadQuotaExceeded` error pauses that account's downloads for 12 h.
 - In September 2026 an uncapped scan used up the quota and locked Plex out for
   about a day.

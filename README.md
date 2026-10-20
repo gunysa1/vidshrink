@@ -36,6 +36,9 @@ that reads the same Drive.
    the server's job service. They download, encode, verify and upload the temporary
    file themselves, then report back. The server checks the upload on Drive and does
    the swap. Remote workers never delete or replace originals.
+5. **Pipelined.** Every worker downloads the next file and uploads the last result
+   while it encodes, so the encoder never waits. Remote workers keep finished
+   downloads and encodes across a restart and stay reserved for them.
 
 More detail: [docs/architecture.md](docs/architecture.md).
 
@@ -46,7 +49,9 @@ More detail: [docs/architecture.md](docs/architecture.md).
 - A remote worker may delete only its own `.vidshrink-tmp.mkv`, and only one it can
   prove it uploaded (size and md5 match its report).
 - Daily Drive budgets are kept per account (uploads 700 GB; main-account downloads
-  500 GB, shared with Plex). A `downloadQuotaExceeded` error pauses downloads for 12 h.
+  500 GB, shared with Plex). The PC and cloud download accounts have no daily cap,
+  because Plex never reads through them. A `downloadQuotaExceeded` error pauses that
+  account's downloads for 12 h.
 - Dolby Vision, interlaced, already-efficient (HEVC/AV1) and low-bitrate files are
   skipped.
 

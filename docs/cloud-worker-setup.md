@@ -190,6 +190,9 @@ download_account = "cloud"
 encoder = "x265-cloud"
 max_hours = 24.0
 disk_check = true
+queue_disk_gb = 120
+queue_hours = 24
+reserve_days = 1
 bwlimit = ""
 worker_name = "oracle-a1"
 workdir = "/home/ubuntu/vidshrink-work"
@@ -197,6 +200,12 @@ workdir = "/home/ubuntu/vidshrink-work"
 
 `max_hours` is the longest encode the worker will claim (0 turns it off). `disk_check`
 skips jobs that do not fit in the free disk.
+
+The worker downloads ahead while it encodes. `queue_disk_gb` caps the files it keeps on
+disk (sources waiting plus results not yet uploaded). 120 leaves room on the 200 GB
+boot volume. `queue_hours` caps the expected encode time of jobs it holds but has not
+started. `reserve_days` is how long the server keeps a finished download reserved for
+this VM if it goes quiet. The VM is always on, so one day is enough.
 
 ## 6. Run it
 
