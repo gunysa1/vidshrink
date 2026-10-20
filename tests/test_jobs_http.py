@@ -76,7 +76,7 @@ def test_download_account_passes_through_claim_heartbeat_report(conn, cfg, job_s
     c = JobClient(job_service.url, job_service.token)
     r = c.claim("pc", download_account="pc")
     assert r["job"]["id"] == vid
-    assert r["download_limit"] == cfg.daily_pc_download_limit
+    assert cfg.daily_pc_download_limit is None and "download_limit" not in r
     hb = c.heartbeat(vid, "pc", download_account="pc")
     assert hb["cancel"] is False
     c.report(vid, "pc", "download_quota", download_account="pc")
@@ -320,7 +320,7 @@ def test_http_heartbeat_ids(conn, clocked_service):
     clock.t += 60
     r = c.heartbeat_many([a, b], "pc", download_account="pc")
     assert r["cancel"] == [b]
-    assert r["download_limit"] is None and "download_used" in r
+    assert "download_limit" not in r and "download_used" in r
     assert db.get(conn, a)["lease_until"] == pytest.approx(clock.t + 7 * 86400)
 
 

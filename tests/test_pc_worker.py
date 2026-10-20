@@ -1040,6 +1040,15 @@ def test_download_today_from_claim_and_heartbeat(tmp_path, monkeypatch):
     t.join(5)
 
 
+def test_download_today_uncapped_has_no_limit(tmp_path):
+    # An uncapped account's reply carries download_used but no download_limit.
+    pc = fake_pc(tmp_path)
+    pc._note_download_today({"job": None, "download_used": 12e9})
+    assert pc.download_today == (12e9, None)
+    pc._note_download_today({"cancel": []})
+    assert pc.download_today == (12e9, None)
+
+
 def test_download_account_defaults_to_main_without_download_remote(tmp_path):
     pc = fake_pc(tmp_path)
     assert pc.download_account == "main"

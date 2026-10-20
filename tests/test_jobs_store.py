@@ -347,7 +347,7 @@ def test_claim_pc_account_charges_pc_downloads_not_main(conn, store):
     assert r["job"]["id"] == vid
     assert store.pc_downloads.used() == 5_000_000_000
     assert store.downloads.used() == 0
-    assert (r["download_used"], r["download_limit"]) == (5_000_000_000, store.cfg.daily_pc_download_limit)
+    assert r["download_used"] == 5_000_000_000 and "download_limit" not in r
 
 
 def test_claim_not_refused_by_pc_volume(conn, store):
@@ -355,7 +355,10 @@ def test_claim_not_refused_by_pc_volume(conn, store):
     vid = add(conn, "a.mkv", size=5_000_000_000)
     r = store.claim("pc", download_account="pc")
     assert r["job"]["id"] == vid
-    assert r["download_limit"] is None
+    # Uncapped: no "download_limit" at all, which an old tray would try to format.
+    assert "download_limit" not in r and r["download_used"] == 905 * 10**9
+    hb = store.heartbeat(vid, "pc", "pc")
+    assert "download_limit" not in hb and "download_used" in hb
 
 
 def test_claim_pc_account_works_while_main_exhausted(conn, cfg, store):
@@ -423,8 +426,7 @@ def test_heartbeat_reports_pc_budget_when_selected(conn, store):
     store.claim("pc", download_account="pc")
     store.pc_downloads.add(1_000)
     hb = store.heartbeat(vid, "pc", download_account="pc")
-    assert (hb["download_used"], hb["download_limit"]) == (
-        5_000_001_000, store.cfg.daily_pc_download_limit)
+    assert hb["download_used"] == 5_000_001_000 and "download_limit" not in hb
 
 
 def test_claim_and_heartbeat_report_download_today(conn, cfg, store):
@@ -640,7 +642,7 @@ def test_heartbeat_many_reports_lost_ids(conn, store):
     r = store.heartbeat_many([a, b, c], "pc", "pc")
     assert r["cancel"] == [c]
     assert r["download_used"] == store.pc_downloads.used()
-    assert r["download_limit"] is None
+    assert "download_limit" not in r
     assert db.get(conn, a)["lease_until"] == store.clock.t + 1800
     assert db.get(conn, b)["lease_until"] == pytest.approx(store.clock.t + 7 * DAY)
     assert db.get(conn, c)["stage"] == "queued"

@@ -140,8 +140,13 @@ class JobStore:
         return [row for _, row in scored]
 
     def _download_today(self, downloads: Budget) -> dict:
-        """Today's download total on the selected budget, for the PC's tray status."""
-        return {"download_used": downloads.used(), "download_limit": downloads.limit}
+        """Today's download total on the selected budget, for the PC's tray status.
+        An uncapped budget sends no "download_limit": an old tray formats any
+        limit it is given, and None would crash it."""
+        today = {"download_used": downloads.used()}
+        if downloads.limit is not None:
+            today["download_limit"] = downloads.limit
+        return today
 
     def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main",
              resume: bool = False, free_bytes: int | None = None,

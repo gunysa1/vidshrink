@@ -239,7 +239,7 @@ class PCWorker:
         self.done = 0
         # (bytes downloaded today, daily limit) from the server's last claim/heartbeat
         # answer, for the tray's status; None until the server has told us.
-        self.download_today: tuple[float, float] | None = None
+        self.download_today: tuple[float, float | None] | None = None
         server = Config()
         # The prefetch limits. The claim filter reads them from here too, so the
         # two can never disagree.
@@ -1072,8 +1072,9 @@ class PCWorker:
         raise last
 
     def _note_download_today(self, resp: dict) -> None:
-        if "download_used" in resp and "download_limit" in resp:
-            self.download_today = (resp["download_used"], resp["download_limit"])
+        # An uncapped account sends download_used without download_limit.
+        if "download_used" in resp:
+            self.download_today = (resp["download_used"], resp.get("download_limit"))
 
     def _heartbeat(self, stop: threading.Event) -> None:
         """One heartbeat_many for every held job, every heartbeat_secs, until stop."""
