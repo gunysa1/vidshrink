@@ -49,7 +49,10 @@ Remote workers update separately:
 
 - **PC:** `git pull` in its checkout, then restart the tray or `pc-worker`. Restart
   between jobs, or use Stop after this file first.
-- **Cloud VM:** `git -C ~/vidshrink pull`, then restart the unit (see
+- **Cloud VM:** `git -C ~/vidshrink pull`. Before restarting, make sure the VM's
+  `config.toml` sets `queue_disk_gb = 120`, `queue_hours = 24` and `reserve_days = 1`
+  (the defaults are the PC's 300 GB and 7 days, too much for the 200 GB boot volume
+  and the always-on VM). Then restart the unit (see
   [cloud-worker-setup.md](cloud-worker-setup.md)).
 
 ## Stopping a remote worker
