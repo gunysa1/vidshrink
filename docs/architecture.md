@@ -171,7 +171,13 @@ JSON.
   Pipelining.
 - `reserve_days` is how long a finished download stays reserved for the worker.
 - **Marker files.** The workdir holds `<id>.job.json`, `<id>.downloaded` and
-  `<id>.encoded` for each job. A restart uses them to resume.
+  `<id>.encoded` for each job. A restart uses them to resume. The source is deleted
+  once `<id>.encoded` is written. `<id>.uploaded` (out size, md5, encode seconds)
+  marks a finished upload whose report the server hasn't confirmed: the worker keeps
+  the job and retries only the report, and uploads again only if the tmp on Drive is
+  no longer its own.
+- **Disk.** The queue limit and the free-space check both count the output still to
+  be written for every downloaded or encoding job, as the server does.
 
 - **Local faults.** If the worker hits a problem of its own (a dead Drive login, a
   full disk, a missing tool), it releases its job with no attempt used, sends an

@@ -5,7 +5,9 @@ LocalJob. Must stay importable on Windows (no vidshrink.worker, no fcntl).
 
 Per job `<id>` the workdir holds `<id>.job.json` (the claim's job dict),
 `<id>.src`, `<id>.out.mkv`, `<id>.log` and the `<id>.downloaded` /
-`<id>.encoded` markers."""
+`<id>.encoded` / `<id>.uploaded` markers. The source is deleted once the encode
+is finished; `<id>.uploaded` (JSON: out_size, md5, encode_secs) marks an upload
+whose "uploaded" report the server hasn't confirmed yet."""
 from __future__ import annotations
 
 import json
@@ -14,7 +16,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-STATES = ("downloading", "downloaded", "encoding", "encoded", "uploading")
+STATES = ("downloading", "downloaded", "encoding", "encoded", "uploading", "uploaded")
 
 
 @dataclass
@@ -45,6 +47,18 @@ def _read_number(path: Path) -> float | None:
         return float(path.read_text().strip())
     except (OSError, ValueError):
         return None
+
+
+def read_uploaded(path: Path) -> dict | None:
+    """An `.uploaded` marker's {"out_size", "md5", "encode_secs"}, or None if it's
+    absent or unreadable (treated the same as absent)."""
+    try:
+        data = json.loads(path.read_text())
+        info = {"out_size": int(data["out_size"]), "md5": str(data["md5"]),
+                "encode_secs": float(data["encode_secs"])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return info if info["out_size"] > 0 and info["md5"] else None
 
 
 def _size(path: Path) -> int:
@@ -110,7 +124,9 @@ class LocalQueue:
             if not p.name.startswith(f"{jid}."):
                 continue
             lj = self._job(job, "downloading")
-            if _read_number(self.workdir / f"{jid}.encoded") is not None and lj.out.exists():
+            if read_uploaded(self.workdir / f"{jid}.uploaded") is not None and lj.out.exists():
+                lj.state = "uploaded"  # only the report is left to do
+            elif _read_number(self.workdir / f"{jid}.encoded") is not None and lj.out.exists():
                 lj.state = "encoded"
             elif (_read_number(self.workdir / f"{jid}.downloaded") is not None
                   and lj.src.exists() and _size(lj.src) == size):
@@ -124,14 +140,34 @@ class LocalQueue:
                 self._jobs[lj.id] = lj
         return resumable, incomplete
 
+    def on_disk(self) -> int:
+        """Bytes the held jobs take on disk now, plus the output their encodes
+        still have to write: up to each source's size beyond what its out file
+        holds now, for every job downloaded or encoding (free space doesn't show
+        that yet, and a prefetched download mustn't take it)."""
+        with self._lock:
+            held = list(self._jobs.values())
+        used = 0
+        for j in held:
+            out = _size(j.out)
+            used += _size(j.src) + out
+            if j.state in ("downloaded", "encoding"):
+                used += max(0, int(j.job.get("size") or 0) - out)
+        return used
+
+    def pending_output(self) -> int:
+        """The output still to be written by the held downloaded/encoding jobs."""
+        with self._lock:
+            held = [j for j in self._jobs.values() if j.state in ("downloaded", "encoding")]
+        return sum(max(0, int(j.job.get("size") or 0) - _size(j.out)) for j in held)
+
     def admits(self, size: int, expected_hours: float, free_bytes: int) -> bool:
         """Whether a job of `size` bytes and `expected_hours` may be claimed."""
         with self._lock:
             held = list(self._jobs.values())
-        on_disk = sum(_size(j.src) + _size(j.out) for j in held)
-        if on_disk + size > self.queue_disk_bytes:
+        if self.on_disk() + size > self.queue_disk_bytes:
             return False
-        if size * self.disk_factor + self.disk_reserve > free_bytes:
+        if size * self.disk_factor + self.disk_reserve + self.pending_output() > free_bytes:
             return False
         # Jobs behind the encoder. With none, a job is always admitted so a long
         # film can be claimed, and one file can be prefetched behind a long encode.

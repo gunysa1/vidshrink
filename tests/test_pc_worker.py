@@ -1662,3 +1662,201 @@ def test_empty_bwlimit_adds_no_flag():
         assert a[a.index("--bwlimit") + 1] == "6M:off"
         a = make(PCConfig(server="x", token="y", bwlimit="6M:40M")).extra_args
         assert a[a.index("--bwlimit") + 1] == "6M:40M"
+
+
+def test_resume_unexpected_error_retries(conn, setup, monkeypatch):
+    # Anything resume() raises -- not only JobServiceError -- is retried every
+    # idle_secs with nothing deleted; run() must not end (the cloud VM's unit
+    # wouldn't restart a clean exit).
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    leave_job(conn, store, pc, root, vid, "downloaded")
+    files = sorted(pc.cfg.workdir.iterdir())
+    calls = []
+    orig_resume = pc.client.resume
+    bad = [LeaseLost("409 from a confused proxy"), ValueError("non-JSON 200 body"),
+           TypeError("odd"), {"resumed": [{"id": "garbage"}], "refused": []},
+           {"resumed": ["not a dict"], "refused": []}, {"resumed": [], "refused": [None]}]
+
+    def flaky(worker, encoder, download_account, jobs):
+        calls.append(1)
+        assert sorted(pc.cfg.workdir.iterdir()) == files  # nothing deleted meanwhile
+        if len(calls) <= len(bad):
+            reply = bad[len(calls) - 1]
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        return orig_resume(worker, encoder, download_account, jobs)
+
+    monkeypatch.setattr(pc.client, "resume", flaky)
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        assert len(calls) == len(bad) + 1
+        assert t.is_alive()
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_src_deleted_after_encode(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    seen = []
+    orig_upload = pc.rclone.upload
+
+    def spy(local, path, cancel=None):
+        wd = pc.cfg.workdir
+        seen.append(((wd / f"{vid}.src").exists(), (wd / f"{vid}.encoded").exists()))
+        return orig_upload(local, path, cancel=cancel)
+
+    monkeypatch.setattr(pc.rclone, "upload", spy)
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        assert seen == [(False, True)]  # the source went once the encode was done
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_uploaded_report_failure_keeps_job_and_retries(conn, setup, monkeypatch):
+    # The server is down for longer than _report_uploaded's own retries: the job is
+    # kept (marker written, still held and heartbeated) and only the report is
+    # retried later -- no second encode or upload.
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    wd = pc.cfg.workdir
+    orig_report, orig_upload, orig_encode = pc.client.report, pc.rclone.upload, pc.encode
+    calls, uploads, encodes, while_down = [], [], [], []
+    gate = threading.Event()
+
+    def flaky(job_id, worker, outcome, **data):
+        if outcome != "uploaded":
+            return orig_report(job_id, worker, outcome, **data)
+        calls.append(data)
+        if len(calls) <= pc.cfg.retry_attempts + 2:
+            if len(calls) > pc.cfg.retry_attempts:
+                while_down.append((json.loads((wd / f"{vid}.uploaded").read_text()),
+                                   vid in pc.queue.held_ids()))
+                if len(calls) == pc.cfg.retry_attempts + 1:
+                    gate.wait(30)  # the test checks the server's row meanwhile
+            raise JobServiceError("job service down", status=503)
+        return orig_report(job_id, worker, outcome, **data)
+
+    monkeypatch.setattr(pc.client, "report", flaky)
+    monkeypatch.setattr(pc.rclone, "upload", lambda local, path, cancel=None: (
+        uploads.append(path), orig_upload(local, path, cancel=cancel))[1])
+    pc.encode = lambda *a: (encodes.append(1), orig_encode(*a))[1]
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: len(while_down) == 1)
+        # Kept reserved, heartbeated, while the report is owed.
+        lease = db.get(conn, vid)["lease_until"]
+        assert wait_for(lambda: db.get(conn, vid)["lease_until"] > lease, timeout=10)
+        row = db.get(conn, vid)
+        assert (row["stage"], row["worker"], row["reserve_secs"]) == ("leased", "pc", 7 * 86400)
+        gate.set()
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        assert wait_for(lambda: not list(wd.glob(f"{vid}.*")))
+        row = db.get(conn, vid)
+        tmp = root / "Movies" / "a.vidshrink-tmp.mkv"
+        assert tmp.exists() and md5_file(tmp) == row["out_md5"]
+        assert len(calls) == pc.cfg.retry_attempts + 3
+        assert len(while_down) == 2
+        for marker, held in while_down:
+            assert marker == {"out_size": row["out_size"], "md5": row["out_md5"],
+                              "encode_secs": pytest.approx(row["encode_secs"])}
+            assert held
+        assert len(uploads) == 1 and len(encodes) == 1
+        assert pc.done == 1
+    finally:
+        gate.set()
+        pc.stop(now=True)
+        t.join(15)
+
+
+def leave_uploaded(conn, store, pc, root, vid, tmp_on_drive=True):
+    """A job a previous run uploaded but couldn't report: encoded, source deleted,
+    `.uploaded` marker written and (unless tmp_on_drive=False) its tmp on Drive."""
+    job = leave_job(conn, store, pc, root, vid, "encoded")
+    wd = pc.cfg.workdir
+    out = wd / f"{vid}.out.mkv"
+    (wd / f"{vid}.src").unlink()
+    if tmp_on_drive:
+        shutil.copy(out, root / job["tmp_path"])
+    (wd / f"{vid}.uploaded").write_text(json.dumps(
+        {"out_size": out.stat().st_size, "md5": md5_file(out), "encode_secs": 1.5}))
+    return job
+
+
+def test_restart_retries_pending_uploaded_report(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    job = leave_uploaded(conn, store, pc, root, vid)
+    tmp = root / job["tmp_path"]
+    tmp_md5 = md5_file(tmp)
+
+    def must_not(*a, **k):
+        raise AssertionError("a pending report must not download, encode or upload")
+
+    pc.encode = must_not
+    monkeypatch.setattr(pc.download_rclone, "download", must_not)
+    monkeypatch.setattr(pc.rclone, "upload", must_not)
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        row = db.get(conn, vid)
+        assert (row["out_md5"], row["encode_secs"]) == (tmp_md5, 1.5)
+        assert tmp.exists() and md5_file(tmp) == tmp_md5
+        assert wait_for(lambda: pc.done == 1)
+        assert wait_for(lambda: not list(pc.cfg.workdir.glob(f"{vid}.*")))
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_restart_pending_report_uploads_again_when_tmp_gone(conn, setup, monkeypatch):
+    # The reservation ran out while switched off: the server deleted the tmp and
+    # requeued the row, and /resume leased it back. Only then is it uploaded again.
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    leave_uploaded(conn, store, pc, root, vid, tmp_on_drive=False)
+    store.release(vid, "pc")  # as expire_leases leaves it
+
+    def must_not(*a, **k):
+        raise AssertionError("must not download or encode again")
+
+    pc.encode = must_not
+    monkeypatch.setattr(pc.download_rclone, "download", must_not)
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        tmp = root / "Movies" / "a.vidshrink-tmp.mkv"
+        assert tmp.exists() and md5_file(tmp) == db.get(conn, vid)["out_md5"]
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_stop_now_during_report_retries_keeps_job_for_next_start(conn, setup, monkeypatch):
+    root, pc, store = setup
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    orig_report = pc.client.report
+
+    def down(job_id, worker, outcome, **data):
+        if outcome != "uploaded":
+            return orig_report(job_id, worker, outcome, **data)
+        pc.stop(now=True)
+        raise JobServiceError("job service down", status=None)
+
+    monkeypatch.setattr(pc.client, "report", down)
+    pc.cfg.retry_base_delay = 5.0  # so the Stop lands during the backoff
+    t = run_in_thread(pc)
+    t.join(60)
+    assert not t.is_alive()
+    wd = pc.cfg.workdir
+    for ext in (".job.json", ".out.mkv", ".uploaded"):
+        assert (wd / f"{vid}{ext}").exists(), ext
+    assert_reserved(conn, vid)
+    assert (root / "Movies" / "a.vidshrink-tmp.mkv").exists()

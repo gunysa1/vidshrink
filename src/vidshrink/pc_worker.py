@@ -1,6 +1,7 @@
 """The remote worker's side: claim a job, encode it, upload, report. Runs on the
 Windows PC (NVENC) and, headless, on a Linux cloud VM (x265, encoder="x265-cloud").
 Must stay importable on Windows: no fcntl, no vidshrink.worker."""
+import json
 import os
 import platform
 import random
@@ -19,7 +20,7 @@ from vidshrink.config import Config
 from vidshrink.encode import (EncodeCancelled, EncodeError, build_command,
                               build_nvenc_command, run_encode_cancellable)
 from vidshrink.jobs import JobClient, JobServiceError, LeaseLost
-from vidshrink.local_queue import LocalJob, LocalQueue
+from vidshrink.local_queue import LocalJob, LocalQueue, read_uploaded
 from vidshrink.paths import md5_file, tmp_path
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
 from vidshrink.rclone import Rclone, RcloneError, TMP_SUFFIX, TransferCancelled
@@ -41,13 +42,14 @@ _NUMBERED_PATTERNS = tuple(re.compile(p) for p in (
     r"^(\d+)\.log$",
     r"^(\d+)\.encoded$",
     r"^(\d+)\.downloaded$",
+    r"^(\d+)\.uploaded$",
     # The queued job's claim dict, plus its own write-then-rename tmp.
     r"^(\d+)\.job\.json(?:\.tmp)?$",
     # rclone's local backend, when it does write a partial file, names it
     # "<name>.<random>.partial" (e.g. "65137.src.a1b2c3.partial").
     r"^(\d+)\.(?:src|out\.mkv)\..*\.partial$",
     # A marker's own write-then-rename tmp, if a crash lands mid-write.
-    r"^(\d+)\.(?:encoded|downloaded)\.tmp$",
+    r"^(\d+)\.(?:encoded|downloaded|uploaded)\.tmp$",
 ))
 # calibrate's own leftovers: never present while the PC worker loop runs (the two
 # never run at once in one process), so always safe to sweep here.
@@ -203,18 +205,19 @@ class _LocalFault(Exception):
 EncodeFn = Callable[[Path, Path, Probe, Path, threading.Event], float]
 
 
-def _file_size(path: Path) -> int:
-    try:
-        return path.stat().st_size
-    except OSError:
-        return 0
-
-
-
 # Local states of a held job that is waiting in a stage's queue rather than being
 # worked on: a server cancel can drop it at once, since no stage owns it.
-_IDLE_STATES = ("downloaded", "encoded")
+_IDLE_STATES = ("downloaded", "encoded", "uploaded")
 _LEFTOVER_JOB = re.compile(r"^(\d+)\.job\.json$")
+
+
+def _parse_resume(resp) -> tuple[dict[int, dict], set[int]]:
+    """A /resume reply as ({id: job}, refused ids); ValueError etc. if malformed."""
+    if not (isinstance(resp, dict) and isinstance(resp.get("resumed"), list)
+            and isinstance(resp.get("refused"), list)
+            and all(isinstance(j, dict) for j in resp["resumed"])):
+        raise ValueError(f"malformed resume reply: {resp!r:.200}")
+    return {int(j["id"]): j for j in resp["resumed"]}, {int(i) for i in resp["refused"]}
 
 
 class PCWorker:
@@ -267,6 +270,14 @@ class PCWorker:
         self._to_encode: deque[LocalJob] = deque()  # downloaded, oldest first
         self._to_upload: deque[LocalJob] = deque()  # encoded, oldest first
         self._encoder_done = threading.Event()
+        # Uploaded jobs whose "uploaded" report is still owed: id -> (out_size, md5,
+        # encode secs), also kept in each one's `<id>.uploaded` marker. The uploader
+        # retries the report alone, never the upload, once _reports_due has passed.
+        self._unreported: dict[int, tuple[int, str, float]] = {}
+        # Those of them resumed after a restart: their tmp on Drive is checked once
+        # before the report (the server may have expired it and deleted the tmp).
+        self._check_tmp: set[int] = set()
+        self._reports_due = 0.0  # time.monotonic()
         self._upload_stage = ""  # "verifying" or "uploading" while the uploader works
         self._uploads_paused_until = 0.0  # time.monotonic() deadline
         self._fault_exc: _LocalFault | None = None
@@ -386,6 +397,9 @@ class PCWorker:
             parts.append(f"Uploads paused ({encoded} waiting)")
         elif encoded:
             parts.append(f"{encoded} encoded waiting")
+        unreported = len(having("uploaded"))
+        if unreported:
+            parts.append(f"{unreported} uploaded, report pending")
         if not parts and self._phase == "running":
             parts.append("Waiting for work")
         return " · ".join(parts)
@@ -448,18 +462,17 @@ class PCWorker:
                 try:
                     resp = self.client.resume(self.cfg.worker_name, self.cfg.encoder,
                                               self.download_account, items)
-                    if not (isinstance(resp, dict) and isinstance(resp.get("resumed"), list)
-                            and isinstance(resp.get("refused"), list)):
-                        raise JobServiceError(f"malformed resume reply: {resp!r:.200}")
+                    confirmed, refused = _parse_resume(resp)
                     break
-                except JobServiceError as e:
-                    self.log(f"job service unreachable, retrying resume: {e}")
+                except Exception as e:
+                    # Anything at all -- unreachable, a 4xx, LeaseLost, a garbled
+                    # reply: nothing has been deleted yet, so just ask again. Ending
+                    # run() here would stop the cloud worker for good.
+                    self.log(f"resume failed, retrying: {type(e).__name__}: {e}")
                     if self._wait_stop(self.cfg.idle_secs):
                         return None
         finally:
             self._resuming = 0
-        confirmed = {int(j["id"]): j for j in resp["resumed"]}
-        refused = {int(i) for i in resp["refused"]}
         unlisted = set()
         for lj in offered:
             job = confirmed.get(lj.id)
@@ -474,11 +487,22 @@ class PCWorker:
                     unlisted.add(lj.id)
                 continue
             lj.job.update(job)  # the server's fresh view, e.g. expected_hours
+            info = (read_uploaded(self.cfg.workdir / f"{lj.id}.uploaded")
+                    if lj.state == "uploaded" else None)
+            if lj.state == "uploaded" and info is None:
+                lj.state = "encoded"  # the marker went bad since scan(): upload again
             with self._cv:
                 self._jobs[lj.id] = lj
                 self._cancels[lj.id] = threading.Event()
                 self._reserved.add(lj.id)
-            self._push(self._to_encode if lj.state == "downloaded" else self._to_upload, lj)
+                if info is not None:
+                    # The uploader reports it (see _report_pending), no queue needed.
+                    self._unreported[lj.id] = (info["out_size"], info["md5"],
+                                               info["encode_secs"])
+                    self._check_tmp.add(lj.id)
+            if lj.state != "uploaded":
+                self._push(self._to_encode if lj.state == "downloaded" else self._to_upload,
+                           lj)
             self.log(f"resumed ({lj.state}): {lj.job.get('path')}")
         return unlisted
 
@@ -644,6 +668,8 @@ class PCWorker:
             self._cancels.pop(lj.id, None)
             self._reserved.discard(lj.id)
             self._gone.discard(lj.id)
+            self._unreported.pop(lj.id, None)
+            self._check_tmp.discard(lj.id)
             self._deleting.add(lj.id)
         try:
             self.queue.forget(lj.id)
@@ -717,11 +743,12 @@ class PCWorker:
             if self.cfg.disk_check:
                 extra["free_bytes"] = self._free_bytes()
             return extra
-        on_disk = sum(_file_size(lj.src) + _file_size(lj.out) for lj in jobs)
-        room = self.queue.queue_disk_bytes - on_disk
+        # Both count the output the held encodes still have to write.
+        room = self.queue.queue_disk_bytes - self.queue.on_disk()
         if room <= 0:
             return None
-        extra["free_bytes"] = min(self._free_bytes(), room)
+        extra["free_bytes"] = max(0, min(self._free_bytes() - self.queue.pending_output(),
+                                         room))
         # The hours limit applies only behind the encoder (see LocalQueue.admits).
         if any(lj.state in ("downloading", "downloaded") for lj in jobs):
             hours = sum(float(lj.job.get("expected_hours") or 0.0) for lj in jobs
@@ -850,6 +877,9 @@ class PCWorker:
             self._check(cancel)
             secs = self.encode(lj.src, lj.out, probe, lj.log, cancel)
             self._write_marker(self.cfg.workdir / f"{lj.id}.encoded", secs)
+            # Only the output and its marker are needed from here on (verify reads
+            # the probe from the job), so free the source's disk at once.
+            lj.src.unlink(missing_ok=True)
         except Exception as e:
             self._job_error(lj, e)
             return
@@ -859,6 +889,7 @@ class PCWorker:
     # --- upload stage ---------------------------------------------------------
     def _uploader(self) -> None:
         while not self._stop_now.is_set():
+            self._retry_reports()
             if self._stop_after.is_set():
                 with self._cv:
                     if self._encoder_done.is_set() and not self._to_upload:
@@ -915,7 +946,9 @@ class PCWorker:
                 self._forget(lj)
                 return
             self._check(cancel)
-            self._report_uploaded(job, jid, path, tmp, out_size, md5, secs)
+            if self._report_uploaded(job, jid, path, tmp, out_size, md5, secs) == "pending":
+                self._keep_unreported(lj, out_size, md5, secs)
+                return
             self._forget(lj)
         except Exception as e:
             if (isinstance(e, RcloneError) and e.rate_limited and uploading
@@ -926,6 +959,75 @@ class PCWorker:
                                 remote=self.rclone.remote)
         finally:
             self._upload_stage = ""
+
+    def _keep_unreported(self, lj: LocalJob, out_size: int, md5: str, secs: float) -> None:
+        """The upload is done but the server hasn't confirmed the report: keep the
+        job, held and heartbeated, and retry only the report later -- now, or on
+        the next start. Never upload again: the server may be swapping that tmp."""
+        marker = self.cfg.workdir / f"{lj.id}.uploaded"
+        try:
+            self._write_marker(marker, json.dumps(
+                {"out_size": out_size, "md5": md5, "encode_secs": secs}))
+        except OSError as e:
+            # Still retried from memory; only a restart would lose it.
+            self.log(f"could not write {marker.name}: {e}")
+        with self._cv:
+            if self._held(lj):
+                self._unreported[lj.id] = (out_size, md5, secs)
+        self._reports_due = time.monotonic() + self.cfg.idle_secs
+        if self._set_state(lj, "uploaded"):
+            self.log(f"keeping {lj.job['path']}; will retry its uploaded report")
+
+    def _retry_reports(self) -> None:
+        """Once due, try each owed "uploaded" report once; see _report_pending."""
+        if time.monotonic() < self._reports_due:
+            return
+        with self._cv:
+            pending = [lj for lj in self._jobs.values()
+                       if lj.state == "uploaded" and lj.id in self._unreported
+                       and lj.id not in self._gone]
+        if not pending:
+            return
+        self._reports_due = time.monotonic() + self.cfg.idle_secs
+        for lj in pending:
+            if self._stop_now.is_set():
+                return
+            self._run_job(lj, self._report_pending)
+
+    def _report_pending(self, lj: LocalJob) -> None:
+        job = lj.job
+        with self._cv:
+            if not self._held(lj) or lj.id not in self._unreported:
+                return
+            out_size, md5, secs = self._unreported[lj.id]
+            check = lj.id in self._check_tmp
+        tmp = job["tmp_path"]
+        if check:
+            # Resumed after a restart, so the row is leased to us again and the
+            # server isn't swapping it. Its tmp is still ours unless the server
+            # expired the reservation meanwhile and deleted it: then upload again.
+            try:
+                ours = self.rclone.exists(tmp) and self.rclone.md5(tmp) == md5
+            except RcloneError as e:
+                self.log(f"could not check {tmp}, will retry: {e}")
+                return
+            with self._cv:
+                self._check_tmp.discard(lj.id)
+                if not ours:
+                    self._unreported.pop(lj.id, None)
+            if not ours:
+                self.log(f"{tmp} is no longer ours; uploading again: {job['path']}")
+                (self.cfg.workdir / f"{lj.id}.uploaded").unlink(missing_ok=True)
+                if self._set_state(lj, "encoded"):
+                    self._push(self._to_upload, lj)
+                return
+        # Right after a resume the first attempt is unambiguous (the earlier report
+        # can't have committed, or the row wouldn't be leased to us); otherwise an
+        # earlier attempt already failed ambiguously.
+        result = self._report_uploaded(job, lj.id, job["path"], tmp, out_size, md5, secs,
+                                       ambiguous=not check, attempts=1)
+        if result != "pending":
+            self._forget(lj)
 
     def _pause_uploads(self, lj: LocalJob, tmp: str | None, md5: str | None) -> None:
         """Drive's upload limit: keep the encoded file and the lease, tell the server
@@ -1146,7 +1248,8 @@ class PCWorker:
             self.log(f"could not report {outcome} for {job['path']}: {e}")
 
     def _report_uploaded(self, job: dict, jid: int, path: str, tmp: str, out_size: int,
-                         md5: str, secs: float) -> None:
+                         md5: str, secs: float, ambiguous: bool = False,
+                         attempts: int | None = None) -> str:
         """Report the completed upload, retrying on a transient JobServiceError.
         Once ANY attempt in this call has failed ambiguously (status None, 5xx,
         timeout, or a connection error -- i.e. we don't know if the server actually
@@ -1155,16 +1258,20 @@ class PCWorker:
         the row on (report() is idempotent for exactly this retry), so deleting
         the tmp then would destroy the only copy of a successful upload. Only an
         UNAMBIGUOUS LeaseLost on the very first attempt (no prior ambiguity) means
-        it's safe to clean up our own tmp."""
-        ambiguous = False
-        for i in range(self.cfg.retry_attempts):
+        it's safe to clean up our own tmp; pass ambiguous=True when an earlier call
+        already failed.
+
+        Returns "done" (reported), "lost" (LeaseLost: the job isn't ours any more)
+        or "pending" (gave up for now: the caller keeps the job and retries)."""
+        attempts = attempts or self.cfg.retry_attempts
+        for i in range(attempts):
             try:
                 self.client.report(jid, self.cfg.worker_name, "uploaded",
                                    download_account=self.download_account,
                                    out_size=out_size, out_md5=md5, encode_secs=secs)
                 self.done += 1
                 self.log(f"uploaded {tmp} ({out_size / 1e9:.1f} GB)")
-                return
+                return "done"
             except LeaseLost:
                 if not ambiguous:
                     self._delete_tmp_if_ours(job, tmp, md5)
@@ -1172,19 +1279,19 @@ class PCWorker:
                     self.log(f"lease lost reporting uploaded after an earlier "
                              f"ambiguous failure; leaving {tmp} for the server to "
                              f"reconcile: {job['path']}")
-                return
+                return "lost"
             except JobServiceError as e:
                 ambiguous = True
                 transient = e.status is None or e.status >= 500
-                if not transient or i == self.cfg.retry_attempts - 1:
+                if not transient or i == attempts - 1:
                     self.log(f"could not report uploaded for {path}: {e}; "
-                             f"leaving {tmp} for the server/lease expiry to reconcile")
-                    return
+                             f"keeping the job to retry the report")
+                    return "pending"
                 if self._stop_now.wait(self.cfg.retry_base_delay * 2 ** i):
-                    self.log(f"stop now while retrying the uploaded report; leaving "
-                             f"{tmp} for the server/lease expiry to reconcile: "
-                             f"{job['path']}")
-                    return
+                    self.log(f"stop now while retrying the uploaded report; keeping "
+                             f"the job to retry the report next time: {job['path']}")
+                    return "pending"
+        return "pending"
 
     def _safe_tmp(self, job: dict, tmp: str) -> bool:
         """Defense in depth: never touch a remote path that isn't provably the
