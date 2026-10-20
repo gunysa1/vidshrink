@@ -310,8 +310,10 @@ class Worker:
         start = done
         last_reconcile = self.clock()
         while limit is None or done < limit:
-            done += self._finish_transfers()
+            # A transfer error deferred during the last encode goes first: recording
+            # transfers again could raise a second error and hide it.
             self._raise_deferred()
+            done += self._finish_transfers()
             if self.failures >= self.cfg.max_consecutive_failures:
                 self.log(f"!!! STOPPING: {self.failures} failures in a row with no success; "
                          f"something is wrong beyond a single file (see reasons in status)")
