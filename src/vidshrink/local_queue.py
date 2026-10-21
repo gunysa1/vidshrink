@@ -16,7 +16,10 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-STATES = ("downloading", "downloaded", "encoding", "encoded", "uploading", "uploaded")
+STATES = ("downloading", "downloaded", "encoding", "encoded", "verifying", "verified",
+          "uploading", "uploaded")
+# Encoded but not yet uploaded: what the upload backlog limit counts.
+UPLOAD_BACKLOG = ("encoded", "verifying", "verified", "uploading")
 
 
 @dataclass
@@ -70,10 +73,11 @@ def _size(path: Path) -> int:
 
 class LocalQueue:
     def __init__(self, workdir: Path, queue_disk_bytes: int, queue_hours: float,
-                 disk_factor: float, disk_reserve: int):
+                 disk_factor: float, disk_reserve: int, queue_upload_bytes: int | None = None):
         self.workdir = Path(workdir)
         self.queue_disk_bytes = queue_disk_bytes
         self.queue_hours = queue_hours
+        self.queue_upload_bytes = queue_upload_bytes  # None: no upload backlog limit
         self.disk_factor = disk_factor
         self.disk_reserve = disk_reserve
         self._jobs: dict[int, LocalJob] = {}
@@ -161,10 +165,24 @@ class LocalQueue:
             held = [j for j in self._jobs.values() if j.state in ("downloaded", "encoding")]
         return sum(max(0, int(j.job.get("size") or 0) - _size(j.out)) for j in held)
 
+    def upload_backlog(self) -> int:
+        """Bytes of finished encodes not yet uploaded."""
+        with self._lock:
+            held = [j for j in self._jobs.values() if j.state in UPLOAD_BACKLOG]
+        return sum(_size(j.out) for j in held)
+
+    def upload_backlog_full(self) -> bool:
+        """The uploader is behind by more than queue_upload_bytes: claiming more
+        would only pile up encodes waiting to upload."""
+        return (self.queue_upload_bytes is not None
+                and self.upload_backlog() > self.queue_upload_bytes)
+
     def admits(self, size: int, expected_hours: float, free_bytes: int) -> bool:
         """Whether a job of `size` bytes and `expected_hours` may be claimed."""
         with self._lock:
             held = list(self._jobs.values())
+        if self.upload_backlog_full():
+            return False
         if self.on_disk() + size > self.queue_disk_bytes:
             return False
         if size * self.disk_factor + self.disk_reserve + self.pending_output() > free_bytes:

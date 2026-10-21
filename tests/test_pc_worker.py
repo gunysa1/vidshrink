@@ -184,6 +184,54 @@ def test_queue_hours_limits_prefetch(conn, cfg, setup, monkeypatch):
         t.join(15)
 
 
+def test_verifies_next_while_uploading(conn, cfg, setup, monkeypatch):
+    root, pc, store = setup
+    a, b, c = add_videos(conn, cfg, root, "b", "c")
+    gate, uploading = threading.Event(), []
+    orig_upload = pc.rclone.upload
+
+    def gated(local, remote, cancel=None):
+        uploading.append(remote)
+        while not gate.wait(0.05):
+            if cancel is not None and cancel.is_set():
+                raise TransferCancelled("cancelled")
+        return orig_upload(local, remote, cancel=cancel)
+
+    monkeypatch.setattr(pc.rclone, "upload", gated)
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: len(uploading) == 1)
+        # a's upload is held; b is encoded and verified meanwhile, not after it.
+        assert wait_for(lambda: pc.queue._jobs.get(b) is not None
+                        and pc.queue._jobs[b].state == "verified")
+        # ...but the verifier stays only one file ahead of the uploader.
+        assert wait_for(lambda: pc.queue._jobs.get(c) is not None
+                        and pc.queue._jobs[c].state == "encoded")
+        time.sleep(1)
+        assert pc.queue._jobs[c].state == "encoded"
+        assert len(uploading) == 1
+        gate.set()
+        assert wait_for(lambda: all(db.get(conn, i)["stage"] == "remote_ready"
+                                    for i in (a, b, c)))
+    finally:
+        gate.set()
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_upload_backlog_stops_claiming(tmp_path):
+    pc = fake_pc(tmp_path, queue_upload_gb=1e-8)  # 10 bytes
+    pc.cfg.workdir.mkdir(parents=True)
+    lj = pc._hold(dict(JOB, id=1, size=100, expected_hours=0.1))
+    pc.queue.set_state(1, "verified")
+    lj.out.write_bytes(b"y" * 11)
+    assert pc._claim_filters() is None
+    assert not pc._admits(dict(JOB, id=2, size=1, expected_hours=0.1))
+    lj.out.write_bytes(b"y" * 10)  # at the limit, not over it
+    assert pc._claim_filters() is not None
+    assert pc._admits(dict(JOB, id=2, size=1, expected_hours=0.1))
+
+
 def test_queue_disk_limits_prefetch(conn, cfg, setup, monkeypatch):
     root, pc, store = setup
     a, b = add_videos(conn, cfg, root, "b")
@@ -348,11 +396,12 @@ def test_status_line_shows_every_stage(tmp_path):
     pc.cfg.workdir.mkdir(parents=True)
     for jid, name, state in ((1, "X", "encoding"), (2, "W1", "downloaded"),
                              (3, "W2", "downloaded"), (4, "Y", "uploading"),
-                             (5, "Z", "downloading")):
+                             (5, "Z", "downloading"), (6, "V", "verifying"),
+                             (7, "E", "encoded"), (8, "F", "verified")):
         pc._hold(dict(JOB, id=jid, path=f"Movies/{name}.mkv", size=1))
         pc.queue.set_state(jid, state)
     assert pc.status_line() == ("Encoding X.mkv (2 waiting) · Downloading Z.mkv"
-                                " · Uploading Y.mkv")
+                                " · Verifying V.mkv · Uploading Y.mkv · 2 encoded waiting")
     assert (pc.stage, pc.current_path) == ("encoding", "Movies/X.mkv")
 
 

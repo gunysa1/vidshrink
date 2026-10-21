@@ -130,6 +130,9 @@ class PCConfig:
     queue_disk_gb: float = 300.0
     queue_hours: float = 24.0
     reserve_days: float = 7.0
+    # Stop claiming while finished encodes waiting to upload exceed this: the
+    # upload link, not the encoder, is then the limit (25 GB is ~70 min at 6 MB/s).
+    queue_upload_gb: float = 25.0
 
 
 def default_config_path() -> Path:
@@ -207,7 +210,7 @@ EncodeFn = Callable[[Path, Path, Probe, Path, threading.Event], float]
 
 # Local states of a held job that is waiting in a stage's queue rather than being
 # worked on: a server cancel can drop it at once, since no stage owns it.
-_IDLE_STATES = ("downloaded", "encoded", "uploaded")
+_IDLE_STATES = ("downloaded", "encoded", "verified", "uploaded")
 _LEFTOVER_JOB = re.compile(r"^(\d+)\.job\.json$")
 
 
@@ -221,9 +224,10 @@ def _parse_resume(resp) -> tuple[dict[int, dict], set[int]]:
 
 
 class PCWorker:
-    """Three stage threads, one job at a time each -- download, encode, then
-    verify+upload+report -- with on-disk queues between them (LocalQueue), plus
-    one heartbeat thread covering every held job."""
+    """Four stage threads, one job at a time each -- download, encode, verify,
+    then upload+report -- with queues between them (LocalQueue), plus one
+    heartbeat thread covering every held job. Verifying apart from uploading
+    keeps the (capped) upload link busy while the next file is checked."""
 
     def __init__(self, cfg: PCConfig, client: JobClient, rclone: Rclone,
                  encode: EncodeFn | None = None, log: Callable[[str], None] = print,
@@ -247,7 +251,8 @@ class PCWorker:
         # The prefetch limits. The claim filter reads them from here too, so the
         # two can never disagree.
         self.queue = LocalQueue(cfg.workdir, int(cfg.queue_disk_gb * 1e9), cfg.queue_hours,
-                                server.disk_factor, server.disk_reserve)
+                                server.disk_factor, server.disk_reserve,
+                                int(cfg.queue_upload_gb * 1e9))
         # After Drive's upload limit the server blocks uploads this long; so do we.
         self.upload_pause_secs = server.rate_limit_block_secs
         self._phase = "new"  # "new", "running", "stopped"
@@ -268,8 +273,14 @@ class PCWorker:
         self._deleting: set[int] = set()
         self._resuming = 0  # jobs offered to /resume, until the server answers
         self._to_encode: deque[LocalJob] = deque()  # downloaded, oldest first
-        self._to_upload: deque[LocalJob] = deque()  # encoded, oldest first
+        self._to_verify: deque[LocalJob] = deque()  # encoded, oldest first
+        self._to_upload: deque[LocalJob] = deque()  # verified, oldest first
         self._encoder_done = threading.Event()
+        self._verifier_done = threading.Event()
+        self._uploader_done = threading.Event()
+        # Verified jobs: id -> (out_size, md5), in memory only (a restart verifies
+        # again from the .encoded marker).
+        self._verified: dict[int, tuple[int, str]] = {}
         # Uploaded jobs whose "uploaded" report is still owed: id -> (out_size, md5,
         # encode secs), also kept in each one's `<id>.uploaded` marker. The uploader
         # retries the report alone, never the upload, once _reports_due has passed.
@@ -278,7 +289,6 @@ class PCWorker:
         # before the report (the server may have expired it and deleted the tmp).
         self._check_tmp: set[int] = set()
         self._reports_due = 0.0  # time.monotonic()
-        self._upload_stage = ""  # "verifying" or "uploading" while the uploader works
         self._uploads_paused_until = 0.0  # time.monotonic() deadline
         self._fault_exc: _LocalFault | None = None
         self._claim_not_before = 0.0  # time.monotonic(); see _back_off_claims
@@ -352,11 +362,10 @@ class PCWorker:
     def _focus(self) -> tuple[str, LocalJob | None]:
         """The encoder's job, or the most active stage's when nothing encodes."""
         jobs = self._snapshot()
-        for state in ("encoding", "uploading", "downloading"):
+        for state in ("encoding", "uploading", "verifying", "downloading"):
             for lj in jobs:
                 if lj.state == state:
-                    stage = (self._upload_stage or state) if state == "uploading" else state
-                    return stage, lj
+                    return state, lj
         return ("waiting for work" if self._phase == "running" else ""), None
 
     @property
@@ -390,9 +399,9 @@ class PCWorker:
         elif waiting:
             parts.append(f"{waiting} downloaded waiting")
         parts += [f"Downloading {name(lj)}" for lj in having("downloading")]
-        parts += [f"{(self._upload_stage or 'uploading').title()} {name(lj)}"
-                  for lj in having("uploading")]
-        encoded = len(having("encoded"))
+        parts += [f"Verifying {name(lj)}" for lj in having("verifying")]
+        parts += [f"Uploading {name(lj)}" for lj in having("uploading")]
+        encoded = len(having("encoded")) + len(having("verified"))
         if encoded and time.monotonic() < self._uploads_paused_until:
             parts.append(f"Uploads paused ({encoded} waiting)")
         elif encoded:
@@ -501,7 +510,7 @@ class PCWorker:
                                                info["encode_secs"])
                     self._check_tmp.add(lj.id)
             if lj.state != "uploaded":
-                self._push(self._to_encode if lj.state == "downloaded" else self._to_upload,
+                self._push(self._to_encode if lj.state == "downloaded" else self._to_verify,
                            lj)
             self.log(f"resumed ({lj.state}): {lj.job.get('path')}")
         return unlisted
@@ -538,7 +547,8 @@ class PCWorker:
                 return
             stages = [threading.Thread(target=self._stage, args=(fn,), daemon=True,
                                        name=f"vidshrink{fn.__name__}")
-                      for fn in (self._downloader, self._encoder, self._uploader)]
+                      for fn in (self._downloader, self._encoder, self._verifier,
+                                 self._uploader)]
             hb_stop = threading.Event()
             hb = threading.Thread(target=self._heartbeat, args=(hb_stop,), daemon=True,
                                   name="vidshrink_heartbeat")
@@ -667,6 +677,7 @@ class PCWorker:
             del self._jobs[lj.id]
             self._cancels.pop(lj.id, None)
             self._reserved.discard(lj.id)
+            self._verified.pop(lj.id, None)
             self._gone.discard(lj.id)
             self._unreported.pop(lj.id, None)
             self._check_tmp.discard(lj.id)
@@ -743,6 +754,8 @@ class PCWorker:
             if self.cfg.disk_check:
                 extra["free_bytes"] = self._free_bytes()
             return extra
+        if self.queue.upload_backlog_full():
+            return None  # the uploader is behind: wait for it to catch up
         # Both count the output the held encodes still have to write.
         room = self.queue.queue_disk_bytes - self.queue.on_disk()
         if room <= 0:
@@ -884,15 +897,78 @@ class PCWorker:
             self._job_error(lj, e)
             return
         if self._set_state(lj, "encoded"):
+            self._push(self._to_verify, lj)
+
+    # --- verify stage ---------------------------------------------------------
+    def _verifier(self) -> None:
+        try:
+            while not self._stop_now.is_set() and not self._uploader_done.is_set():
+                if self._stop_after.is_set():
+                    with self._cv:
+                        if self._encoder_done.is_set() and not self._to_verify:
+                            return  # Stop after: every encoded file is verified
+                with self._cv:
+                    if self._to_upload:
+                        # One verified file waiting keeps the uploader busy; running
+                        # further ahead would only spend CPU sooner.
+                        self._cv.wait(0.5)
+                        continue
+                lj = self._take(self._to_verify, "verifying")
+                if lj is not None:
+                    self._run_job(lj, self._verify_one)
+        finally:
+            self._verifier_done.set()
+            with self._cv:
+                self._cv.notify_all()
+
+    def _verify_one(self, lj: LocalJob) -> None:
+        job, jid, out = lj.job, lj.id, lj.out
+        try:
+            probe = Probe(**job["probe"])
+            secs = self._read_marker(self.cfg.workdir / f"{jid}.encoded")
+            if secs is None:
+                raise FileNotFoundError(2, "no finished-encode marker for", str(out))
+            self.log(f"verifying {job['path']} ({secs / 60:.0f} min encode)")
+            out_size = out.stat().st_size
+            verdict = compare(probe, parse_ffprobe(run_ffprobe(str(out)), out_size),
+                              job["size"], out_size, self.cfg.min_saving, decode_errors(out))
+            if verdict.problems:
+                self.log(f"failed checks: {'; '.join(verdict.problems)}")
+                self._report(job, "failed", reason="; ".join(verdict.problems))
+                self._forget(lj)
+                return
+            if verdict.not_worth_it:
+                self.log(f"not worth it: only {1 - out_size / job['size']:.0%} smaller")
+                self._report(job, "not_worth_it",
+                             reason=f"only {1 - out_size / job['size']:.0%} smaller")
+                self._forget(lj)
+                return
+            md5 = md5_file(out)
+            self._check(self._cancel_of(lj))
+        except Exception as e:
+            self._job_error(lj, e)
+            return
+        with self._cv:
+            if self._held(lj):
+                self._verified[jid] = (out_size, md5)
+        if self._set_state(lj, "verified"):
             self._push(self._to_upload, lj)
 
     # --- upload stage ---------------------------------------------------------
     def _uploader(self) -> None:
+        try:
+            self._upload_loop()
+        finally:
+            self._uploader_done.set()
+            with self._cv:
+                self._cv.notify_all()
+
+    def _upload_loop(self) -> None:
         while not self._stop_now.is_set():
             self._retry_reports()
             if self._stop_after.is_set():
                 with self._cv:
-                    if self._encoder_done.is_set() and not self._to_upload:
+                    if self._verifier_done.is_set() and not self._to_upload:
                         return  # Stop after: every encoded file is uploaded
             paused = self._uploads_paused_until - time.monotonic()
             if paused > 0:
@@ -913,29 +989,17 @@ class PCWorker:
         tmp = None
         try:
             path, tmp = job["path"], job["tmp_path"]
-            probe = Probe(**job["probe"])
             secs = self._read_marker(self.cfg.workdir / f"{jid}.encoded")
+            with self._cv:
+                verified = self._verified.get(jid)
             if secs is None:
                 raise FileNotFoundError(2, "no finished-encode marker for", str(out))
-            self._upload_stage = "verifying"
-            self.log(f"verifying ({secs / 60:.0f} min encode)")
-            out_size = out.stat().st_size
-            verdict = compare(probe, parse_ffprobe(run_ffprobe(str(out)), out_size),
-                              job["size"], out_size, self.cfg.min_saving, decode_errors(out))
-            if verdict.problems:
-                self.log(f"failed checks: {'; '.join(verdict.problems)}")
-                self._report(job, "failed", reason="; ".join(verdict.problems))
-                self._forget(lj)
+            if verified is None:  # not expected: just verify it (again)
+                if self._set_state(lj, "encoded"):
+                    self._push(self._to_verify, lj)
                 return
-            if verdict.not_worth_it:
-                self.log(f"not worth it: only {1 - out_size / job['size']:.0%} smaller")
-                self._report(job, "not_worth_it",
-                             reason=f"only {1 - out_size / job['size']:.0%} smaller")
-                self._forget(lj)
-                return
-            md5 = md5_file(out)
+            out_size, md5 = verified
             self._check(cancel)
-            self._upload_stage = "uploading"
             self.log(f"uploading {out_size / 1e9:.1f} GB "
                      f"({1 - out_size / job['size']:.0%} smaller)")
             uploading = True
@@ -957,8 +1021,6 @@ class PCWorker:
             else:
                 self._job_error(lj, e, tmp=tmp, md5=md5, uploading=uploading,
                                 remote=self.rclone.remote)
-        finally:
-            self._upload_stage = ""
 
     def _keep_unreported(self, lj: LocalJob, out_size: int, md5: str, secs: float) -> None:
         """The upload is done but the server hasn't confirmed the report: keep the
@@ -1019,7 +1081,7 @@ class PCWorker:
                 self.log(f"{tmp} is no longer ours; uploading again: {job['path']}")
                 (self.cfg.workdir / f"{lj.id}.uploaded").unlink(missing_ok=True)
                 if self._set_state(lj, "encoded"):
-                    self._push(self._to_upload, lj)
+                    self._push(self._to_verify, lj)
                 return
         # Right after a resume the first attempt is unambiguous (the earlier report
         # can't have committed, or the row wouldn't be leased to us); otherwise an
@@ -1047,7 +1109,7 @@ class PCWorker:
         except JobServiceError as e:
             self.log(f"could not report upload_paused for {job['path']}: {e}")
         self._uploads_paused_until = time.monotonic() + self.upload_pause_secs
-        if self._set_state(lj, "encoded"):
+        if self._set_state(lj, "verified"):
             self._push(self._to_upload, lj, front=True)
 
     # --- per-job outcomes -------------------------------------------------------
@@ -1116,8 +1178,10 @@ class PCWorker:
         if lj.state == "encoding":
             lj.out.unlink(missing_ok=True)
             back = "downloaded"
-        else:  # uploading (verifying, or the transfer itself)
+        else:  # verifying or uploading: verify again on the next start
             self._delete_tmp_if_ours(lj.job, tmp, md5)
+            with self._cv:
+                self._verified.pop(lj.id, None)
             back = "encoded"
         if self._set_state(lj, back):
             self.log(f"stopped; keeping {lj.job['path']} ({back}) for next time")

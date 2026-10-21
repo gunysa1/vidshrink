@@ -100,6 +100,7 @@ workdir = 'D:\vidshrink'
 # Download-ahead limits (these are the defaults):
 queue_disk_gb = 300    # source files waiting plus results not yet uploaded
 queue_hours = 24       # expected encode hours of jobs held but not yet started
+queue_upload_gb = 25   # stop claiming while this much encoded output waits to upload
 reserve_days = 7       # how long finished downloads stay reserved while the PC is off
 # Optional: cap the PC's upload bandwidth so Plex stays usable, e.g. "6M"
 # (uploads only). To cap downloads too, give "UP:DOWN", e.g. "6M:40M" (MiB/s).

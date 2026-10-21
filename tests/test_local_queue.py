@@ -166,3 +166,17 @@ def test_clean_workdir_sweeps_uploaded_markers(tmp_path):
         (tmp_path / name).write_text("{}")
     deleted = clean_workdir(tmp_path, {5})
     assert {p.name for p in deleted} == {"4.uploaded", "4.uploaded.tmp"}
+
+
+def test_admits_refuses_while_upload_backlog_full(tmp_path):
+    q = LocalQueue(tmp_path, 10_000, 24.0, 2.0, 0, queue_upload_bytes=15)
+    for jid, state in ((1, "encoded"), (2, "uploading"), (3, "uploaded")):
+        q.add(_job(jid))
+        q.set_state(jid, state)
+        (tmp_path / f"{jid}.out.mkv").write_bytes(b"y" * 10)
+    # encoded + uploading count (20 bytes); uploaded (only a report owed) doesn't
+    assert q.upload_backlog() == 20 and q.upload_backlog_full()
+    assert not q.admits(1, 0.1, 10**9)
+    q.set_state(2, "uploaded")
+    assert q.upload_backlog() == 10 and not q.upload_backlog_full()
+    assert q.admits(1, 0.1, 10**9)

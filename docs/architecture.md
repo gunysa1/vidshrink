@@ -12,7 +12,7 @@
 | `encode.py` | ffmpeg command lines for x265 (server and cloud) and NVENC (PC), and the stream mapping (FLAC for PCM, SRT for mov_text/eia_608). |
 | `verify.py` | Output checks: codec, duration within 1 s, streams, clean full decode, minimum saving. |
 | `jobs.py` | The job service (`JobStore`, HTTP server, `JobClient`): leases, heartbeats, reports, budgets, alerts. |
-| `pc_worker.py` | The remote worker used by both the PC (NVENC) and the cloud VM (x265): download, encode and upload stage threads and a batch heartbeat. |
+| `pc_worker.py` | The remote worker used by both the PC (NVENC) and the cloud VM (x265): download, encode, verify and upload stage threads and a batch heartbeat. |
 | `local_queue.py` | The remote worker's local job queue and its marker files on disk. |
 | `tray.py` | Windows tray app around `pc_worker`. |
 | `budget.py` | Daily byte budgets per Pacific day, plus temporary blocks after quota errors. |
@@ -54,9 +54,12 @@ upload at a time.
   stops claiming at either limit:
   - `queue_disk_gb`: source files waiting plus outputs not yet uploaded.
   - `queue_hours`: expected encode hours of jobs held but not yet encoded.
+  - `queue_upload_gb` (default 25): finished encodes waiting to upload. Past it the
+    upload link is the bottleneck, so claiming more would only pile up encodes.
   - The first job into an empty queue is always admitted. `free_bytes` and `max_hours`
     still apply to each claim.
-- **Verify** runs in the upload stage, before the upload.
+- **Verify** is its own stage between encode and upload, so the next file is checked
+  while the previous one uploads and the (capped) upload link never waits on it.
 
 ## Reservations
 
@@ -165,9 +168,10 @@ JSON.
 | `disk_check` | false | true |
 | `queue_disk_gb` | 300 | 120 |
 | `queue_hours` | 24 | 24 |
+| `queue_upload_gb` | 25 | 25 |
 | `reserve_days` | 7 | 1 |
 
-- `queue_disk_gb` and `queue_hours` limit how much work a worker prefetches. See
+- `queue_disk_gb`, `queue_hours` and `queue_upload_gb` limit how much work a worker prefetches. See
   Pipelining.
 - `reserve_days` is how long a finished download stays reserved for the worker.
 - **Marker files.** The workdir holds `<id>.job.json`, `<id>.downloaded` and
