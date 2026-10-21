@@ -104,6 +104,6 @@ def test_cancel_leaves_original(tmp_path, make_clip):
 
 def test_cli_local_without_pc_config_uses_x265(tmp_path, make_clip):
     from vidshrink.cli import main
-    d = folder_with(tmp_path, make_clip, ("a", {"container": "mp4", "seconds": 1}))
+    d = folder_with(tmp_path, make_clip, ("a", {"container": "mp4", "sub_langs": ()}))
     assert main(["local", str(d), "--config", str(tmp_path / "none.toml")]) == 0
     assert codec(d / "a.mkv") == "hevc" and (d / ORIGINALS / "a.mp4").exists()
