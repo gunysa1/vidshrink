@@ -138,10 +138,18 @@ def main(argv: list[str] | None = None) -> int:
         if name == "calibrate":
             p.add_argument("--samples", type=int, default=3)
             p.add_argument("--cqs", default="20,22,24,26")
+    lc = sub.add_parser("local", help="compress a local folder of videos in place")
+    lc.add_argument("folder", type=Path)
+    lc.add_argument("--config", type=Path, default=None)
+    lc.add_argument("--cq", type=int, default=None, help="NVENC CQ (default: config's)")
+    lc.add_argument("--dry-run", action="store_true")
+    lc.add_argument("--limit", type=int)
     args = ap.parse_args(argv)
 
     if args.cmd in ("pc-worker", "tray", "calibrate"):
         return _pc_main(args)
+    if args.cmd == "local":
+        return _local_main(args)
 
     cfg = replace(base, remote=args.remote, db_path=args.db, workdir=args.workdir)
     if "VIDSHRINK_MIN_SIZE" in os.environ:
@@ -206,6 +214,41 @@ def _pc_main(args) -> int:
         run_tray(TrayController(make_worker))
         return 0
     return _calibrate(args, pcfg, client)
+
+
+def _local_main(args) -> int:
+    from vidshrink.encode import build_command, build_nvenc_command, run_encode_cancellable
+    from vidshrink.local import compress_folder
+    from vidshrink.pc_worker import PCConfig, apply_ffmpeg_dir, default_config_path, \
+        load_pc_config
+    path = args.config or default_config_path()
+    pcfg = load_pc_config(path) if path.exists() else PCConfig(server="", token="", encoder="x265-cloud")
+    apply_ffmpeg_dir(pcfg)
+    if not args.folder.is_dir():
+        _log(f"not a folder: {args.folder}")
+        return 2
+    cq = args.cq if args.cq is not None else pcfg.cq
+
+    def encode(src, out, probe, log_path, cancel):
+        cmd = (build_nvenc_command(src, out, probe, cq) if pcfg.encoder == "nvenc"
+               else build_command(src, out, probe, Config()))
+        return run_encode_cancellable(cmd, log_path, cancel)
+
+    cancel = threading.Event()
+    result = {}
+    t = threading.Thread(target=lambda: result.update(totals=compress_folder(
+        args.folder, encode, pcfg.min_saving, args.dry_run, args.limit, cancel, _log)),
+        daemon=True)
+    t.start()
+    try:
+        while t.is_alive():
+            t.join(0.5)
+    except KeyboardInterrupt:
+        _log("Ctrl-C: stopping; the file being encoded is left unchanged")
+        cancel.set()
+        t.join()
+    totals = result.get("totals")
+    return 0 if totals is not None and totals.failed == 0 else 1
 
 
 def _run_until_ctrl_c(w) -> None:

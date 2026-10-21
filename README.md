@@ -103,6 +103,7 @@ the repo.
 | `vidshrink pc-worker [--config PATH]` | PC / cloud | headless remote worker |
 | `vidshrink tray` | PC | tray app with Start / Stop now / Stop after this file |
 | `vidshrink calibrate` | PC | pick the NVENC CQ that matches x265 quality (VMAF) |
+| `vidshrink local FOLDER [--dry-run] [--limit N] [--cq N]` | any | compress a local folder (not the library) in place, with the same checks; originals move to `FOLDER/_vidshrink_originals/` |
 
 ## Documentation
 

@@ -9,6 +9,7 @@ def test_cli_imports_without_fcntl(monkeypatch):
         monkeypatch.delitem(sys.modules, name)
     cli = importlib.import_module("vidshrink.cli")
     assert callable(cli.main)
-    for mod in ("vidshrink.pc_worker", "vidshrink.calibrate", "vidshrink.tray", "vidshrink.jobs"):
+    for mod in ("vidshrink.pc_worker", "vidshrink.calibrate", "vidshrink.tray", "vidshrink.jobs",
+                "vidshrink.local"):
         importlib.import_module(mod)
     assert "vidshrink.worker" not in sys.modules
