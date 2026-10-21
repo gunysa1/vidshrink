@@ -83,8 +83,9 @@ def test_dry_run_and_stale_tmp(tmp_path, make_clip):
     totals = compress_folder(d, lambda *a: calls.append(a), dry_run=True,
                              log=lambda m: None)
     assert calls == [] and totals.done == 0
-    assert (d / "a.mp4").exists()
-    assert not (d / f"b{TMP_SUFFIX}").exists()  # never a candidate, and cleaned up
+    assert sorted(p.name for p in d.iterdir()) == ["a.mp4", f"b{TMP_SUFFIX}"]  # untouched
+    compress_folder(d, x265, log=lambda m: None)
+    assert not (d / f"b{TMP_SUFFIX}").exists()  # a real run cleans it up
 
 
 def test_cancel_leaves_original(tmp_path, make_clip):

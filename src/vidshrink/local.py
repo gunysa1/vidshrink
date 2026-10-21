@@ -71,14 +71,16 @@ def compress_folder(folder: Path, encode: EncodeFn, min_saving: float = 0.20,
 
     def note(msg: str) -> None:
         log(msg)
+        if dry_run:
+            return  # a dry run touches nothing in the folder, not even the log
         try:
             with open(logfile, "a", encoding="utf-8") as f:
                 f.write(msg + "\n")
         except OSError:
             pass
 
-    for stale in folder.glob(f"*{TMP_SUFFIX}"):  # an encode interrupted last time
-        stale.unlink(missing_ok=True)
+    for stale in [] if dry_run else folder.glob(f"*{TMP_SUFFIX}"):
+        stale.unlink(missing_ok=True)  # an encode interrupted last time
     for src in candidates(folder):
         if cancel.is_set() or (limit is not None and totals.done >= limit):
             break
