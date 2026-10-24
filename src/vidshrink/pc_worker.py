@@ -24,7 +24,7 @@ from vidshrink.local_queue import LocalJob, LocalQueue, read_uploaded
 from vidshrink.paths import md5_file, tmp_path
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
 from vidshrink.rclone import Rclone, RcloneError, TMP_SUFFIX, TransferCancelled
-from vidshrink.verify import compare, decode_errors
+from vidshrink.verify import compare, decode_errors, source_errors
 
 
 def _default_workdir() -> Path:
@@ -41,6 +41,7 @@ _NUMBERED_PATTERNS = tuple(re.compile(p) for p in (
     r"^(\d+)\.out\.mkv$",
     r"^(\d+)\.log$",
     r"^(\d+)\.encoded$",
+    r"^(\d+)\.srcerrs$",
     r"^(\d+)\.downloaded$",
     r"^(\d+)\.uploaded$",
     # The queued job's claim dict, plus its own write-then-rename tmp.
@@ -49,7 +50,7 @@ _NUMBERED_PATTERNS = tuple(re.compile(p) for p in (
     # "<name>.<random>.partial" (e.g. "65137.src.a1b2c3.partial").
     r"^(\d+)\.(?:src|out\.mkv)\..*\.partial$",
     # A marker's own write-then-rename tmp, if a crash lands mid-write.
-    r"^(\d+)\.(?:encoded|downloaded|uploaded)\.tmp$",
+    r"^(\d+)\.(?:encoded|srcerrs|downloaded|uploaded)\.tmp$",
 ))
 # calibrate's own leftovers: never present while the PC worker loop runs (the two
 # never run at once in one process), so always safe to sweep here.
@@ -830,7 +831,8 @@ class PCWorker:
         try:
             path = job["path"]
             # A fresh claim: nothing already on disk under this id is trustworthy.
-            for f in (src, downloaded, lj.out, self.cfg.workdir / f"{lj.id}.encoded"):
+            for f in (src, downloaded, lj.out, self.cfg.workdir / f"{lj.id}.encoded",
+                      self.cfg.workdir / f"{lj.id}.srcerrs"):
                 f.unlink(missing_ok=True)
             self.log(f"downloading {path} ({job['size'] / 1e9:.1f} GB)")
             self._check(cancel)
@@ -889,8 +891,12 @@ class PCWorker:
             self.log(f"encoding {job['path']}")
             self._check(cancel)
             secs = self.encode(lj.src, lj.out, probe, lj.log, cancel)
+            # Verify needs the source's own audio errors (the audio is copied, so
+            # they reappear in the output), but the source is deleted below.
+            self._write_marker(self.cfg.workdir / f"{lj.id}.srcerrs",
+                               source_errors(lj.src, lj.out))
             self._write_marker(self.cfg.workdir / f"{lj.id}.encoded", secs)
-            # Only the output and its marker are needed from here on (verify reads
+            # Only the output and its markers are needed from here on (verify reads
             # the probe from the job), so free the source's disk at once.
             lj.src.unlink(missing_ok=True)
         except Exception as e:
@@ -930,8 +936,13 @@ class PCWorker:
                 raise FileNotFoundError(2, "no finished-encode marker for", str(out))
             self.log(f"verifying {job['path']} ({secs / 60:.0f} min encode)")
             out_size = out.stat().st_size
+            try:  # absent for a file encoded before srcerrs existed
+                src_errors = (self.cfg.workdir / f"{jid}.srcerrs").read_text()
+            except OSError:
+                src_errors = ""
             verdict = compare(probe, parse_ffprobe(run_ffprobe(str(out)), out_size),
-                              job["size"], out_size, self.cfg.min_saving, decode_errors(out))
+                              job["size"], out_size, self.cfg.min_saving,
+                              decode_errors(out), src_errors)
             if verdict.problems:
                 self.log(f"failed checks: {'; '.join(verdict.problems)}")
                 self._report(job, "failed", reason="; ".join(verdict.problems))

@@ -1909,3 +1909,23 @@ def test_stop_now_during_report_retries_keeps_job_for_next_start(conn, setup, mo
         assert (wd / f"{vid}{ext}").exists(), ext
     assert_reserved(conn, vid)
     assert (root / "Movies" / "a.vidshrink-tmp.mkv").exists()
+
+
+@pytest.mark.parametrize("src_errors, stage", [
+    ("[aac @ 0000014f568e8940] env_facs_q 255 is invalid", "remote_ready"),
+    ("", "failed"),
+])
+def test_output_errors_the_source_has_do_not_fail(conn, setup, monkeypatch,
+                                                  src_errors, stage):
+    root, pc, store = setup
+    # Audio is copied, so a damaged source's errors reappear in the output; only
+    # errors the source lacks fail the job. The source is gone by verify time, so
+    # its errors are recorded at encode time.
+    monkeypatch.setattr("vidshrink.pc_worker.decode_errors",
+                        lambda p: "[aac @ 0xadd7785bf680] env_facs_q 255 is invalid")
+    monkeypatch.setattr("vidshrink.pc_worker.source_errors", lambda s, o: src_errors)
+    t = run_in_thread(pc)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    assert wait_for(lambda: db.get(conn, vid)["stage"] == stage)
+    pc.stop(now=True)
+    t.join(10)

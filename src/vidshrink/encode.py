@@ -36,9 +36,11 @@ CONVERTED = {**{c: "subrip" for c in TO_SRT}, **{c: "flac" for c in TO_FLAC}}
 
 
 def output_streams(streams: list[list[str]]) -> list[list[str]]:
-    """The audio/subtitle streams an encode writes for these source streams."""
-    return [[kind, CONVERTED.get(codec, codec), lang] for kind, codec, lang in streams
+    """The audio/subtitle streams an encode writes for these source streams, in the
+    order it writes them: `-map 0:a -map 0:s` puts all audio before all subtitles."""
+    kept = [[kind, CONVERTED.get(codec, codec), lang] for kind, codec, lang in streams
             if not (kind == "subtitle" and codec in DROPPED_SUBS)]
+    return [s for s in kept if s[0] == "audio"] + [s for s in kept if s[0] != "audio"]
 
 
 def _input_args(src: Path, probe: Probe) -> list[str]:

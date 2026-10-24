@@ -10,7 +10,7 @@
 | `worker.py` | The server loop: prepare (download), encode, verify, upload a tmp file, swap. It downloads the next file and uploads results in the background while it encodes. It also finishes remote workers' results and recovers after restarts. |
 | `transfer.py` | The server worker's background download and upload threads. |
 | `encode.py` | ffmpeg command lines for x265 (server and cloud) and NVENC (PC), and the stream mapping (FLAC for PCM, SRT for mov_text/eia_608). |
-| `verify.py` | Output checks: codec, duration within 1 s, streams, clean full decode, minimum saving. |
+| `verify.py` | Output checks: codec, duration (within 1 s, or 0.05% on long files), streams (audio before subtitles, as written; an undetermined language may gain a tag), full decode with no errors beyond the source's own copied-audio errors, minimum saving. |
 | `jobs.py` | The job service (`JobStore`, HTTP server, `JobClient`): leases, heartbeats, reports, budgets, alerts. |
 | `pc_worker.py` | The remote worker used by both the PC (NVENC) and the cloud VM (x265): download, encode, verify and upload stage threads and a batch heartbeat. |
 | `local_queue.py` | The remote worker's local job queue and its marker files on disk. |
