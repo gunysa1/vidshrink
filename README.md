@@ -17,11 +17,12 @@ that reads the same Drive.
   (rclone)       │ vidshrink serve  job service (HTTP + token)  │
                  │ state.db         SQLite, the source of truth │
                  └───────────▲──────────────────▲───────────────┘
-                     LAN     │                  │ Tailscale
+                     LAN     │                  │ SSH tunnels
                  ┌───────────┴─────┐   ┌────────┴─────────────┐
-                 │ Windows PC       │   │ cloud VM (Oracle A1) │
-                 │ NVENC, tray app  │   │ x265, systemd unit   │
-                 └──────────────────┘   └──────────────────────┘
+                 │ Windows PC       │   │ cloud VMs            │
+                 │ NVENC, tray app  │   │ Oracle A1, GCP spot  │
+                 └──────────────────┘   │ x265, systemd unit   │
+                                        └──────────────────────┘
 ```
 
 1. **Scan.** `vidshrink scan` lists the library, probes each new or changed file
@@ -32,7 +33,7 @@ that reads the same Drive.
    the original.
 3. **Swap.** Only the server swaps: it checks that the original is unchanged,
    moves it to Drive's trash, and renames the temporary file into its place.
-4. **Remote workers.** A Windows PC (NVENC) and a cloud VM (x265) can lease jobs from
+4. **Remote workers.** A Windows PC (NVENC) and cloud VMs (x265) can lease jobs from
    the server's job service. They download, encode, verify and upload the temporary
    file themselves, then report back. The server checks the upload on Drive and does
    the swap. Remote workers never delete or replace originals.
@@ -112,8 +113,8 @@ the repo.
 - [docs/operations.md](docs/operations.md): day-to-day running, restarts, requeues
   and troubleshooting
 - [docs/pc-setup.md](docs/pc-setup.md): set up the Windows NVENC worker
-- [docs/cloud-worker-setup.md](docs/cloud-worker-setup.md): set up the cloud x265
-  worker (Oracle Cloud Always Free)
+- [docs/cloud-worker-setup.md](docs/cloud-worker-setup.md): set up a cloud x265
+  worker (Oracle Cloud Always Free, or a Google Cloud spot VM)
 - `docs/superpowers/specs/`: design documents, one per feature
 - `docs/superpowers/plans/`: the implementation plans built from them
 
@@ -124,4 +125,4 @@ the repo.
 ```
 
 The suite uses local rclone remotes and short generated clips. It never touches a
-real Drive. The full run takes about 12 minutes.
+real Drive. The full run takes about 14 minutes.

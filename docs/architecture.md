@@ -157,7 +157,7 @@ JSON.
 
 | Key | PC | Cloud |
 |---|---|---|
-| `server`, `token` | LAN URL | Tailscale URL |
+| `server`, `token` | LAN URL | `http://127.0.0.1:8765` (SSH tunnel from the server) |
 | `remote` | `gdrive:` (main account, uploads) | `gdrive:` (its own authorization) |
 | `download_remote` | second account | download-only account (Viewer) |
 | `download_account` | (derived: `pc`) | `cloud` |
@@ -166,7 +166,7 @@ JSON.
 | `bwlimit` | `6M` (upload cap) | `""` (no limit) |
 | `max_hours` | 0 (off) | 24 |
 | `disk_check` | false | true |
-| `queue_disk_gb` | 300 | 120 |
+| `queue_disk_gb` | 300 | 120 (Oracle), 100 (GCP) |
 | `queue_hours` | 24 | 24 |
 | `queue_upload_gb` | 25 | 25 |
 | `reserve_days` | 7 | 1 |
@@ -175,8 +175,10 @@ JSON.
   Pipelining.
 - `reserve_days` is how long a finished download stays reserved for the worker.
 - **Marker files.** The workdir holds `<id>.job.json`, `<id>.downloaded` and
-  `<id>.encoded` for each job. A restart uses them to resume. The source is deleted
-  once `<id>.encoded` is written. `<id>.uploaded` (out size, md5, encode seconds)
+  `<id>.encoded` for each job. A restart uses them to resume. Before `<id>.encoded`,
+  the encode stage writes `<id>.srcerrs`: the source's own audio decode errors, taken
+  only when the output's audio has errors, so verify can still excuse them once the
+  source is gone. The source is deleted once `<id>.encoded` is written. `<id>.uploaded` (out size, md5, encode seconds)
   marks a finished upload whose report the server hasn't confirmed: the worker keeps
   the job and retries only the report, and uploads again only if the tmp on Drive is
   no longer its own.
@@ -187,4 +189,6 @@ JSON.
   full disk, a missing tool), it releases its job with no attempt used, sends an
   alert and stops.
 - **On the cloud.** The systemd unit doesn't restart a clean stop like that. Fix the
-  cause, then start the unit again.
+  cause, then start the unit again. A spot VM that Google stops is different: the
+  worker gets a stop signal, releases the running job and keeps finished downloads
+  and encodes for its next start.

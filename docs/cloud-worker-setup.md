@@ -1,8 +1,15 @@
-# Setting up the cloud worker (Oracle A1, x265)
+# Setting up a cloud worker (x265)
 
-The cloud worker is the PC worker run headless on a Linux VM. It claims jobs from the
-server over Tailscale, encodes them with software x265, uploads the result, and reports
-back. It is on-demand: it only claims work while its unit runs.
+A cloud worker is the PC worker run headless on a Linux VM. It claims jobs from the
+server through an SSH tunnel, encodes them with software x265, uploads the result, and
+reports back. It only claims work while its unit runs.
+
+Two run in production:
+
+| Worker | VM | Paid by |
+|---|---|---|
+| `oracle-a1` | Oracle `VM.Standard.A1.Flex`, 4 OCPU, 24 GB, aarch64 | Always Free |
+| `gcp-t2d` | Google Cloud `t2d-standard-8` spot, us-central1-c, x86_64 | free-trial credit |
 
 Rules for the whole guide:
 
@@ -11,17 +18,42 @@ Rules for the whole guide:
 
 ## 1. The instance
 
-Already created in the Oracle console:
+### Oracle
 
 - Shape `VM.Standard.A1.Flex`, 4 OCPU, 24 GB RAM.
 - Ubuntu 24.04 LTS, aarch64, user `ubuntu`.
 - 200 GB boot volume (the workdir lives on it).
 - Security list: only SSH inbound. Port 8765 is never opened.
 
-Let user services run without a login session:
+### Google Cloud (spot)
+
+- Machine `t2d-standard-8` (8 vCPU, 32 GB), provisioning model **Spot**, zone
+  `us-central1-c`. Ubuntu 24.04 LTS, x86_64, 145 GB balanced disk.
+- Firewall: only SSH inbound.
+- **Reserve a static external IP** and attach it (VPC network → IP addresses). Without
+  one, every restart after a spot stop gives the VM a new IP and the tunnel breaks.
+  Editing the machine type can detach it; check the External IP column afterwards and
+  re-attach it under Edit → Network interfaces. Google also bills a reserved IP that
+  isn't attached to a running VM.
+- **Restart after a spot stop.** Google stops a spot VM when it needs the capacity and
+  does not start it again. A Cloud Scheduler job does:
+  1. IAM & Admin → Roles: create a role `VM starter` with `compute.instances.get`,
+     `compute.instances.start` and `compute.zoneOperations.get`.
+  2. IAM & Admin → Service accounts: create `vm-starter` with that role. It needs no
+     key (new organisations block key creation anyway).
+  3. Cloud Scheduler → Create job: name `vm-autostart`, region `us-central1`, frequency
+     `*/10 * * * *`, target HTTP `POST`
+     `https://compute.googleapis.com/compute/v1/projects/<project>/zones/us-central1-c/instances/<vm>/start`,
+     empty body, auth header **OAuth token** as `vm-starter`, scope
+     `https://www.googleapis.com/auth/cloud-platform`.
+
+  Starting a running VM does nothing, so the job just runs every 10 minutes. To keep
+  the VM stopped on purpose, pause the job first.
+
+Either VM: let user services run without a login session:
 
 ```bash
-sudo loginctl enable-linger ubuntu
+sudo loginctl enable-linger "$USER"
 ```
 
 ## 2. Reaching the job service
@@ -38,6 +70,9 @@ service. The VM can reach only that one port. On the server, add an SSH alias fo
 Host vidshrink-cloud
     HostName <vm public IP>
     User ubuntu
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+    ExitOnForwardFailure yes
 ```
 
 Then install and start the tunnel unit:
@@ -45,6 +80,15 @@ Then install and start the tunnel unit:
 ```bash
 cp deploy/vidshrink-tunnel.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now vidshrink-tunnel
+```
+
+A second VM gets its own alias and its own copy of the unit. The GCP one is
+`vidshrink-gcp` / `vidshrink-tunnel-gcp`:
+
+```bash
+sed 's/vidshrink-cloud$/vidshrink-gcp/; s/the cloud worker/the GCP worker/' \
+  deploy/vidshrink-tunnel.service > ~/.config/systemd/user/vidshrink-tunnel-gcp.service
+systemctl --user daemon-reload && systemctl --user enable --now vidshrink-tunnel-gcp
 ```
 
 On the VM, `curl http://127.0.0.1:8765/health` should now answer 401 (no token), and
@@ -64,14 +108,16 @@ curl -H "Authorization: Bearer $TOKEN" http://<server-tailnet-name>:8765/health
 
 It should answer with the health JSON. `vidshrink-serve` already binds `0.0.0.0:8765`,
 which includes the Tailscale interface, so nothing changes on the server. Once this works
-you can restrict SSH in the Oracle security list to the tailnet.
+you can restrict SSH in the firewall to the tailnet.
 
 ## 3. Tools on the VM
 
 ### ffmpeg
 
-Use the same version as the server: BtbN `n9.0.2`, the `linuxarm64` GPL build. Take the
-`ffmpeg-n9.0.2-...-linuxarm64-gpl` tarball from the BtbN FFmpeg-Builds releases page.
+Use the same version as the server: BtbN `n9.0.2`, the GPL build for the VM's CPU
+(`linuxarm64` on Oracle, `linux64` on GCP). Take the tarball from the BtbN
+FFmpeg-Builds releases page, or for x86_64 copy the server's
+`~/.local/opt/ffmpeg-9.0.2-linux64-gpl` over SSH.
 
 ```bash
 mkdir -p ~/.local/opt ~/.local/bin
@@ -83,8 +129,8 @@ ffmpeg -version | head -1
 
 ### rclone
 
-Install the arm64 build from rclone.org (`curl https://rclone.org/install.sh | sudo bash`
-picks the right one), then check `rclone version`.
+Install the build for the VM's CPU from rclone.org (`curl https://rclone.org/install.sh
+| sudo bash` picks the right one), then check `rclone version`.
 
 ### vidshrink
 
@@ -113,49 +159,58 @@ python3 -m venv .venv
 Create a new Google account used only for downloads. From the main account, share the
 library folders with it as **Viewer**. Read-only is enough.
 
-### Upload client (separate OAuth client)
+### OAuth client (one for the cloud VMs)
 
-The upload remote `gdrive:` is a new authorization of the main account, made for this VM
-only. It must use its **own OAuth client**, different from the one the server and PC use,
-so the VM can be revoked alone.
+Both remotes on a cloud VM, `gdrive:` and `gdrive-cloud:`, use an OAuth client of your
+own. Don't use rclone's built-in client: Google is retiring rclone's shared client
+during 2026. The cloud VMs share one client, separate from the server's and the PC's, so
+they can be revoked without touching those. In production it lives in the GCP VM's
+project.
 
-In your own Google Cloud project:
+In that Google Cloud project:
 
 1. Enable the Google Drive API (if not already).
 2. Create an OAuth client ID of type "Desktop app". Note the client ID and secret.
 3. On the OAuth consent screen, set the publishing status to **In production**. In
-   "Testing", Google expires refresh tokens after 7 days and the unattended worker would
-   lose upload access every week. A published but unverified app is fine for your own
-   account; Google shows an "unverified app" warning once, at authorization.
+   "Testing", Google expires refresh tokens after 7 days and the unattended worker
+   loses Drive access every week (`invalid_grant`). A published but unverified app is
+   fine for your own accounts; Google shows an "unverified app" warning at
+   authorization.
+
+**A token only works with the client that issued it.** If you change a remote's
+`client_id` or `client_secret`, authorize that remote again. Otherwise it keeps working
+until its access token runs out, then fails with `invalid_client` about an hour later.
+Edit `rclone.conf` directly to change the client. `rclone config update` starts a new
+authorization.
 
 ### Authorizing the remotes
 
-The browser step of `rclone authorize` runs on a machine with a browser (the PC), not on
-the VM.
+Create both remotes on the VM with `rclone config`, with the client ID and secret above:
 
-Upload remote, with the new client:
+- `gdrive`: type `drive`, scope full access. Log in as the **main** account. Set the
+  root so it points at the same Drive root as the server's `gdrive:` (copy non-secret
+  options such as `root_folder_id` from the server's config; not its token).
+- `gdrive-cloud`: type `drive`, scope `drive.readonly`, and in the advanced options
+  `shared_with_me = true`. Log in as the **download** account.
 
-```bash
-rclone authorize "drive" "<client_id>" "<client_secret>"
-```
-
-Log in as the main account. Copy the printed token, then on the VM run `rclone config`:
-new remote `gdrive`, type `drive`, the same client ID and secret, scope full access, and
-paste the token at "config_token". Set the root so it points at the same Drive root as the
-server's `gdrive:` (copy the non-secret options such as `root_folder_id` from the server's
-config; not its token).
-
-Download remote, `gdrive-cloud:`, follows the PC's recipe (`docs/pc-setup.md`, the
-second-account section) with a fresh authorization:
+The VM has no browser, so do the login through a port forward from a device that has
+one (a PC, or a phone running Termux):
 
 ```bash
-rclone authorize "drive"
+ssh -L 53682:127.0.0.1:53682 <user>@<vm public IP>
+# then, on the VM:
+rclone config reconnect gdrive:        # answer y to auto config
+rclone config reconnect gdrive-cloud:
 ```
 
-Log in as the new download account, then on the VM run `rclone config` and create the
-remote `gdrive-cloud` with: type `drive`, scope `drive.readonly`, and in the advanced
-options `shared_with_me = true`. The default rclone client is fine for this read-only
-account. Paste the token at "config_token".
+Open the printed `http://127.0.0.1:53682/auth?...` link in that device's browser and
+log in. Run the `rclone` commands at the VM prompt, not on the device: if the device
+runs rclone itself, the port forward holds port 53682 and rclone fails with "address
+already in use".
+
+Without a port forward: answer `n` to auto config, run the printed
+`rclone authorize "drive" ...` command on the device, and paste its result at the VM's
+`config_token>` prompt.
 
 ### Check that the paths line up
 
@@ -182,7 +237,7 @@ install -m 600 /dev/null ~/.config/vidshrink/config.toml
 Then write this into it (the file is already private, mode 600):
 
 ```toml
-server = "http://<server-tailnet-name>:8765"
+server = "http://127.0.0.1:8765"
 token = "<job-service token>"
 remote = "gdrive:"
 download_remote = "gdrive-cloud:"
@@ -198,14 +253,19 @@ worker_name = "oracle-a1"
 workdir = "/home/ubuntu/vidshrink-work"
 ```
 
+On GCP: `worker_name = "gcp-t2d"`, `queue_disk_gb = 100` (145 GB disk) and the
+workdir under that VM's home.
+
 `max_hours` is the longest encode the worker will claim (0 turns it off). `disk_check`
 skips jobs that do not fit in the free disk.
 
 The worker downloads ahead while it encodes. `queue_disk_gb` caps the files it keeps on
-disk (sources waiting plus results not yet uploaded). 120 leaves room on the 200 GB
-boot volume. `queue_hours` caps the expected encode time of jobs it holds but has not
-started. `reserve_days` is how long the server keeps a finished download reserved for
-this VM if it goes quiet. The VM is always on, so one day is enough.
+disk (sources waiting plus results not yet uploaded); leave room on the disk.
+`queue_hours` caps the expected encode time of jobs it holds but has not started.
+`reserve_days` is how long the server keeps a finished download reserved for this VM if
+it goes quiet. The VMs are meant to be always on, so one day is enough. A worker that
+stays stopped longer finds some jobs given away on its next start; it deletes their
+local files (`resume refused, deleting: ...`).
 
 ## 6. Run it
 
@@ -219,7 +279,7 @@ journalctl --user -u vidshrink-cloud-worker -f
 
 The unit restarts after a crash but not after a clean exit. If a Drive login dies, the
 worker releases its job, sends an alert (shown by `vidshrink status` on the server as
-`ALERT oracle-a1: ...`) and exits. Re-authorize the remote as in section 4, then start it
+`ALERT <worker>: ...`) and exits. Re-authorize the remote as in section 4, then start it
 again by hand:
 
 ```bash
@@ -228,12 +288,17 @@ systemctl --user start vidshrink-cloud-worker
 
 To stop claiming work, `systemctl --user stop vidshrink-cloud-worker`.
 
+On a spot VM the unit starts on its own when the VM boots, and the worker resumes the
+downloads and encodes it kept.
+
 ## 7. Revoking access
 
-- Upload access: in the main Google account, remove the VM's OAuth client under
-  Security > Third-party access. The server and PC use another client and keep working.
-- Network: remove the VM from the tailnet (Tailscale admin console).
+- Drive access: in each Google account, remove the cloud VMs' OAuth client under
+  Security > Third-party access, or delete the client in its Cloud project. The server
+  and PC use other clients and keep working.
+- Network: remove the VM's SSH alias and tunnel unit on the server (or the VM from the
+  tailnet).
 - Job service: there is one shared token. Rotate it by hand: replace
   `~/vidshrink/serve.token` on the server, restart `vidshrink-serve`, and update the
-  token in the PC's and any other worker's config.
+  token in the PC's and every other worker's config.
 - Download account: remove its Viewer shares, or delete the account.

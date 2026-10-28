@@ -167,7 +167,10 @@ only keeps the two separate:
 2. On the PC, run `rclone config` to create a new remote, e.g. `gdrive-pc`, type
    `drive`, scope `drive.readonly`, and in the advanced options set
    `shared_with_me = true`, so that `Movies/...` paths resolve from the "Shared
-   with me" root. Log in with the second account in the browser.
+   with me" root. Log in with the second account in the browser. Give the remote
+   your own OAuth client ID and secret (published, not "Testing"). Google is retiring
+   rclone's built-in client during 2026, and a Testing client's logins expire after
+   7 days. See [cloud-worker-setup.md](cloud-worker-setup.md), section 4.
 
 3. Test it:
 

@@ -42,17 +42,17 @@ systemctl --user restart vidshrink-serve
 Deploy in this order:
 
 1. The server first. Restart `vidshrink-serve` any time, and `vidshrink` between jobs.
-2. Then the cloud VM and the PC. Old remote workers keep working against the new
+2. Then the cloud VMs and the PC. Old remote workers keep working against the new
    server, one job at a time, until they are updated.
 
 Remote workers update separately:
 
 - **PC:** `git pull` in its checkout, then restart the tray or `pc-worker`. Restart
   between jobs, or use Stop after this file first.
-- **Cloud VM:** `git -C ~/vidshrink pull`. Before restarting, make sure the VM's
-  `config.toml` sets `queue_disk_gb = 120`, `queue_hours = 24` and `reserve_days = 1`
-  (the defaults are the PC's 300 GB and 7 days, too much for the 200 GB boot volume
-  and the always-on VM). Then restart the unit (see
+- **Cloud VMs:** `git -C ~/vidshrink pull`. Before restarting, make sure the VM's
+  `config.toml` sets `queue_disk_gb` (120 on Oracle, 100 on GCP), `queue_hours = 24`
+  and `reserve_days = 1` (the defaults are the PC's 300 GB and 7 days, too much for
+  the VMs' disks). Then restart the unit between jobs (see
   [cloud-worker-setup.md](cloud-worker-setup.md)).
 
 ## Stopping a remote worker
@@ -88,6 +88,18 @@ sqlite3 ~/vidshrink/state.db \
 If the source changed or its probe looks wrong, set `stage='unprobed'` instead, and
 the next `vidshrink scan` probes it again.
 
+Common reasons:
+
+- `rclone exit 3` (directory not found): the file was moved or renamed on Drive,
+  for example by Sonarr or Radarr. `vidshrink scan` adds it under its new path, but
+  scan never touches `failed` rows, so retire the old row by hand once
+  `rclone lsf` confirms the old path is gone:
+  `update videos set stage='gone' where id=<ID> and stage='failed'`.
+- `duration X -> Y` with Y well short of X: usually a bad source whose video ends
+  before its stated length. Replace the file on Drive.
+- `decode errors` naming the source's own faults (for example "non monotonically
+  increasing dts"): a damaged source. Replace it, or leave it failed.
+
 ## Worker alerts
 
 | Alert | Fix |
@@ -96,6 +108,27 @@ the next `vidshrink scan` probes it again.
 | `Local fault, worker stopped: …` | Fix the cause (disk space, permissions, a missing ffmpeg), then restart the worker. |
 
 An alert clears on that worker's next successful claim.
+
+What the rclone error behind a failed Drive login means:
+
+- `invalid_grant`: the refresh token expired or was revoked. A client whose consent
+  screen is still in "Testing" does this every 7 days; publish it, then reconnect.
+- `invalid_client`: the remote's `client_id`/`client_secret` don't match the client
+  that issued its token, or the secret was reset. It shows about an hour after the
+  change. Reconnect the remote with the client now in its config.
+
+## Cloud VMs
+
+- **Tunnel fails with "remote port forwarding failed for listen port 8765".** A dead
+  SSH session still holds the port on the VM. Find it with `ss -ltnp | grep 8765` on
+  the VM, `kill` that `sshd` pid, then `systemctl --user restart vidshrink-tunnel`
+  (or `vidshrink-tunnel-gcp`) on the server.
+- **GCP VM unreachable ("Connection timed out").** Google stopped the spot VM. The
+  Cloud Scheduler job `vm-autostart` starts it within 10 minutes, and the tunnel
+  reconnects by itself. If the External IP shown in the console isn't the reserved
+  static one, re-attach it (see [cloud-worker-setup.md](cloud-worker-setup.md)).
+- **Stopping the GCP VM on purpose:** pause `vm-autostart` first, or it starts the VM
+  again.
 
 ## ffmpeg
 
@@ -111,7 +144,7 @@ An alert clears on that worker's next successful claim.
 Plex reads the same main account, so its daily download quota is shared:
 
 - The server caps its own downloads at 500 GB per Pacific day.
-- The PC and the cloud worker download through their own accounts. Those have no
+- The PC and the cloud workers download through their own accounts. Those have no
   daily cap, and usage is still recorded.
 - A `downloadQuotaExceeded` error pauses that account's downloads for 12 h.
 - In September 2026 an uncapped scan used up the quota and locked Plex out for
