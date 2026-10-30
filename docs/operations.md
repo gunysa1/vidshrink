@@ -97,8 +97,11 @@ Common reasons:
   `update videos set stage='gone' where id=<ID> and stage='failed'`.
 - `duration X -> Y` with Y well short of X: usually a bad source whose video ends
   before its stated length. Replace the file on Drive.
-- `decode errors` naming the source's own faults (for example "non monotonically
-  increasing dts"): a damaged source. Replace it, or leave it failed.
+- `decode errors` naming the source's own faults: a damaged source. Replace it, or
+  leave it failed.
+- `[null @ ...] non monotonically increasing dts` from a build before 2026-10-30:
+  the decode check itself rounded timestamps when the video starts between frame
+  ticks, not a fault in the output. Update the worker and requeue.
 
 ## Worker alerts
 

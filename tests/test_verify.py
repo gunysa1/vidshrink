@@ -1,4 +1,5 @@
 from dataclasses import replace
+import subprocess
 
 from vidshrink.probe import Probe
 from vidshrink.verify import compare, decode_errors, source_errors
@@ -117,3 +118,18 @@ def test_repeat_counts_need_not_match():
     out_err = "[aac @ 0xa] env_facs_q 255 is invalid\n    Last message repeated 4 times\n"
     src_err = "[aac @ 0xb] env_facs_q 255 is invalid\n    Last message repeated 2 times\n"
     assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err).ok
+
+
+def test_decode_errors_video_starting_off_the_frame_grid_is_clean(tmp_path):
+    # Naruto: 23.976 fps video starts 63 ms after the audio. Rounding its ms
+    # timestamps to frame ticks in the null muxer gave "non monotonically
+    # increasing dts".
+    video = tmp_path / "v.mkv"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc=size=160x90:rate=24000/1001:duration=2", "-c:v", "libx264",
+                    str(video)], check=True)
+    shifted = tmp_path / "shifted.mkv"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-itsoffset", "0.063", "-i", str(video),
+                    "-f", "lavfi", "-i", "sine=duration=2", "-map", "0", "-map", "1",
+                    "-c:v", "copy", "-c:a", "aac", str(shifted)], check=True)
+    assert decode_errors(shifted) == ""

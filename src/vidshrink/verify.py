@@ -69,9 +69,11 @@ def unexplained_errors(errors: str, src_errors: str) -> list[str]:
 
 def decode_errors(path: Path, audio_only: bool = False) -> str:
     maps = ["-map", "0:a?"] if audio_only else ["-map", "0:v", "-map", "0:a?"]
+    # Keep the file's own time base: rounding ms timestamps to frame ticks makes
+    # the null muxer report duplicate dts when video starts between frame ticks.
     res = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", str(path),
-         *maps, "-f", "null", "-"],
+         *maps, "-enc_time_base", "demux", "-f", "null", "-"],
         capture_output=True, **TEXT_KWARGS, **procflags.spawn_kwargs(),
     )
     err = res.stderr.strip()
