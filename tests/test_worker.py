@@ -159,7 +159,14 @@ def test_throttled_md5_check_retries_and_does_not_block(conn, env, monkeypatch):
     root, worker = env
     from vidshrink.rclone import RcloneError
     orig_md5 = worker.rclone.md5
-    calls = []
+    orig_upload = worker.rclone.upload
+    calls, uploads = [], []
+
+    def counting_upload(*a, **kw):
+        uploads.append(1)
+        return orig_upload(*a, **kw)
+
+    monkeypatch.setattr(worker.rclone, "upload", counting_upload)
 
     def flaky(path):
         calls.append(path)
@@ -170,7 +177,9 @@ def test_throttled_md5_check_retries_and_does_not_block(conn, env, monkeypatch):
     monkeypatch.setattr(worker.rclone, "md5", flaky)
     assert worker.run() == 2
     assert worker.budget.allows(1)
-    assert len(calls) >= 2
+    assert len(calls) >= 2  # the throttled check ran again
+    assert len(uploads) == 2  # retried the check; nothing was uploaded twice
+    assert all(r["attempts"] == 0 for r in db.rows_in(conn, "done"))
     assert not db.rows_in(conn, "ready") and not db.rows_in(conn, "failed")
     assert len(db.rows_in(conn, "done")) == 2
 

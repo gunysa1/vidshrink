@@ -1017,7 +1017,7 @@ class PCWorker:
                      f"({1 - out_size / job['size']:.0%} smaller)")
             uploading = True
             self._retry(lambda: self.rclone.upload(out, tmp, cancel=cancel), cancel)
-            if self.rclone.md5(tmp) != md5:
+            if self._retry(lambda: self.rclone.md5(tmp), cancel) != md5:
                 self._delete_tmp_if_ours(job, tmp, md5)
                 self._report(job, "failed", reason="checksum mismatch after upload")
                 self._forget(lj)

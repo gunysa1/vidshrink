@@ -547,7 +547,7 @@ class Worker:
         try:
             if error is not None:
                 raise error
-            remote_md5 = self.rclone.md5(tmp)
+            remote_md5 = self._retry(lambda: self.rclone.md5(tmp))
         except RcloneError as e:
             if e.upload_limit:
                 self.budget.block(self.cfg.rate_limit_block_secs)
