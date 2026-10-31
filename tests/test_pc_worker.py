@@ -455,7 +455,7 @@ def test_upload_permit_server_error_pauses_without_failing(conn, setup, monkeypa
     def permit(job_id, worker, out_size):
         asked.append(out_size)
         if len(asked) == 1:
-            raise JobServiceError("boom", status=500)
+            raise JobServiceError("boom", status=400)  # a 4xx is not retried
         return orig_permit(job_id, worker, out_size)
 
     def upload(local, path, cancel=None):
@@ -469,6 +469,8 @@ def test_upload_permit_server_error_pauses_without_failing(conn, setup, monkeypa
         outcomes.append(outcome)
         return orig_report(job_id, worker, outcome, **data)
 
+    logs = []
+    pc.log = logs.append
     pc.cfg.idle_secs = 0.2
     monkeypatch.setattr(pc.client, "upload_permit", permit)
     monkeypatch.setattr(pc.rclone, "upload", upload)
@@ -477,6 +479,7 @@ def test_upload_permit_server_error_pauses_without_failing(conn, setup, monkeypa
     t = run_in_thread(pc)
     try:
         assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready", timeout=60)
+        assert any(m.startswith("could not get an upload permit, will retry") for m in logs)
         assert len(asked) >= 2 and uploads
         assert "failed" not in outcomes and "upload_paused" not in outcomes
     finally:
