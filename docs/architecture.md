@@ -43,11 +43,12 @@ side exits: skipped, not_worth_it, failed, probe_failed, gone
 - **Swap.** The server sets `original_trashed` on the row right before it trashes the
   original. If the original is later missing, the tmp file replaces it only when the
   flag is set. Otherwise the tmp is kept and the row shows "swap: needs attention".
-  If a swap fails while the original is still there, the server removes the tmp.
-- **Attempts.** A file that fails twice (`max_attempts`) is parked as `failed`. If a
-  scanned file differs from its download ("changed since scan") twice in a row with
-  the same listing, the second time costs an attempt and the row is parked as
-  `failed`. A real change on Drive resets attempts.
+  If a swap fails while the original is still there, the server removes the tmp,
+  unless this server had already trashed the original (`original_trashed`): then the
+  tmp is kept, because the encode may be the only copy.
+- **Attempts.** A file that fails twice (`max_attempts`) is parked as `failed`. Every
+  "changed since scan" adds an attempt. A real change in the listing resets them. The
+  second one in a row with the same listing parks the row as `failed`.
 - **Drive errors before a download.** Checking the target is retried. If it keeps
   failing the row stays `queued` with no attempt used, but it counts toward the
   server's "5 failures in a row" stop.

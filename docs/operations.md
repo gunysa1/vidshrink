@@ -107,8 +107,11 @@ Common reasons:
   instead of downloading forever. Check the file on Drive. A real change on Drive
   (new size or modtime) resets attempts by itself.
 - `upload shows no saving: ...`: a worker reported an upload that isn't at least 20%
-  smaller. The server parked the row and removed the tmp file on Drive. The same
-  happens to a row whose last upload attempt failed.
+  smaller. The server parked the row and removed the tmp file on Drive.
+- `upload: ...`: the last upload attempt failed. The row is parked and the tmp file
+  on Drive is removed.
+- `status` names the worker in a remote failure: `<worker>: <reason>`, not always
+  `PC`.
 - `[null @ ...] non monotonically increasing dts` from a build before 2026-10-30:
   the decode check itself rounded timestamps when the video starts between frame
   ticks, not a fault in the output. Update the worker and requeue.
@@ -122,14 +125,12 @@ Common reasons:
 
 An alert clears on that worker's next successful claim.
 
-`status` names the worker in a failure: `<worker>: <reason>`, not always `PC`.
-
 Drive has two different upload errors, and they are handled differently:
 
 | Drive error | Meaning | What happens |
 |---|---|---|
 | `uploadLimitExceeded` ("Received upload limit error") | the daily upload cap | the worker reports `upload_paused` and keeps its file; uploads are blocked for everyone for 6 h |
-| `userRateLimitExceeded`, `rateLimitExceeded` ("User rate limit exceeded") | a short-term throttle | retried with backoff; no block, no attempt used. The md5 check after an upload is retried too. |
+| `userRateLimitExceeded`, `rateLimitExceeded` ("User rate limit exceeded") | a short-term throttle | retried up to five times with backoff and never blocks uploads; if it keeps failing, the attempt counts like any other failure (only a throttle during a worker's download releases the job with no attempt). The md5 check after an upload is retried too. |
 
 A remote worker asks the server for a permit before every upload. When the day's
 700 GB is used up, its upload waits for a permit (`vidshrink status` shows the
@@ -165,13 +166,17 @@ gone from Drive and this server didn't record trashing it. The server records
 place when the original is missing only if that flag is set. Otherwise the tmp stays
 on Drive, because moving it in could bring back a file you deleted on purpose.
 Check the folder on Drive. If you deleted the original, delete the tmp too. If the
-encode is what you want, rename the tmp into place by hand.
+encode is what you want, rename the tmp into place by hand. The final name is the
+original's name with a `.mkv` extension (`final_path`). Once a file there has the
+encode's md5, the server finishes the row on its own.
 
 After upgrading, a row that an older version left in `swapping` with the original
 already trashed shows this once. Look at each one a single time.
 
 When a swap fails with the original still present, or the final upload attempt
 fails and the row is parked as `failed`, the server removes the tmp file on Drive.
+The exception is a swap where this server had already trashed the original
+(`original_trashed`): the tmp is kept, because the encode may be the only copy.
 
 A dry run (`run --dry-run`) leaves other workers' leases and tmp files alone. It
 still cleans up its own interrupted uploads.

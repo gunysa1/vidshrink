@@ -49,8 +49,8 @@ More detail: [docs/architecture.md](docs/architecture.md).
   checks on Drive. Deletes go to the Drive trash.
 - A remote worker may delete only its own `.vidshrink-tmp.mkv`, and only one it can
   prove it uploaded (size and md5 match its report).
-- A worker asks the server before each upload, so the 700 GB/day applies to every
-  upload.
+- The 700 GB/day upload budget is checked before every upload (older workers skip
+  the check).
 - Daily Drive budgets are kept per account (uploads 700 GB; main-account downloads
   500 GB, shared with Plex). The PC and cloud download accounts have no daily cap,
   because Plex never reads through them. A `downloadQuotaExceeded` error pauses that

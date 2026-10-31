@@ -193,18 +193,17 @@ authorization.
 
 Create both remotes on the VM with `rclone config`, with the client ID and secret above:
 
-- `gdrive`: type `drive`. Log in as the **main** account. Choose scope `drive.file`
-  (see the recommendation below). Set the
+- `gdrive`: type `drive`, scope full access. Log in as the **main** account. Set the
   root so it points at the same Drive root as the server's `gdrive:` (copy non-secret
   options such as `root_folder_id` from the server's config; not its token).
 - `gdrive-cloud`: type `drive`, scope `drive.readonly`, and in the advanced options
   `shared_with_me = true`. Log in as the **download** account.
 
-**Recommended: scope `drive.file` for the upload remote.** With it, Google itself
-limits the token to files that this worker created, so a stolen VM token can't read or
-change the rest of the library. Pick the scope when the remote is authorized; changing
-it later means reconnecting. Do the same for the PC's upload remote. The server's own
-`gdrive:` keeps full access, since it swaps and trashes originals.
+The upload remote (`gdrive`, on the VM and on the PC) needs full `drive` scope because
+it must write into the library's existing folders. Limiting a worker to its own files
+(`drive.file`) was considered and does not work: that scope can't see folders it
+didn't create, so the upload would build a duplicate folder tree and the server would
+never find the tmp file next to the original.
 
 The VM has no browser, so do the login through a port forward from a device that has
 one (a PC, or a phone running Termux):
