@@ -1029,6 +1029,9 @@ class FakeRemote:
     def exists(self, path):
         return path in self.files
 
+    def entries(self, path):
+        return [{"Name": path.rsplit("/", 1)[-1], "Size": 5}] if path in self.files else []
+
     def md5(self, path):
         return self.files.get(path)
 
@@ -1104,6 +1107,25 @@ def test_stop_now_abandon_deletes_our_complete_tmp(tmp_path):
     remote = FakeRemote({TMP: "a" * 32})
     pc = fake_pc(tmp_path, remote=remote)
     pc._abandon(JOB, TMP, "a" * 32)
+    assert remote.deleted == [TMP]
+
+
+def test_tmp_delete_refuses_duplicate_names(tmp_path):
+    remote, logs = FakeRemote({TMP: "a" * 32}), []
+    pc = fake_pc(tmp_path, remote=remote, logs=logs)
+    remote.entries = lambda path: [{"Name": "x", "Size": 5}, {"Name": "x", "Size": 5}]
+    pc._delete_tmp_if_ours(JOB, TMP, "a" * 32, 5)
+    assert remote.deleted == []
+    assert any("refusing to delete" in m and "2 entries" in m for m in logs)
+
+
+def test_tmp_delete_checks_size(tmp_path):
+    remote, logs = FakeRemote({TMP: "a" * 32}), []
+    pc = fake_pc(tmp_path, remote=remote, logs=logs)
+    pc._delete_tmp_if_ours(JOB, TMP, "a" * 32, 6)  # the remote entry is 5 bytes
+    assert remote.deleted == []
+    assert any("refusing to delete" in m and "size differs" in m for m in logs)
+    pc._delete_tmp_if_ours(JOB, TMP, "a" * 32, 5)
     assert remote.deleted == [TMP]
 
 

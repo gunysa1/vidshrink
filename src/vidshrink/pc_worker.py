@@ -1020,7 +1020,7 @@ class PCWorker:
             uploading = True
             self._retry(lambda: self.rclone.upload(out, tmp, cancel=cancel), cancel)
             if self._retry(lambda: self.rclone.md5(tmp), cancel) != md5:
-                self._delete_tmp_if_ours(job, tmp, md5)
+                self._delete_tmp_if_ours(job, tmp, md5, out_size)
                 self._report(job, "failed", reason="checksum mismatch after upload")
                 self._forget(lj)
                 return
@@ -1140,7 +1140,7 @@ class PCWorker:
         """Drive's upload limit: keep the encoded file and the lease, tell the server
         (which blocks uploads for everyone), and retry only after the block."""
         job = lj.job
-        self._delete_tmp_if_ours(job, tmp, md5)
+        self._delete_tmp_if_ours(job, tmp, md5, self._verified_size(lj.id))
         self.log(f"Drive's upload limit hit; uploads paused for "
                  f"{self.upload_pause_secs / 3600:.0f} h, keeping {job['path']}")
         try:
@@ -1224,7 +1224,7 @@ class PCWorker:
             lj.out.unlink(missing_ok=True)
             back = "downloaded"
         else:  # verifying or uploading: verify again on the next start
-            self._delete_tmp_if_ours(lj.job, tmp, md5)
+            self._delete_tmp_if_ours(lj.job, tmp, md5, self._verified_size(lj.id))
             with self._cv:
                 self._verified.pop(lj.id, None)
             back = "encoded"
@@ -1383,7 +1383,7 @@ class PCWorker:
                 return "done"
             except LeaseLost:
                 if not ambiguous:
-                    self._delete_tmp_if_ours(job, tmp, md5)
+                    self._delete_tmp_if_ours(job, tmp, md5, out_size)
                 else:
                     self.log(f"lease lost reporting uploaded after an earlier "
                              f"ambiguous failure; leaving {tmp} for the server to "
@@ -1410,7 +1410,8 @@ class PCWorker:
             return False
         return True
 
-    def _delete_tmp_if_ours(self, job: dict, tmp: str | None, md5: str | None) -> None:
+    def _delete_tmp_if_ours(self, job: dict, tmp: str | None, md5: str | None,
+                            size: int | None = None) -> None:
         if not tmp or not self._safe_tmp(job, tmp):
             return
         if not md5:
@@ -1419,15 +1420,29 @@ class PCWorker:
             self.log(f"no local md5 yet; not deleting {tmp}")
             return
         try:
-            if self.rclone.exists(tmp) and self.rclone.md5(tmp) == md5:
+            found = self.rclone.entries(tmp)
+            if not found:
+                return
+            if len(found) > 1:  # Drive allows duplicate names: which one is ours?
+                self.log(f"refusing to delete {tmp}: {len(found)} entries")
+                return
+            if size is not None and found[0].get("Size") != size:
+                self.log(f"refusing to delete {tmp}: size differs")
+                return
+            if self.rclone.md5(tmp) == md5:
                 self.rclone.delete(tmp)
         except RcloneError as e:
             self.log(f"could not remove {tmp}: {e}")
 
+    def _verified_size(self, jid: int) -> int | None:
+        with self._cv:
+            verified = self._verified.get(jid)
+        return verified[0] if verified else None
+
     def _abandon(self, job: dict, tmp: str | None, md5: str | None) -> None:
         # Stop now, a server cancel or a local fault: the lease may no longer be ours
         # by now, so only ever remove a tmp that provably holds the bytes we uploaded.
-        self._delete_tmp_if_ours(job, tmp, md5)
+        self._delete_tmp_if_ours(job, tmp, md5, self._verified_size(job["id"]))
         try:
             self.client.release(job["id"], self.cfg.worker_name)
         except (LeaseLost, JobServiceError):
