@@ -414,6 +414,34 @@ def test_upload_waits_when_permit_refused(conn, setup, monkeypatch):
         t.join(15)
 
 
+def test_upload_permit_lease_lost_drops_job(conn, setup, monkeypatch):
+    root, pc, store = setup
+    uploads, outcomes = [], []
+
+    def lost(job_id, worker, out_size):
+        raise LeaseLost("gone")
+
+    orig_report = pc.client.report
+
+    def spy(job_id, worker, outcome, **data):
+        outcomes.append(outcome)
+        return orig_report(job_id, worker, outcome, **data)
+
+    monkeypatch.setattr(pc.client, "upload_permit", lost)
+    monkeypatch.setattr(pc.rclone, "upload", lambda *a, **k: uploads.append(a))
+    monkeypatch.setattr(pc.client, "report", spy)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: not (pc.cfg.workdir / f"{vid}.out.mkv").exists()
+                        and not (pc.cfg.workdir / f"{vid}.encoded").exists())
+        time.sleep(1)
+        assert not uploads and "failed" not in outcomes
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
 def test_upload_proceeds_when_permit_endpoint_missing(conn, setup, monkeypatch):
     root, pc, store = setup
 

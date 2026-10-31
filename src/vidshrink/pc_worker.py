@@ -1040,21 +1040,27 @@ class PCWorker:
     def _upload_permitted(self, lj: LocalJob, out_size: int) -> bool:
         """Ask the server whether today's upload budget allows this upload. If not,
         pause our uploads until it resets and put the job back (the server already
-        knows its budget is used, so there is nothing to report). LeaseLost
-        propagates to the stage's error handling; a server without the endpoint
-        (404) is an older one, so upload anyway."""
+        knows its budget is used, so there is nothing to report). A server without
+        the endpoint (404) is an older one, so upload anyway. Lost lease: drop the
+        job, as _pause_uploads does. Any other service error is not an answer, so
+        don't upload on it: retry the permit after the idle wait."""
         try:
             permit = self._retry_job_call(lambda: self.client.upload_permit(
                 lj.id, self.cfg.worker_name, out_size))
+        except LeaseLost:
+            self.log(f"lease lost asking for an upload permit, dropping: {lj.job['path']}")
+            self._forget(lj)
+            return False
         except JobServiceError as e:
-            if e.status != 404:
-                raise
-            self.log("the server has no upload permit; uploading without asking")
-            return True
+            if e.status == 404:
+                self.log("the server has no upload permit; uploading without asking")
+                return True
+            self.log(f"could not get an upload permit, will retry: {e}")
+            permit = {"ok": False, "retry_after": self.cfg.idle_secs}
         if permit["ok"]:
             return True
-        retry_after = float(permit["retry_after"])
-        self.log(f"upload budget used up; uploads paused for {retry_after / 3600:.1f} h, "
+        retry_after = max(float(permit.get("retry_after", 0)), 1.0)
+        self.log(f"upload not permitted now; uploads paused for {retry_after / 3600:.1f} h, "
                  f"keeping {lj.job['path']}")
         self._uploads_paused_until = time.monotonic() + retry_after
         if self._set_state(lj, "verified"):
