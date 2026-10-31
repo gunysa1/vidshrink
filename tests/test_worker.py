@@ -9,7 +9,7 @@ import pytest
 from vidshrink import db
 from vidshrink.budget import Budget
 from vidshrink.probe import parse_ffprobe, run_ffprobe
-from vidshrink.rclone import Rclone, TransferCancelled
+from vidshrink.rclone import Rclone, RcloneError, TransferCancelled
 from vidshrink.scanner import scan
 from vidshrink.worker import AlreadyRunning, Worker, final_path, tmp_path
 
@@ -405,6 +405,18 @@ def test_download_budget_counts_downloads(conn, env):
     assert worker.download_budget.used() == sum(r["size"] for r in downloaded)
 
 
+def test_failed_download_is_still_charged(conn, env, monkeypatch):
+    # The bytes left the account whether or not rclone finished; charge them when
+    # the download starts, not after it succeeds.
+    _, worker = env
+    monkeypatch.setattr(worker.rclone, "download",
+                        lambda *a, **k: (_ for _ in ()).throw(RcloneError(1, "boom")))
+    row = db.get_by_path(conn, "Movies/a.mkv")
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    prepare(worker, row)
+    assert worker.download_budget.used() == row["size"]
+
+
 def test_download_budget_exhausted_waits_without_downloading(conn, env):
     _, worker = env
     worker.download_budget.add(worker.cfg.daily_download_limit)
@@ -631,7 +643,7 @@ def test_interrupted_run_leaves_unfinished_transfers_for_recover(conn, cfg, env,
     assert db.get(conn, ready["id"])["stage"] == "uploading"
     assert db.get(conn, fetched["id"])["stage"] == "downloading"
     assert db.get(conn, waiting["id"])["stage"] == "encoding"
-    assert worker.download_budget.used() == ready["size"] + waiting["size"]
+    assert worker.download_budget.used() == sum(r["size"] for r in (ready, fetched, waiting))
     worker.recover()
     assert db.get(conn, ready["id"])["stage"] == "ready"
     assert db.get(conn, waiting["id"])["stage"] == "downloaded"

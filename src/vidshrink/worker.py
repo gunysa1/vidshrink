@@ -420,6 +420,8 @@ class Worker:
                 else:
                     started = db.mark_if(self.conn, vid, ("queued",), "downloading",
                                          encoder="x265")
+                    if started:
+                        self.download_budget.add(row["size"])  # charged even if rclone fails
         except DiskTooSmall as e:
             self._cleanup(vid)
             db.mark_if(self.conn, vid, ("queued",), "failed", reason=str(e)[:500])
@@ -439,13 +441,12 @@ class Worker:
                                                  cancel=cancel))
 
     def finish_download(self, row, error: Exception | None = None) -> bool:
-        """After the transfer (or its `error`): count it, check the size, mark `downloaded`."""
+        """After the transfer (or its `error`): check the size, mark `downloaded`."""
         vid, path = row["id"], row["path"]
         if error is not None:
             self._on_error(row, error)
             return False
         try:
-            self.download_budget.add(row["size"])
             if self._src(vid).stat().st_size != row["size"]:
                 self._cleanup(vid)
                 db.mark(self.conn, vid, "unprobed", reason="changed since scan",
