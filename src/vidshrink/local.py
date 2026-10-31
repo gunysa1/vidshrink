@@ -18,7 +18,7 @@ from pathlib import Path
 from vidshrink.encode import EncodeCancelled, EncodeError
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
 from vidshrink.scorer import EFFICIENT, INTERLACED, codec_family
-from vidshrink.verify import compare, decode_errors, source_errors
+from vidshrink.verify import audio_errors, compare, decode_errors
 
 VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".mkv", ".avi", ".wmv", ".ts", ".m2ts", ".mts",
               ".webm", ".flv", ".mpg", ".mpeg", ".3gp"}
@@ -112,9 +112,9 @@ def compress_folder(folder: Path, encode: EncodeFn, min_saving: float = 0.20,
             secs = encode(src, tmp, probe, enc_log, cancel)
             out_size = tmp.stat().st_size
             errors = decode_errors(tmp)
+            out_audio, src_audio = audio_errors(src, tmp) if errors else ("", "")
             verdict = compare(probe, parse_ffprobe(run_ffprobe(str(tmp)), out_size),
-                              size, out_size, min_saving, errors,
-                              source_errors(src, tmp) if errors else "")
+                              size, out_size, min_saving, errors, src_audio, out_audio)
         except EncodeCancelled:
             tmp.unlink(missing_ok=True)
             note(f"stopped during: {src.name} (left unchanged)")

@@ -940,9 +940,11 @@ class PCWorker:
                 src_errors = (self.cfg.workdir / f"{jid}.srcerrs").read_text()
             except OSError:
                 src_errors = ""
+            errors = decode_errors(out)
+            out_audio = decode_errors(out, audio_only=True) if errors else ""
             verdict = compare(probe, parse_ffprobe(run_ffprobe(str(out)), out_size),
                               job["size"], out_size, self.cfg.min_saving,
-                              decode_errors(out), src_errors)
+                              errors, src_errors, out_audio)
             if verdict.problems:
                 self.log(f"failed checks: {'; '.join(verdict.problems)}")
                 self._report(job, "failed", reason="; ".join(verdict.problems))

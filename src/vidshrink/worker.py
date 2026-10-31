@@ -15,7 +15,7 @@ from vidshrink.paths import final_path, is_valid_md5, md5_file, tmp_path  # re-e
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
 from vidshrink.rclone import Rclone, RcloneError, with_retries
 from vidshrink.transfer import Transfer
-from vidshrink.verify import compare, decode_errors, source_errors
+from vidshrink.verify import audio_errors, compare, decode_errors
 
 
 INTERRUPTED_PREFIX = "interrupted during "
@@ -476,8 +476,9 @@ class Worker:
             out_size = out.stat().st_size
             out_probe = parse_ffprobe(run_ffprobe(str(out)), out_size)
             errors = decode_errors(out)
+            out_audio, src_audio = audio_errors(src, out) if errors else ("", "")
             verdict = compare(probe, out_probe, row["size"], out_size, self.cfg.min_saving,
-                              errors, source_errors(src, out) if errors else "")
+                              errors, src_audio, out_audio)
             if verdict.problems:
                 self._fail(row, "; ".join(verdict.problems))
                 return

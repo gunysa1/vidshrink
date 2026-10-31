@@ -2,7 +2,7 @@ from dataclasses import replace
 import subprocess
 
 from vidshrink.probe import Probe
-from vidshrink.verify import compare, decode_errors, source_errors
+from vidshrink.verify import audio_errors, compare, decode_errors, source_errors
 
 SRC = Probe(container="mp4", duration=100.0, codec="h264", width=1920, height=1080,
             video_index=0, vbitrate=10e6, is_dv=False, color_primaries=None,
@@ -91,28 +91,61 @@ def test_duration_tolerance_scales_with_length():
 def test_decode_errors_the_source_already_has_pass():
     out_err = "[aac @ 0xadd7785bf680] env_facs_q 255 is invalid\n"
     src_err = "[aac @ 0000014f568e8940] env_facs_q 255 is invalid\n"  # Windows-style
-    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err).ok
+    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err, out_err).ok
     v = compare(SRC, OUT, 1000, 500, 0.2,
-                out_err + "[hevc @ 0x55d0] Invalid NAL unit size\n", src_err)
+                out_err + "[hevc @ 0x55d0] Invalid NAL unit size\n", src_err, out_err)
     assert v.problems == ["decode errors: [hevc @ 0x55d0] Invalid NAL unit size"]
 
 
 def test_decode_errors_stream_labels_ignored():
     out_err = "[aist#0:1/mp3 @ 0xb187] [dec:mp3float @ 0xb18740] Invalid data\n"
     src_err = "[aist#0:2/mp3 @ 0x5512] [dec:mp3float @ 0x9999aa] Invalid data\n"
-    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err).ok
+    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err, out_err).ok
 
 
 def test_decode_errors_source_audio_dts_glitch_passes():
-    # SpongeBob S16E15: the source's own audio has a duplicate timestamp. The source
-    # check decodes audio only (stream 0); in the output it is stream 1, and an mp4
-    # source counts in samples where the mkv output counts in ms.
-    src_err = ("[null @ 0x55e8f4] Application provided invalid, non monotonically "
-               "increasing dts to muxer in stream 0: 28335104 >= 28335104\n")
-    out_err = ("[null @ 00000285d9] Application provided invalid, non monotonically "
-               "increasing dts to muxer in stream 1: 590319 >= 590319\n")
-    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err).ok
-    assert not compare(SRC, OUT, 1000, 500, 0.2, out_err, "").ok
+    # SpongeBob S16E15: the source's own audio has a duplicate timestamp. In the full
+    # output decode the audio is stream 1; the audio-only decodes of output and
+    # source both call it stream 0, and an mp4 source counts in samples where the
+    # mkv output counts in ms.
+    dts = "Application provided invalid, non monotonically increasing dts to muxer in stream "
+    src_err = f"[null @ 0x55e8f4] {dts}0: 28335104 >= 28335104\n"
+    out_audio = f"[null @ 0x55e8f5] {dts}0: 590319 >= 590319\n"
+    out_err = f"[null @ 00000285d9] {dts}1: 590319 >= 590319\n"
+    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err, out_audio).ok
+    assert not compare(SRC, OUT, 1000, 500, 0.2, out_err, "", out_audio).ok
+
+
+def test_decode_errors_video_never_excused_by_the_source_audio():
+    dts = "Application provided invalid, non monotonically increasing dts to muxer in stream "
+    src_err = f"[null @ 0x1] {dts}0: 112 >= 112\n"
+    video_err = "".join(f"[null @ 0x2] {dts}0: {t} >= {t}\n" for t in (5, 9, 13))
+    # the output's audio is clean, so every line is the video's
+    v = compare(SRC, OUT, 1000, 500, 0.2, video_err, src_err, "")
+    assert v.problems == [f"decode errors: [null @ 0x2] {dts}0: 5 >= 5"]
+    # one audio glitch in both, plus a video glitch: only the audio one is excused
+    out_audio = f"[null @ 0x3] {dts}0: 2000 >= 2000\n"
+    out_err = f"[null @ 0x2] {dts}1: 2000 >= 2000\n" + f"[null @ 0x2] {dts}0: 5 >= 5\n"
+    v = compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err, out_audio)
+    assert v.problems == [f"decode errors: [null @ 0x2] {dts}0: 5 >= 5"]
+
+
+def test_decode_errors_counts_must_match():
+    # one glitch in the source's audio does not excuse two in the output's
+    dts = "Application provided invalid, non monotonically increasing dts to muxer in stream "
+    src_err = f"[null @ 0x1] {dts}0: 112 >= 112\n"
+    out_audio = f"[null @ 0x3] {dts}0: 112 >= 112\n[null @ 0x3] {dts}0: 900 >= 900\n"
+    out_err = f"[null @ 0x2] {dts}1: 112 >= 112\n[null @ 0x2] {dts}1: 900 >= 900\n"
+    assert not compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err, out_audio).ok
+    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err + src_err, out_audio).ok
+
+
+def test_decode_errors_other_audio_track_does_not_excuse():
+    dts = "Application provided invalid, non monotonically increasing dts to muxer in stream "
+    src_err = f"[null @ 0x1] {dts}1: 112 >= 112\n"       # second audio track
+    out_audio = f"[null @ 0x3] {dts}0: 112 >= 112\n"     # first audio track
+    out_err = f"[null @ 0x2] {dts}1: 112 >= 112\n"
+    assert not compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err, out_audio).ok
 
 
 def test_source_errors_skips_source_when_output_audio_clean(make_clip, tmp_path):
@@ -126,10 +159,18 @@ def test_bare_exit_code_never_explained_by_source():
     assert v.problems == ["decode errors: ffmpeg exit 1"]
 
 
-def test_repeat_counts_need_not_match():
+def test_repeat_counts_must_match():
+    # Both audio-only decodes read the same copied audio, so the folded repeats
+    # must add up: 1+4 output messages against 1+2 in the source fail, 1+2 pass.
     out_err = "[aac @ 0xa] env_facs_q 255 is invalid\n    Last message repeated 4 times\n"
     src_err = "[aac @ 0xb] env_facs_q 255 is invalid\n    Last message repeated 2 times\n"
-    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err).ok
+    assert not compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err, out_err).ok
+    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, out_err, out_err).ok
+    # The full decode interleaves video messages, so its runs fold differently.
+    full = "[aac @ 0xa] env_facs_q 255 is invalid\n[hevc @ 0xc] bad\n" \
+           "[aac @ 0xa] env_facs_q 255 is invalid\n    Last message repeated 1 times\n"
+    v = compare(SRC, OUT, 1000, 500, 0.2, full, src_err, src_err)
+    assert v.problems == ["decode errors: [hevc @ 0xc] bad"]
 
 
 def test_decode_errors_video_starting_off_the_frame_grid_is_clean(tmp_path):
@@ -145,3 +186,9 @@ def test_decode_errors_video_starting_off_the_frame_grid_is_clean(tmp_path):
                     "-f", "lavfi", "-i", "sine=duration=2", "-map", "0", "-map", "1",
                     "-c:v", "copy", "-c:a", "aac", str(shifted)], check=True)
     assert decode_errors(shifted) == ""
+
+
+def test_audio_errors_skips_source_when_output_audio_clean(make_clip, tmp_path):
+    bad = tmp_path / "bad.mkv"
+    bad.write_bytes(b"junk" * 1000)
+    assert audio_errors(bad, make_clip("a")) == ("", "")
