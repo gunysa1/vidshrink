@@ -103,6 +103,18 @@ def test_decode_errors_stream_labels_ignored():
     assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err).ok
 
 
+def test_decode_errors_source_audio_dts_glitch_passes():
+    # SpongeBob S16E15: the source's own audio has a duplicate timestamp. The source
+    # check decodes audio only (stream 0); in the output it is stream 1, and an mp4
+    # source counts in samples where the mkv output counts in ms.
+    src_err = ("[null @ 0x55e8f4] Application provided invalid, non monotonically "
+               "increasing dts to muxer in stream 0: 28335104 >= 28335104\n")
+    out_err = ("[null @ 00000285d9] Application provided invalid, non monotonically "
+               "increasing dts to muxer in stream 1: 590319 >= 590319\n")
+    assert compare(SRC, OUT, 1000, 500, 0.2, out_err, src_err).ok
+    assert not compare(SRC, OUT, 1000, 500, 0.2, out_err, "").ok
+
+
 def test_source_errors_skips_source_when_output_audio_clean(make_clip, tmp_path):
     bad = tmp_path / "bad.mkv"
     bad.write_bytes(b"junk" * 1000)

@@ -51,7 +51,9 @@ def _streams_match(expected: list[list[str]], out: list[list[str]]) -> bool:
 
 # "[aac @ 0x55d0c8]" (Linux) / "[aac @ 000001f4]" (Windows) and "aist#0:1": per-run
 # addresses and output stream numbers, which differ between source and output.
-_ERROR_NOISE = re.compile(r"@ (?:0x)?[0-9a-fA-F]+|#\d+:\d+")
+# "in stream 1: 112 >= 112": the null muxer's stream number and timestamps, which
+# differ too (the source check maps audio only; containers count time differently).
+_ERROR_NOISE = re.compile(r"@ (?:0x)?[0-9a-fA-F]+|#\d+:\d+|in stream \d+: \d+ >= \d+")
 
 
 _REPEATED = re.compile(r"^\s*Last message repeated \d+ times?$")
