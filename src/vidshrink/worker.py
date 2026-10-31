@@ -593,7 +593,8 @@ class Worker:
 
     def _remove_tmp(self, tmp: str) -> None:
         """Delete a leftover tmp from Drive (the scan hides them, so they'd pile up
-        unseen). Only for a row whose original is present or that is parked."""
+        unseen). Only for a row whose original is known to be present or has never been
+        touched; never when the original is absent (the tmp may be the only copy)."""
         try:
             if self.rclone.exists(tmp):
                 self._retry(lambda: self.rclone.delete(tmp))
@@ -711,6 +712,12 @@ class Worker:
         if original_present:
             db.mark(self.conn, row["id"], "failed", reason=f"swap: {e}"[:500])
             self._cleanup(row["id"])
+            if row["original_trashed"]:
+                # This server trashed the original it encoded; what sits at the path now
+                # is someone else's file, and the tmp may be the only copy of the encode.
+                self.log(f"SWAP FAILED, keeping {tmp_path(row['path'])} on Drive: the "
+                         f"original was trashed by this server: {row['path']}: {e}")
+                return
             self._remove_tmp(tmp_path(row["path"]))
             self.log(f"SWAP FAILED, original kept: {row['path']}: {e}")
             return

@@ -266,6 +266,26 @@ def test_swap_failure_with_original_present_removes_tmp(conn, env):
     assert sorted(p.name for p in (root / "Movies").iterdir()) == ["a.mkv", "b.mp4"]
 
 
+def test_swap_failure_keeps_tmp_when_original_was_trashed_by_us(conn, env):
+    # We trashed the original and crashed before the move; the user then put another
+    # file at the path. The tmp may be the only copy of the encode.
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    prepare(worker, db.get_by_path(conn, "Movies/b.mp4"))
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    transfer = worker.start_upload(row)  # the tmp lands; the crash comes before the swap
+    transfer.wait(60)
+    transfer.result()
+    tmp = root / "Movies" / "b.vidshrink-tmp.mkv"
+    assert tmp.exists()
+    (root / "Movies" / "b.mp4").write_bytes(b"someone else's file")
+    db.mark(conn, row["id"], "swapping", original_trashed=1)
+    assert worker._reconcile_swaps() == 0
+    r = db.get(conn, row["id"])
+    assert r["stage"] == "failed" and "original changed or duplicated" in r["reason"]
+    assert tmp.exists()
+
+
 def test_final_upload_failure_removes_tmp(conn, env, monkeypatch):
     root, worker = env
     worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
