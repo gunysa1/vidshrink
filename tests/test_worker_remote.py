@@ -195,6 +195,16 @@ def test_run_waits_instead_of_exiting_while_pc_holds_work(conn, env):
     assert slept == [worker.cfg.idle_poll_secs]
 
 
+def test_dry_run_does_not_expire_leases(conn, env):
+    root, worker = env
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    db.mark(conn, vid, "leased", worker="pc", encoder="nvenc", lease_until=time.time() - 1)
+    (root / "Movies" / "a.vidshrink-tmp.mkv").write_bytes(b"partial")
+    worker.run(dry_run=True)
+    assert db.get(conn, vid)["stage"] == "leased"
+    assert (root / "Movies" / "a.vidshrink-tmp.mkv").exists()
+
+
 def test_run_sweeps_expired_leases(conn, env):
     root, worker = env
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]

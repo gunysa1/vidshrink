@@ -323,7 +323,8 @@ class Worker:
                     and db.rows_in(self.conn, "swapping")):
                 done += self._reconcile_swaps()
                 last_reconcile = self.clock()
-            self.jobs.expire_leases()
+            if not dry_run:
+                self.jobs.expire_leases()  # deletes other workers' tmp files: never in a dry run
             if limit is not None and done >= limit:
                 break
             if not dry_run:
