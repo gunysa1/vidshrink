@@ -91,6 +91,15 @@ def test_bad_download_account_is_400(conn, job_service):
         c.claim("pc", download_account="bogus")
 
 
+def test_unknown_encoder_is_400(conn, job_service):
+    add(conn, "a.mkv")
+    c = JobClient(job_service.url, job_service.token)
+    with pytest.raises(JobServiceError, match="400"):
+        c.claim("pc", encoder="x264")
+    with pytest.raises(JobServiceError, match="400"):
+        c.resume("pc", "x264", "main", [])
+
+
 def test_wrong_token(job_service):
     with pytest.raises(JobServiceError, match="401"):
         JobClient(job_service.url, "nope").health()

@@ -1016,6 +1016,13 @@ def test_load_pc_config_cloud_keys(tmp_path):
         "x265-cloud", "cloud", 24.0, True, "")
 
 
+def test_pc_config_rejects_unknown_encoder(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('server = "http://s"\ntoken = "abc"\nencoder = "x264"\n')
+    with pytest.raises(ValueError, match="nvenc"):
+        load_pc_config(p)
+
+
 # --- final-review fixes: unit tests with fakes ------------------------------
 
 class FakeRemote:

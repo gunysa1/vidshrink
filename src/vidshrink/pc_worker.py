@@ -23,6 +23,7 @@ from vidshrink.jobs import JobClient, JobServiceError, LeaseLost
 from vidshrink.local_queue import LocalJob, LocalQueue, read_uploaded
 from vidshrink.paths import md5_file, tmp_path
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
+from vidshrink import scorer
 from vidshrink.rclone import Rclone, RcloneError, TMP_SUFFIX, TransferCancelled
 from vidshrink.verify import compare, decode_errors, source_errors
 
@@ -148,6 +149,9 @@ def load_pc_config(path: Path) -> PCConfig:
     unknown = set(data) - known
     if unknown:
         raise ValueError(f"unknown settings in {path}: {sorted(unknown)}")
+    if data.get("encoder", "nvenc") not in scorer.REMOTE_ENCODERS:
+        raise ValueError(f"unknown encoder {data['encoder']!r} in {path}; "
+                         f"one of {scorer.REMOTE_ENCODERS}")
     if "workdir" in data:
         data["workdir"] = Path(data["workdir"])
     return PCConfig(**data)

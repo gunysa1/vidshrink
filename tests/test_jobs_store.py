@@ -842,3 +842,15 @@ def test_report_uploaded_without_permit_still_accepted(conn, store):
     store.claim("pc")
     store.report(vid, "pc", "uploaded", out_size=100, out_md5="0" * 32, encode_secs=1.0)
     assert db.get(conn, vid)["stage"] == "remote_ready"
+
+
+@pytest.mark.parametrize("encoder", ["x265", "x264", ""])
+def test_claim_rejects_unknown_encoder(conn, store, encoder):
+    add(conn, "a.mkv")
+    with pytest.raises(ValueError, match="unknown encoder"):
+        store.claim("pc", encoder=encoder)
+
+
+def test_resume_rejects_unknown_encoder(conn, store):
+    with pytest.raises(ValueError, match="unknown encoder"):
+        store.resume("pc", "x265", "main", [])

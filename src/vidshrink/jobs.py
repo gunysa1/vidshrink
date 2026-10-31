@@ -151,6 +151,8 @@ class JobStore:
     def claim(self, worker: str, encoder: str = "nvenc", download_account: str = "main",
              resume: bool = False, free_bytes: int | None = None,
              max_hours: float | None = None) -> dict:
+        if encoder not in scorer.REMOTE_ENCODERS:
+            raise ValueError(f"unknown encoder {encoder!r}; one of {scorer.REMOTE_ENCODERS}")
         downloads = self._download_budget(download_account)
         result = None
         if resume:
@@ -270,6 +272,8 @@ class JobStore:
         still leased to this worker with this encoder (even if the lease has expired
         but not yet been swept) or back in the queue with its stem free. Everything
         else is refused, and the worker deletes its local files for it."""
+        if encoder not in scorer.REMOTE_ENCODERS:
+            raise ValueError(f"unknown encoder {encoder!r}; one of {scorer.REMOTE_ENCODERS}")
         self._download_budget(download_account)  # rejects an unknown account
         reserves = [_reserve_secs(item.get("reserve_secs")) for item in jobs]
         self._seen(worker, encoder)
