@@ -427,16 +427,58 @@ def test_upload_permit_lease_lost_drops_job(conn, setup, monkeypatch):
         outcomes.append(outcome)
         return orig_report(job_id, worker, outcome, **data)
 
+    logs = []
+    pc.log = logs.append
     monkeypatch.setattr(pc.client, "upload_permit", lost)
     monkeypatch.setattr(pc.rclone, "upload", lambda *a, **k: uploads.append(a))
     monkeypatch.setattr(pc.client, "report", spy)
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
     t = run_in_thread(pc)
     try:
+        assert wait_for(lambda: any(m.startswith("lease lost asking for an upload permit,"
+                                                 " dropping") for m in logs))
         assert wait_for(lambda: not (pc.cfg.workdir / f"{vid}.out.mkv").exists()
                         and not (pc.cfg.workdir / f"{vid}.encoded").exists())
         time.sleep(1)
         assert not uploads and "failed" not in outcomes
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_upload_permit_server_error_pauses_without_failing(conn, setup, monkeypatch):
+    root, pc, store = setup
+    orig_permit = pc.client.upload_permit
+    orig_upload = pc.rclone.upload
+    asked, uploads, outcomes = [], [], []
+
+    def permit(job_id, worker, out_size):
+        asked.append(out_size)
+        if len(asked) == 1:
+            raise JobServiceError("boom", status=500)
+        return orig_permit(job_id, worker, out_size)
+
+    def upload(local, path, cancel=None):
+        assert len(asked) >= 2  # not before the second answer
+        uploads.append(path)
+        return orig_upload(local, path, cancel=cancel)
+
+    orig_report = pc.client.report
+
+    def spy(job_id, worker, outcome, **data):
+        outcomes.append(outcome)
+        return orig_report(job_id, worker, outcome, **data)
+
+    pc.cfg.idle_secs = 0.2
+    monkeypatch.setattr(pc.client, "upload_permit", permit)
+    monkeypatch.setattr(pc.rclone, "upload", upload)
+    monkeypatch.setattr(pc.client, "report", spy)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready", timeout=60)
+        assert len(asked) >= 2 and uploads
+        assert "failed" not in outcomes and "upload_paused" not in outcomes
     finally:
         pc.stop(now=True)
         t.join(15)
