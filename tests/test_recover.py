@@ -56,7 +56,7 @@ def test_swap_both_present(conn, setup):
 def test_swap_original_already_trashed(conn, setup):
     root, worker, row = setup
     (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
-    vid = row("e.mkv", "swapping", final_path="e.mkv", **SWAP_FIELDS)
+    vid = row("e.mkv", "swapping", final_path="e.mkv", original_trashed=1, **SWAP_FIELDS)
     worker.recover()
     assert (root / "e.mkv").read_bytes() == NEW
     assert db.get(conn, vid)["stage"] == "done"
@@ -224,10 +224,35 @@ def test_swap_transient_rclone_error_stays_swapping(conn, cfg, setup, monkeypatc
     assert (root / "e.vidshrink-tmp.mkv").read_bytes() == NEW
 
 
-def test_swap_original_different_ext_only_tmp_present(conn, setup):
+def test_swap_resumes_after_crash_once_original_is_trashed(conn, setup):
+    # A crash between trashing the original and moving the tmp leaves exactly this.
+    root, worker, row = setup
+    (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
+    vid = row("e.avi", "swapping", final_path="e.mkv", original_trashed=1, **SWAP_FIELDS)
+    worker.recover()
+    assert sorted(p.name for p in root.iterdir()) == ["e.mkv"]
+    assert (root / "e.mkv").read_bytes() == NEW
+    assert db.get(conn, vid)["stage"] == "done"
+
+
+def test_swap_without_flag_and_missing_original_keeps_tmp(conn, setup):
+    # Same layout from older code (flag NULL), or a user who deleted the original:
+    # nothing says this server trashed it, so the tmp is kept and not moved.
     root, worker, row = setup
     (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
     vid = row("e.avi", "swapping", final_path="e.mkv", **SWAP_FIELDS)
+    assert db.get(conn, vid)["original_trashed"] is None
+    worker.recover()
+    assert sorted(p.name for p in root.iterdir()) == ["e.vidshrink-tmp.mkv"]
+    assert (root / "e.vidshrink-tmp.mkv").read_bytes() == NEW
+    r = db.get(conn, vid)
+    assert r["stage"] == "swapping" and r["reason"].startswith("swap: needs attention:")
+
+
+def test_swap_original_different_ext_only_tmp_present(conn, setup):
+    root, worker, row = setup
+    (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
+    vid = row("e.avi", "swapping", final_path="e.mkv", original_trashed=1, **SWAP_FIELDS)
     worker.recover()
     assert sorted(p.name for p in root.iterdir()) == ["e.mkv"]
     assert (root / "e.mkv").read_bytes() == NEW

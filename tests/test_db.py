@@ -139,3 +139,21 @@ def test_connect_tolerates_a_concurrent_migration(cfg, monkeypatch):
 def test_connect_twice_is_idempotent(cfg):
     db.connect(cfg.db_path).close()
     db.connect(cfg.db_path).close()
+
+
+def test_migration_adds_original_trashed(tmp_path):
+    # A database from before the column existed: just the original videos table.
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE videos (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,"
+                " size INTEGER NOT NULL, modtime TEXT NOT NULL,"
+                " stage TEXT NOT NULL DEFAULT 'unprobed', score REAL, updated_at REAL NOT NULL)")
+    old.execute("INSERT INTO videos (path, size, modtime, stage, updated_at)"
+                " VALUES ('a.mkv', 1, 't', 'swapping', 0)")
+    old.commit()
+    old.close()
+    c = db.connect(path)
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(videos)")}
+    assert "original_trashed" in cols
+    assert db.get_by_path(c, "a.mkv")["original_trashed"] is None
+    c.close()

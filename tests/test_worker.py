@@ -250,6 +250,28 @@ def test_swap_refuses_when_original_changed(conn, env, change):
     assert r["stage"] != "done" and "original changed or duplicated" in r["reason"]
 
 
+@pytest.mark.parametrize("stale_flag", [False, True])
+def test_original_deleted_during_encode_is_not_replaced(conn, cfg, env, stale_flag):
+    # The user deleted the original on Drive while it was being encoded: the swap
+    # must not bring it back. A flag left over from an earlier swap of the same row
+    # doesn't count: it describes a different original.
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    worker.cfg.swap_retry_secs = 0
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    prepare(worker, row)
+    assert db.get(conn, row["id"])["stage"] == "ready"
+    if stale_flag:
+        db.mark(conn, row["id"], "ready", original_trashed=1)
+    (root / "Movies" / "b.mp4").unlink()
+    worker.run()
+    assert not (root / "Movies" / "b.mkv").exists()
+    assert (root / "Movies" / "b.vidshrink-tmp.mkv").exists()
+    r = db.get(conn, row["id"])
+    assert r["stage"] == "swapping" and r["reason"].startswith("swap: needs attention")
+    assert "not trashed by this server" in r["reason"]
+
+
 def test_prepare_requeues_file_changed_since_scan(conn, cfg, env):
     root, worker = env
     worker.cfg.workdir.mkdir(parents=True, exist_ok=True)

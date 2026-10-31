@@ -160,7 +160,8 @@ class Worker:
             return False
         if not row["final_path"]:
             db.mark(self.conn, vid, "remote_ready", final_path=final_path(row["path"]))
-        db.mark(self.conn, vid, "swapping")
+        # A flag from an earlier swap of this row describes a different original.
+        db.mark(self.conn, vid, "swapping", original_trashed=None)
         try:
             self._swap(db.get(self.conn, vid))
         except (SwapError, RcloneError) as e:
@@ -578,7 +579,8 @@ class Worker:
             self._cleanup(vid)
             db.mark(self.conn, vid, "dry_run", reason=f"uploaded as {tmp}")
             return True
-        db.mark(self.conn, vid, "swapping")
+        # A flag from an earlier swap of this row describes a different original.
+        db.mark(self.conn, vid, "swapping", original_trashed=None)
         try:
             self._swap(db.get(self.conn, vid))
         except (SwapError, RcloneError) as e:
@@ -609,7 +611,15 @@ class Worker:
                 if len(originals) != 1 or (originals[0]["Size"], originals[0]["ModTime"]) \
                         != (row["size"], row["modtime"]):
                     raise SwapError("original changed or duplicated; not deleting")
+                # Recorded before the delete, so a crash between the two still lets
+                # _reconcile_swaps finish the move on the next start.
+                db.mark(self.conn, row["id"], "swapping", original_trashed=1)
                 self._retry(lambda: self.rclone.delete(path))
+            elif not row["original_trashed"]:
+                # Gone without us trashing it: the user deleted it on Drive while it
+                # was being encoded. Moving the tmp in would bring it back.
+                raise SwapError("original missing but not trashed by this server; "
+                                "not replacing it")
             self._retry(lambda: self.rclone.move(tmp, final))
         elif not (self._one(final) and self.rclone.md5(final) == row["out_md5"]):
             raise SwapError(f"{tmp} missing and {final} does not match the encode")
