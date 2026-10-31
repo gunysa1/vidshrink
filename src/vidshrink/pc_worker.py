@@ -20,7 +20,7 @@ from vidshrink.config import Config
 from vidshrink.encode import (EncodeCancelled, EncodeError, build_command,
                               build_nvenc_command, run_encode_cancellable)
 from vidshrink.jobs import JobClient, JobServiceError, LeaseLost
-from vidshrink.local_queue import LocalJob, LocalQueue, read_uploaded
+from vidshrink.local_queue import _NUMBERED_PATTERNS, LocalJob, LocalQueue, read_uploaded
 from vidshrink.paths import md5_file, tmp_path
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
 from vidshrink import scorer
@@ -33,26 +33,6 @@ def _default_workdir() -> Path:
     return Path(base) / "vidshrink" / "work"
 
 
-# Only files whose NAME matches one of these are ever touched by clean_workdir --
-# never anything else, and never a subdirectory, even if workdir is a whole drive.
-# The first group of each numbered pattern is the job id, so a match can be kept
-# when it belongs to the job currently running.
-_NUMBERED_PATTERNS = tuple(re.compile(p) for p in (
-    r"^(\d+)\.src$",
-    r"^(\d+)\.out\.mkv$",
-    r"^(\d+)\.log$",
-    r"^(\d+)\.encoded$",
-    r"^(\d+)\.srcerrs$",
-    r"^(\d+)\.downloaded$",
-    r"^(\d+)\.uploaded$",
-    # The queued job's claim dict, plus its own write-then-rename tmp.
-    r"^(\d+)\.job\.json(?:\.tmp)?$",
-    # rclone's local backend, when it does write a partial file, names it
-    # "<name>.<random>.partial" (e.g. "65137.src.a1b2c3.partial").
-    r"^(\d+)\.(?:src|out\.mkv)\..*\.partial$",
-    # A marker's own write-then-rename tmp, if a crash lands mid-write.
-    r"^(\d+)\.(?:encoded|srcerrs|downloaded|uploaded)\.tmp$",
-))
 # calibrate's own leftovers: never present while the PC worker loop runs (the two
 # never run at once in one process), so always safe to sweep here.
 _CALIBRATE_PATTERNS = tuple(re.compile(p) for p in (r"^cal-.*$", r"^cal\.log$"))

@@ -1,4 +1,4 @@
-"""Leases encode jobs to remote workers (the PC). The server's DB stays the source of
+"""Leases encode jobs to remote workers (the PC and cloud VMs). The server's DB stays the source of
 truth; only the server verifies uploads and replaces originals."""
 import hmac
 import json
@@ -209,6 +209,7 @@ class JobStore:
             # the PC's result couldn't be uploaded today anyway.
             return {"job": None, "retry_after": self.uploads.seconds_until_reset()}
         busy = self._busy_final_paths()
+        over_budget = False
         for row in self._candidates(encoder):
             final = final_path(row["path"])
             if final in busy:
@@ -224,7 +225,8 @@ class JobStore:
                            reason=f"target {final} already exists")
                 continue
             if not downloads.allows(row["size"]):
-                return {"job": None, "retry_after": downloads.seconds_until_reset()}
+                over_budget = True
+                continue  # a smaller candidate may still fit today's budget
             with db.transaction(self.conn):
                 # Re-check right before claiming: another row may have taken this
                 # final_path/tmp_path stem since the busy set above was computed.
@@ -241,6 +243,8 @@ class JobStore:
                 continue
             self.log(f"leased to {worker}: {row['path']}")
             return {"job": self._job(row, final, encoder), "retry_after": 0.0}
+        if over_budget:  # only the budget stands in the way: wait for its reset
+            return {"job": None, "retry_after": downloads.seconds_until_reset()}
         return {"job": None, "retry_after": NO_WORK_RETRY_SECS}
 
     def heartbeat(self, job_id: int, worker: str, download_account: str = "main") -> dict:
@@ -381,7 +385,7 @@ class JobStore:
                 stage = "failed" if attempts >= self.cfg.max_attempts else "queued"
                 self._mark_leased_or_raise(job_id, worker, now, stage, {
                     "attempts": attempts,
-                    "reason": f"PC: {data.get('reason', '')}"[:500], **clear})
+                    "reason": f"{worker}: {data.get('reason', '')}"[:500], **clear})
             elif outcome == "not_worth_it":
                 self._mark_leased_or_raise(job_id, worker, now, "not_worth_it", {
                     "reason": str(data.get("reason", ""))[:500], **clear})

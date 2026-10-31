@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,27 @@ STATES = ("downloading", "downloaded", "encoding", "encoded", "verifying", "veri
           "uploading", "uploaded")
 # Encoded but not yet uploaded: what the upload backlog limit counts.
 UPLOAD_BACKLOG = ("encoded", "verifying", "verified", "uploading")
+
+# Only files whose NAME matches one of these are ever touched by clean_workdir --
+# never anything else, and never a subdirectory, even if workdir is a whole drive.
+# The first group of each numbered pattern is the job id, so a match can be kept
+# when it belongs to the job currently running.
+_NUMBERED_PATTERNS = tuple(re.compile(p) for p in (
+    r"^(\d+)\.src$",
+    r"^(\d+)\.out\.mkv$",
+    r"^(\d+)\.log$",
+    r"^(\d+)\.encoded$",
+    r"^(\d+)\.srcerrs$",
+    r"^(\d+)\.downloaded$",
+    r"^(\d+)\.uploaded$",
+    # The queued job's claim dict, plus its own write-then-rename tmp.
+    r"^(\d+)\.job\.json(?:\.tmp)?$",
+    # rclone's local backend, when it does write a partial file, names it
+    # "<name>.<random>.partial" (e.g. "65137.src.a1b2c3.partial").
+    r"^(\d+)\.(?:src|out\.mkv)\..*\.partial$",
+    # A marker's own write-then-rename tmp, if a crash lands mid-write.
+    r"^(\d+)\.(?:encoded|srcerrs|downloaded|uploaded)\.tmp$",
+))
 
 
 @dataclass
@@ -204,7 +226,6 @@ class LocalQueue:
 
     def forget(self, job_id: int) -> None:
         """Drop the job and delete every file of that id."""
-        from vidshrink.pc_worker import _NUMBERED_PATTERNS  # lazy: pc_worker imports us
         with self._lock:
             self._jobs.pop(job_id, None)
         try:

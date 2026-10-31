@@ -270,7 +270,7 @@ def _calibrate(args, pcfg, client) -> int:
     from vidshrink.pc_worker import pc_download_rclone
     from vidshrink.probe import Probe
     rc = pc_download_rclone(pcfg)
-    download_account = "pc" if pcfg.download_remote else "main"
+    download_account = pcfg.download_account or ("pc" if pcfg.download_remote else "main")
     pcfg.workdir.mkdir(parents=True, exist_ok=True)
     jobs, samples = [], []
     try:

@@ -243,7 +243,8 @@ def test_report_failed_twice_marks_failed(conn, store):
     assert (row["stage"], row["attempts"], row["worker"]) == ("queued", 1, None)
     store.claim("pc")
     store.report(vid, "pc", "failed", reason="boom")
-    assert db.get(conn, vid)["stage"] == "failed"
+    row = db.get(conn, vid)
+    assert row["stage"] == "failed" and row["reason"] == "pc: boom"
 
 
 def test_report_not_worth_it_changed_and_quota(conn, store):
@@ -900,3 +901,11 @@ def test_claim_rejects_unknown_encoder(conn, store, encoder):
 def test_resume_rejects_unknown_encoder(conn, store):
     with pytest.raises(ValueError, match="unknown encoder"):
         store.resume("pc", "x265", "main", [])
+
+
+def test_claim_skips_a_candidate_over_budget_for_a_smaller_one(conn, cfg, store):
+    add(conn, "big.mkv", size=5_000_000_000, score=3)
+    small = add(conn, "small.mkv", size=1_000_000_000, score=1)
+    store.downloads.add(cfg.daily_download_limit - 2_000_000_000)
+    r = store.claim("pc")
+    assert r["job"]["id"] == small

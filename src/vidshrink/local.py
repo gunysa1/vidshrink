@@ -17,13 +17,13 @@ from pathlib import Path
 
 from vidshrink.encode import EncodeCancelled, EncodeError
 from vidshrink.probe import Probe, ProbeError, parse_ffprobe, run_ffprobe
+from vidshrink.rclone import TMP_SUFFIX
 from vidshrink.scorer import EFFICIENT, INTERLACED, codec_family
 from vidshrink.verify import audio_errors, compare, decode_errors
 
 VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".mkv", ".avi", ".wmv", ".ts", ".m2ts", ".mts",
               ".webm", ".flv", ".mpg", ".mpeg", ".3gp"}
 ORIGINALS = "_vidshrink_originals"
-TMP_SUFFIX = ".vidshrink-tmp.mkv"
 LOG_NAME = "_vidshrink_local.log"
 
 # (src, out, probe, log_path, cancel) -> encode seconds, as in pc_worker

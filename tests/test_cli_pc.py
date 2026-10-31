@@ -132,3 +132,28 @@ def test_calibrate_holds_leases_until_all_samples_are_cut(tmp_path, monkeypatch,
     assert client.calls.index("measure") > max(
         i for i, c in enumerate(client.calls) if c[0] == "rel")
     assert not list((tmp_path / "w").iterdir())  # samples cleaned up
+
+
+def test_calibrate_uses_configured_download_account(tmp_path, monkeypatch):
+    import argparse
+    import vidshrink.calibrate as cal
+    import vidshrink.pc_worker as pcw
+    from vidshrink.cli import _calibrate
+    from vidshrink.pc_worker import PCConfig
+
+    accounts = []
+
+    class Client:
+        def claim(self, worker, encoder, download_account="main"):
+            accounts.append(download_account)
+            return {"job": None}
+
+    monkeypatch.setattr(pcw, "pc_download_rclone", lambda pcfg: None)
+    monkeypatch.setattr(cal, "measure", lambda samples, *a, **k: [])
+    monkeypatch.setattr(cal, "format_table", lambda rows: "table")
+    monkeypatch.setattr(cal, "pick_cq", lambda rows: 23)
+    pcfg = PCConfig(server="http://x", token="t", workdir=tmp_path / "w", worker_name="pc",
+                    download_remote="gdrive-pc:", download_account="cloud")
+    args = argparse.Namespace(samples=1, cqs="22", config=None)
+    _calibrate(args, pcfg, Client())
+    assert accounts and set(accounts) == {"cloud"}
