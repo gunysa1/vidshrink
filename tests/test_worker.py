@@ -439,13 +439,22 @@ def test_transient_error_before_download_keeps_the_row_queued(conn, env, monkeyp
 
 
 def test_persistent_error_before_download_leaves_the_row_queued(conn, env, monkeypatch):
+    # No attempt is burned, but the failures still trip the consecutive-failure breaker.
     _, worker = env
+    db.mark(conn, db.get_by_path(conn, "Movies/a.mkv")["id"], "failed")  # only b.mp4 is left
     monkeypatch.setattr(worker.rclone, "exists",
                         lambda path: (_ for _ in ()).throw(RcloneError(1, "boom")))
+    logs, slept = [], []
+    worker.log = logs.append
+    worker.sleep = slept.append
+    worker.cfg.retry_base_delay = 0.5  # the retries' jittered sleeps never equal it exactly
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    assert worker.run() == 0
     row = db.get_by_path(conn, "Movies/b.mp4")
-    assert worker.start_download(row) is False
-    row = db.get(conn, row["id"])
-    assert row["stage"] == "queued" and row["attempts"] == 0 and worker.failures == 0
+    assert row["stage"] == "queued" and row["attempts"] == 0
+    assert worker.failures == worker.cfg.max_consecutive_failures
+    assert any("!!! STOPPING" in line for line in logs)
+    assert worker.cfg.retry_base_delay in slept
 
 
 def test_download_budget_exhausted_waits_without_downloading(conn, env):

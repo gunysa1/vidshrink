@@ -429,8 +429,10 @@ class Worker:
             return False
         except (RcloneError, OSError) as e:
             if isinstance(e, RcloneError) and not e.download_quota:
-                # Nothing was downloaded yet: not this file's fault, so keep it
-                # queued without burning an attempt.
+                # Nothing was downloaded yet: not this file's fault, so keep it queued
+                # without burning an attempt. It still counts toward the consecutive-
+                # failure breaker, or a persistent error would stall the loop forever.
+                self.failures += 1
                 self.log(f"could not check Drive before downloading {path}, will retry: {e}")
                 self.sleep(self.cfg.retry_base_delay)
                 return False
