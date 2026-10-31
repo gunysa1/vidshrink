@@ -399,7 +399,7 @@ class Worker:
         vid, path = row["id"], row["path"]
         final = final_path(path)
         try:
-            if final != path and self.rclone.exists(final):
+            if final != path and self._retry(lambda: self.rclone.exists(final)):
                 db.mark_if(self.conn, vid, ("queued",), "failed",
                           reason=f"target {final} already exists")
                 return False
@@ -428,6 +428,12 @@ class Worker:
             self.log(f"failed: {path}: {e}")
             return False
         except (RcloneError, OSError) as e:
+            if isinstance(e, RcloneError) and not e.download_quota:
+                # Nothing was downloaded yet: not this file's fault, so keep it
+                # queued without burning an attempt.
+                self.log(f"could not check Drive before downloading {path}, will retry: {e}")
+                self.sleep(self.cfg.retry_base_delay)
+                return False
             self._on_error(row, e)
             return False
         if not started:

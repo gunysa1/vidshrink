@@ -417,6 +417,37 @@ def test_failed_download_is_still_charged(conn, env, monkeypatch):
     assert worker.download_budget.used() == row["size"]
 
 
+def test_transient_error_before_download_keeps_the_row_queued(conn, env, monkeypatch):
+    # rclone.exists raises twice, then works: the row is downloaded with no attempt
+    # burned and no failure counted.
+    _, worker = env
+    real, calls = worker.rclone.exists, []
+
+    def flaky(path):
+        calls.append(path)
+        if len(calls) <= 2:
+            raise RcloneError(1, "boom")
+        return real(path)
+
+    monkeypatch.setattr(worker.rclone, "exists", flaky)
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    row = db.get_by_path(conn, "Movies/b.mp4")  # final_path differs: exists() is called
+    prepare(worker, row)
+    assert len(calls) == 3
+    row = db.get(conn, row["id"])
+    assert row["stage"] == "ready" and row["attempts"] == 0 and worker.failures == 0
+
+
+def test_persistent_error_before_download_leaves_the_row_queued(conn, env, monkeypatch):
+    _, worker = env
+    monkeypatch.setattr(worker.rclone, "exists",
+                        lambda path: (_ for _ in ()).throw(RcloneError(1, "boom")))
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    assert worker.start_download(row) is False
+    row = db.get(conn, row["id"])
+    assert row["stage"] == "queued" and row["attempts"] == 0 and worker.failures == 0
+
+
 def test_download_budget_exhausted_waits_without_downloading(conn, env):
     _, worker = env
     worker.download_budget.add(worker.cfg.daily_download_limit)
