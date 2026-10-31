@@ -38,14 +38,16 @@ side exits: skipped, not_worth_it, failed, probe_failed, gone
   - A finished encode (`ready`) is kept and uploaded.
   - An encode interrupted mid-way goes back to `downloaded` and counts as an
     interruption. It starts again from the beginning of the file.
-- **One server worker per database.** `vidshrink run` holds a lock on `<db_path>.lock`
-  (`state.lock`), whatever `--workdir`. A second one exits.
+- **One server worker per database.** `vidshrink run` holds a lock on the database
+  path with its suffix changed to `.lock` (`state.db` -> `state.lock`), whatever
+  `--workdir`. A second one exits.
 - **Swap.** The server sets `original_trashed` on the row right before it trashes the
   original. If the original is later missing, the tmp file replaces it only when the
   flag is set. Otherwise the tmp is kept and the row shows "swap: needs attention".
   If a swap fails while the original is still there, the server removes the tmp,
-  unless this server had already trashed the original (`original_trashed`): then the
-  tmp is kept, because the encode may be the only copy.
+  unless this server had already trashed the original (`original_trashed` 1) or the
+  row predates the flag (NULL, written by older code): then the tmp is kept, because
+  the encode may be the only copy. A fresh swap starts the flag at 0.
 - **Attempts.** A file that fails twice (`max_attempts`) is parked as `failed`. Every
   "changed since scan" adds an attempt. A real change in the listing resets them. The
   second one in a row with the same listing parks the row as `failed`.
@@ -131,8 +133,9 @@ size ratios. Its CPU is different, so it learns its own speeds.
 - Drive's daily upload cap (`uploadLimitExceeded`) blocks uploads for everyone for 6 h.
   A short-term throttle (`userRateLimitExceeded`) is retried with backoff and blocks
   nothing.
-- The server skips a candidate that is too big for what is left of today's download
-  budget and takes a smaller one.
+- A remote claim skips a candidate that is too big for what is left of today's
+  download budget and takes a smaller one. The server's own download loop does not
+  skip: it waits for the budget to reset.
 
 ## Job service API
 

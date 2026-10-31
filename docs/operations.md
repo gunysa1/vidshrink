@@ -130,7 +130,7 @@ Drive has two different upload errors, and they are handled differently:
 | Drive error | Meaning | What happens |
 |---|---|---|
 | `uploadLimitExceeded` ("Received upload limit error") | the daily upload cap | the worker reports `upload_paused` and keeps its file; uploads are blocked for everyone for 6 h |
-| `userRateLimitExceeded`, `rateLimitExceeded` ("User rate limit exceeded") | a short-term throttle | retried up to five times with backoff and never blocks uploads; if it keeps failing, the attempt counts like any other failure (only a throttle during a worker's download releases the job with no attempt). The md5 check after an upload is retried too. |
+| `userRateLimitExceeded`, `rateLimitExceeded` ("User rate limit exceeded") | a short-term throttle | retried up to five times with backoff and never blocks uploads; if it keeps failing on the server, the attempt counts like any other failure. A remote worker uses no attempt: on a download it releases the job, on an upload it keeps the file and its lease and tries again after its idle wait. The md5 check after an upload is retried too. |
 
 A remote worker asks the server for a permit before every upload. When the day's
 700 GB is used up, its upload waits for a permit (`vidshrink status` shows the
@@ -176,7 +176,9 @@ already trashed shows this once. Look at each one a single time.
 When a swap fails with the original still present, or the final upload attempt
 fails and the row is parked as `failed`, the server removes the tmp file on Drive.
 The exception is a swap where this server had already trashed the original
-(`original_trashed`): the tmp is kept, because the encode may be the only copy.
+(`original_trashed`), or a row an older version left in `swapping` (which may have
+trashed it without recording so): the tmp is kept, because the encode may be the
+only copy.
 
 A dry run (`run --dry-run`) leaves other workers' leases and tmp files alone. It
 still cleans up its own interrupted uploads.
@@ -195,8 +197,9 @@ still cleans up its own interrupted uploads.
 Plex reads the same main account, so its daily download quota is shared:
 
 - The server caps its own downloads at 500 GB per Pacific day. A download counts
-  when it starts, so a failed or interrupted one still counts. A job too big for what
-  is left of the day is skipped for a smaller one.
+  when it starts, so a failed or interrupted one still counts. When its next job is
+  too big for what is left of the day, the server waits for the reset. A remote
+  claim skips a job too big for its account's budget and takes a smaller one.
 - The PC and the cloud workers download through their own accounts. Those have no
   daily cap, and usage is still recorded.
 - A `downloadQuotaExceeded` error pauses that account's downloads for 12 h.
