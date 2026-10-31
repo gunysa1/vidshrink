@@ -909,3 +909,13 @@ def test_claim_skips_a_candidate_over_budget_for_a_smaller_one(conn, cfg, store)
     store.downloads.add(cfg.daily_download_limit - 2_000_000_000)
     r = store.claim("pc")
     assert r["job"]["id"] == small
+
+
+def test_claim_budget_skip_costs_no_drive_call(conn, cfg, store):
+    add(conn, "big.avi", size=5_000_000_000, score=3)
+    small = add(conn, "small.mkv", size=1_000_000_000, score=1)
+    store.downloads.add(cfg.daily_download_limit - 2_000_000_000)
+    calls = []
+    store.rclone.exists = lambda p: calls.append(p) or False
+    assert store.claim("pc")["job"]["id"] == small
+    assert calls == []  # big.avi was skipped before asking Drive about big.mkv

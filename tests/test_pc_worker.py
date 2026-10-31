@@ -377,11 +377,53 @@ def test_throttled_upload_retries_instead_of_pausing(conn, setup, monkeypatch):
         t.join(15)
 
 
+def test_throttled_upload_that_keeps_failing_keeps_the_encode(conn, setup, monkeypatch):
+    # The per-user rate limit outlasting _retry on an upload is not a reason to
+    # throw the finished encode away: keep it and the lease, retry later.
+    root, pc, store = setup
+    uploads, outcomes, released, logs = [], [], [], []
+
+    def throttled(local, path, cancel=None):
+        uploads.append(path)
+        raise RcloneError(1, "googleapi: Error 403: User rate limit exceeded.,"
+                          " userRateLimitExceeded")
+
+    orig_report = pc.client.report
+
+    def spy(job_id, worker, outcome, **data):
+        outcomes.append(outcome)
+        return orig_report(job_id, worker, outcome, **data)
+
+    pc.log = logs.append
+    orig_release = pc.client.release
+    monkeypatch.setattr(pc.rclone, "upload", throttled)
+    monkeypatch.setattr(pc.client, "report", spy)
+    monkeypatch.setattr(pc.client, "release", lambda job_id, worker: (
+        released.append(job_id), orig_release(job_id, worker))[1])
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    t = run_in_thread(pc)
+    try:
+        # Twice: the second pass proves the job came back for another upload.
+        assert wait_for(lambda: sum(m.startswith("throttled during upload; keeping")
+                                    for m in logs) >= 2)
+        row = db.get(conn, vid)
+        assert (row["stage"], row["worker"]) == ("leased", "pc")
+        assert (pc.cfg.workdir / f"{vid}.out.mkv").exists()
+        assert (pc.cfg.workdir / f"{vid}.encoded").exists()
+        assert released == []
+        assert "failed" not in outcomes and "upload_paused" not in outcomes
+        assert not store.uploads.blocked()
+        assert len(uploads) >= 2
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
 def test_upload_waits_when_permit_refused(conn, setup, monkeypatch):
     root, pc, store = setup
     orig_permit = pc.client.upload_permit
     orig_upload = pc.rclone.upload
-    asked, uploads, outcomes = [], [], []
+    asked, uploads, outcomes, released, claims, logs = [], [], [], [], [], []
 
     def permit(job_id, worker, out_size):
         asked.append(out_size)
@@ -390,8 +432,9 @@ def test_upload_waits_when_permit_refused(conn, setup, monkeypatch):
         return orig_permit(job_id, worker, out_size)
 
     def upload(local, path, cancel=None):
-        assert len(asked) >= 2  # not before the second answer
-        uploads.append(path)
+        # Recorded, not asserted here: an assert in the worker thread would only
+        # become a poison-job release and a second, permitted, pass.
+        uploads.append(len(asked))
         return orig_upload(local, path, cancel=cancel)
 
     orig_report = pc.client.report
@@ -400,14 +443,28 @@ def test_upload_waits_when_permit_refused(conn, setup, monkeypatch):
         outcomes.append(outcome)
         return orig_report(job_id, worker, outcome, **data)
 
+    orig_release, orig_claim = pc.client.release, pc.client.claim
+
+    def claim(*a, **k):
+        resp = orig_claim(*a, **k)
+        if resp.get("job"):
+            claims.append(resp["job"]["id"])
+        return resp
+
+    pc.log = logs.append
     monkeypatch.setattr(pc.client, "upload_permit", permit)
     monkeypatch.setattr(pc.rclone, "upload", upload)
     monkeypatch.setattr(pc.client, "report", spy)
+    monkeypatch.setattr(pc.client, "release", lambda job_id, worker: (
+        released.append(job_id), orig_release(job_id, worker))[1])
+    monkeypatch.setattr(pc.client, "claim", claim)
     vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
     t = run_in_thread(pc)
     try:
         assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready", timeout=60)
-        assert len(asked) >= 2 and uploads
+        assert any(m.startswith("upload not permitted now") for m in logs)
+        assert uploads == [2]  # one upload, after the second answer
+        assert released == [] and claims == [vid]
         assert "upload_paused" not in outcomes and "uploaded" in outcomes
     finally:
         pc.stop(now=True)

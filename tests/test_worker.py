@@ -339,6 +339,7 @@ def test_original_deleted_during_encode_is_not_replaced(conn, cfg, env, stale_fl
     r = db.get(conn, row["id"])
     assert r["stage"] == "swapping" and r["reason"].startswith("swap: needs attention")
     assert "not trashed by this server" in r["reason"]
+    assert r["original_trashed"] == 0  # a fresh swap knows it trashed nothing yet
 
 
 def test_prepare_requeues_file_changed_since_scan(conn, cfg, env):

@@ -1165,6 +1165,18 @@ class PCWorker:
                     f"for the remote, then Start again): {e}",
                     alert=f"Drive login failed for {remote}; re-authorize that rclone "
                           f"remote, then restart the worker: {e}") from e
+            if e.throttled and uploading:
+                # Google's per-user rate limit outlasted _retry on the upload or
+                # its md5 check: the encode is finished, so keep it and the lease
+                # and try again after the idle wait (as a refused permit does).
+                # Nothing to report: the server's budget is not involved.
+                self._delete_tmp_if_ours(job, tmp, md5, self._verified_size(lj.id))
+                self.log(f"throttled during upload; keeping {job['path']}, "
+                         f"retrying uploads in {self.cfg.idle_secs:.0f} s")
+                self._uploads_paused_until = time.monotonic() + self.cfg.idle_secs
+                if self._set_state(lj, "verified"):
+                    self._push(self._to_upload, lj, front=True)
+                return
             if e.throttled:
                 # Surprising on a download (the limit is normally hit on upload),
                 # but still not this video's fault: release and back off like any

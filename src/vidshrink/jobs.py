@@ -220,13 +220,13 @@ class JobStore:
             if max_hours is not None and scorer.expected_hours(
                     self.conn, Probe.from_json(row["probe_json"]), encoder) > max_hours:
                 continue  # would take the worker too long
+            if not downloads.allows(row["size"]):
+                over_budget = True
+                continue  # a smaller candidate may still fit today's budget
             if final != row["path"] and self.rclone.exists(final):
                 db.mark_if(self.conn, row["id"], ("queued",), "failed",
                            reason=f"target {final} already exists")
                 continue
-            if not downloads.allows(row["size"]):
-                over_budget = True
-                continue  # a smaller candidate may still fit today's budget
             with db.transaction(self.conn):
                 # Re-check right before claiming: another row may have taken this
                 # final_path/tmp_path stem since the busy set above was computed.

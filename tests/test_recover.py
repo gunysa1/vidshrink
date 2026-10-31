@@ -249,6 +249,22 @@ def test_swap_without_flag_and_missing_original_keeps_tmp(conn, setup):
     assert r["stage"] == "swapping" and r["reason"].startswith("swap: needs attention:")
 
 
+def test_swap_without_flag_and_changed_original_keeps_tmp(conn, setup):
+    # Older code (flag NULL) may have trashed the original before it stopped, and
+    # someone has since put another file at the path: nothing says the original is
+    # still there, so the tmp may be the only copy of the encode. Keep it.
+    root, worker, row = setup
+    (root / "e.avi").write_bytes(b"old")
+    vid = row("e.avi", "swapping", final_path="e.mkv", **SWAP_FIELDS)
+    (root / "e.avi").write_bytes(b"someone else's, longer file")
+    (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)
+    assert db.get(conn, vid)["original_trashed"] is None
+    worker.recover()
+    r = db.get(conn, vid)
+    assert r["stage"] == "failed" and "original changed or duplicated" in r["reason"]
+    assert (root / "e.vidshrink-tmp.mkv").read_bytes() == NEW
+
+
 def test_swap_original_different_ext_only_tmp_present(conn, setup):
     root, worker, row = setup
     (root / "e.vidshrink-tmp.mkv").write_bytes(NEW)

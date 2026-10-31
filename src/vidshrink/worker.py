@@ -161,7 +161,8 @@ class Worker:
         if not row["final_path"]:
             db.mark(self.conn, vid, "remote_ready", final_path=final_path(row["path"]))
         # A flag from an earlier swap of this row describes a different original.
-        db.mark(self.conn, vid, "swapping", original_trashed=None)
+        # 0, not NULL: NULL is a row older code left, which may have trashed it.
+        db.mark(self.conn, vid, "swapping", original_trashed=0)
         try:
             self._swap(db.get(self.conn, vid))
         except (SwapError, RcloneError) as e:
@@ -592,7 +593,8 @@ class Worker:
             db.mark(self.conn, vid, "dry_run", reason=f"uploaded as {tmp}")
             return True
         # A flag from an earlier swap of this row describes a different original.
-        db.mark(self.conn, vid, "swapping", original_trashed=None)
+        # 0, not NULL: NULL is a row older code left, which may have trashed it.
+        db.mark(self.conn, vid, "swapping", original_trashed=0)
         try:
             self._swap(db.get(self.conn, vid))
         except (SwapError, RcloneError) as e:
@@ -634,7 +636,9 @@ class Worker:
                         != (row["size"], row["modtime"]):
                     raise SwapError("original changed or duplicated; not deleting")
                 # Recorded before the delete, so a crash between the two still lets
-                # _reconcile_swaps finish the move on the next start.
+                # _reconcile_swaps finish the move on the next start. It means "about
+                # to trash": should the delete keep failing and the user then delete
+                # the file, the move would bring it back as its encode (nothing lost).
                 db.mark(self.conn, row["id"], "swapping", original_trashed=1)
                 self._retry(lambda: self.rclone.delete(path))
             elif not row["original_trashed"]:
@@ -722,11 +726,14 @@ class Worker:
         if original_present:
             db.mark(self.conn, row["id"], "failed", reason=f"swap: {e}"[:500])
             self._cleanup(row["id"])
-            if row["original_trashed"]:
-                # This server trashed the original it encoded; what sits at the path now
-                # is someone else's file, and the tmp may be the only copy of the encode.
+            if row["original_trashed"] != 0:
+                # 1: this server trashed the original it encoded; what sits at the path
+                # now is someone else's file, and the tmp may be the only copy of the
+                # encode. NULL: a row older code left, which may have done the same.
+                why = ("was trashed by this server" if row["original_trashed"]
+                       else "may have been trashed (row from older code)")
                 self.log(f"SWAP FAILED, keeping {tmp_path(row['path'])} on Drive: the "
-                         f"original was trashed by this server: {row['path']}: {e}")
+                         f"original {why}: {row['path']}: {e}")
                 return
             self._remove_tmp(tmp_path(row["path"]))
             self.log(f"SWAP FAILED, original kept: {row['path']}: {e}")
