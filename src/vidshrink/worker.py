@@ -565,6 +565,8 @@ class Worker:
                 self.log("Drive upload limit hit; blocking uploads")
                 return False
             self._fail(row, f"upload: {e}", retry_stage="ready")
+            if db.get(self.conn, vid)["stage"] == "failed":
+                self._remove_tmp(tmp)  # parked for good: nothing will overwrite it
             return False
         self.budget.add(row["out_size"])
         if remote_md5 != row["out_md5"]:
@@ -588,6 +590,15 @@ class Worker:
             self.log(f"SWAP FAILED, will retry: {path}: {e}")
             return False
         return True
+
+    def _remove_tmp(self, tmp: str) -> None:
+        """Delete a leftover tmp from Drive (the scan hides them, so they'd pile up
+        unseen). Only for a row whose original is present or that is parked."""
+        try:
+            if self.rclone.exists(tmp):
+                self._retry(lambda: self.rclone.delete(tmp))
+        except RcloneError as e:
+            self.log(f"could not remove {tmp}: {e}")
 
     def _one(self, path: str) -> dict | None:
         found = self.rclone.entries(path)
@@ -700,6 +711,7 @@ class Worker:
         if original_present:
             db.mark(self.conn, row["id"], "failed", reason=f"swap: {e}"[:500])
             self._cleanup(row["id"])
+            self._remove_tmp(tmp_path(row["path"]))
             self.log(f"SWAP FAILED, original kept: {row['path']}: {e}")
             return
         # The original is already in Drive's trash; the encode may be the only copy.

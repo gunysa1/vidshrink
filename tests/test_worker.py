@@ -250,6 +250,43 @@ def test_swap_refuses_when_original_changed(conn, env, change):
     assert r["stage"] != "done" and "original changed or duplicated" in r["reason"]
 
 
+def test_swap_failure_with_original_present_removes_tmp(conn, env):
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    prepare(worker, db.get_by_path(conn, "Movies/b.mp4"))
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    orig = root / "Movies" / "b.mp4"
+    st = orig.stat()
+    os.utime(orig, (st.st_atime, st.st_mtime - 3600))
+    assert upload_and_swap(worker, row) is False
+    assert (root / "Movies" / "b.vidshrink-tmp.mkv").exists()
+    assert worker._reconcile_swaps() == 0
+    r = db.get(conn, row["id"])
+    assert r["stage"] == "failed" and "original changed or duplicated" in r["reason"]
+    assert sorted(p.name for p in (root / "Movies").iterdir()) == ["a.mkv", "b.mp4"]
+
+
+def test_final_upload_failure_removes_tmp(conn, env, monkeypatch):
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    worker.cfg.retry_attempts = 1
+    prepare(worker, db.get_by_path(conn, "Movies/b.mp4"))
+    row = db.get_by_path(conn, "Movies/b.mp4")
+    real_upload = worker.rclone.upload
+
+    def broken(local, path, **kw):
+        real_upload(local, path, **kw)  # the tmp lands on the remote, then it fails
+        raise RcloneError(1, "boom")
+
+    monkeypatch.setattr(worker.rclone, "upload", broken)
+    assert upload_and_swap(worker, row) is False
+    assert db.get(conn, row["id"])["stage"] == "ready"
+    assert (root / "Movies" / "b.vidshrink-tmp.mkv").exists()  # next upload overwrites it
+    assert upload_and_swap(worker, db.get(conn, row["id"])) is False
+    assert db.get(conn, row["id"])["stage"] == "failed"
+    assert sorted(p.name for p in (root / "Movies").iterdir()) == ["a.mkv", "b.mp4"]
+
+
 @pytest.mark.parametrize("stale_flag", [False, True])
 def test_original_deleted_during_encode_is_not_replaced(conn, cfg, env, stale_flag):
     # The user deleted the original on Drive while it was being encoded: the swap
