@@ -148,3 +148,19 @@ def test_status_shows_no_cap(conn, cfg):
     out = status_report(conn, cfg, budget)
     assert "PC account downloaded today: 168 GB (no cap)" in out
     assert "Cloud account downloaded today: 34 GB (no cap)" in out
+
+
+def test_rclone_args_kept_for_any_remote_name(cfg, monkeypatch, tmp_path):
+    import vidshrink.cli as cli
+    seen = {}
+
+    class SpyRclone:
+        def __init__(self, remote, args=()):
+            seen["remote"], seen["args"] = remote, args
+
+    monkeypatch.setattr(cli, "Rclone", SpyRclone)
+    monkeypatch.setenv("VIDSHRINK_TOKEN_PATH", str(tmp_path / "token"))
+    assert main(["--remote", "other:", "--db", str(cfg.db_path),
+                 "--workdir", str(cfg.workdir), "token"]) == 0
+    assert seen["remote"] == "other:"
+    assert "--drive-use-trash=true" in seen["args"]

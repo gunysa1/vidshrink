@@ -156,8 +156,6 @@ def main(argv: list[str] | None = None) -> int:
         cfg = replace(cfg, min_size=int(os.environ["VIDSHRINK_MIN_SIZE"]))
     if "VIDSHRINK_TOKEN_PATH" in os.environ:
         cfg = replace(cfg, token_path=Path(os.environ["VIDSHRINK_TOKEN_PATH"]))
-    if not cfg.remote.startswith("gdrive:"):
-        cfg = replace(cfg, rclone_args=())  # drive-only flags are noise elsewhere
 
     conn = db.connect(cfg.db_path)
     rclone = Rclone(cfg.remote, cfg.rclone_args)
