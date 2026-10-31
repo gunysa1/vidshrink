@@ -18,6 +18,9 @@ journalctl --user -u vidshrink -n 50 --no-pager -o cat
 
 ## Restarting the server worker
 
+Only one `vidshrink run` can run per database. A second one stops at once, whatever
+`--workdir` it is given. The lock is `state.lock` next to `state.db`.
+
 An encode that's running when `vidshrink.service` stops is thrown away; the
 first interruption costs no attempt. It goes back to `downloaded` and starts again
 from the beginning. A finished download or encode is kept. Restart between jobs
@@ -82,7 +85,7 @@ or do it between jobs:
 
 ```bash
 sqlite3 ~/vidshrink/state.db \
-  "update videos set stage='queued', attempts=0, reason=NULL where id=<ID>"
+  "update videos set stage='queued', attempts=0, reason=NULL where id=<ID> and stage='failed'"
 ```
 
 If the source changed or its probe looks wrong, set `stage='unprobed'` instead, and
@@ -92,13 +95,20 @@ Common reasons:
 
 - `rclone exit 3` (directory not found): the file was moved or renamed on Drive,
   for example by Sonarr or Radarr. `vidshrink scan` adds it under its new path, but
-  scan never touches `failed` rows, so retire the old row by hand once
-  `rclone lsf` confirms the old path is gone:
+  scan re-probes a `failed` row only when its size or modtime changed on Drive, so
+  retire the old row by hand once `rclone lsf` confirms the old path is gone:
   `update videos set stage='gone' where id=<ID> and stage='failed'`.
 - `duration X -> Y` with Y well short of X: usually a bad source whose video ends
   before its stated length. Replace the file on Drive.
 - `decode errors` naming the source's own faults: a damaged source. Replace it, or
   leave it failed.
+- `size on Drive differs from the download again`: Drive's size changed between the
+  scan and the download twice in a row with the same listing, so the row is parked
+  instead of downloading forever. Check the file on Drive. A real change on Drive
+  (new size or modtime) resets attempts by itself.
+- `upload shows no saving: ...`: a worker reported an upload that isn't at least 20%
+  smaller. The server parked the row and removed the tmp file on Drive. The same
+  happens to a row whose last upload attempt failed.
 - `[null @ ...] non monotonically increasing dts` from a build before 2026-10-30:
   the decode check itself rounded timestamps when the video starts between frame
   ticks, not a fault in the output. Update the worker and requeue.
@@ -111,6 +121,20 @@ Common reasons:
 | `Local fault, worker stopped: …` | Fix the cause (disk space, permissions, a missing ffmpeg), then restart the worker. |
 
 An alert clears on that worker's next successful claim.
+
+`status` names the worker in a failure: `<worker>: <reason>`, not always `PC`.
+
+Drive has two different upload errors, and they are handled differently:
+
+| Drive error | Meaning | What happens |
+|---|---|---|
+| `uploadLimitExceeded` ("Received upload limit error") | the daily upload cap | the worker reports `upload_paused` and keeps its file; uploads are blocked for everyone for 6 h |
+| `userRateLimitExceeded`, `rateLimitExceeded` ("User rate limit exceeded") | a short-term throttle | retried with backoff; no block, no attempt used. The md5 check after an upload is retried too. |
+
+A remote worker asks the server for a permit before every upload. When the day's
+700 GB is used up, its upload waits for a permit (`vidshrink status` shows the
+budget). The worker keeps the file and its lease and asks again after the wait the
+server names. Nothing is lost.
 
 What the rclone error behind a failed Drive login means:
 
@@ -133,6 +157,25 @@ What the rclone error behind a failed Drive login means:
 - **Stopping the GCP VM on purpose:** pause `vm-autostart` first, or it starts the VM
   again.
 
+## Swap needs attention
+
+A row that shows "swap: needs attention" has a finished upload, but its original is
+gone from Drive and this server didn't record trashing it. The server records
+`original_trashed` just before it trashes the original, and moves the tmp file into
+place when the original is missing only if that flag is set. Otherwise the tmp stays
+on Drive, because moving it in could bring back a file you deleted on purpose.
+Check the folder on Drive. If you deleted the original, delete the tmp too. If the
+encode is what you want, rename the tmp into place by hand.
+
+After upgrading, a row that an older version left in `swapping` with the original
+already trashed shows this once. Look at each one a single time.
+
+When a swap fails with the original still present, or the final upload attempt
+fails and the row is parked as `failed`, the server removes the tmp file on Drive.
+
+A dry run (`run --dry-run`) leaves other workers' leases and tmp files alone. It
+still cleans up its own interrupted uploads.
+
 ## ffmpeg
 
 - The server uses BtbN n9.0.2 from `~/.local/opt/ffmpeg-9.0.2-linux64-gpl`,
@@ -146,7 +189,9 @@ What the rclone error behind a failed Drive login means:
 
 Plex reads the same main account, so its daily download quota is shared:
 
-- The server caps its own downloads at 500 GB per Pacific day.
+- The server caps its own downloads at 500 GB per Pacific day. A download counts
+  when it starts, so a failed or interrupted one still counts. A job too big for what
+  is left of the day is skipped for a smaller one.
 - The PC and the cloud workers download through their own accounts. Those have no
   daily cap, and usage is still recorded.
 - A `downloadQuotaExceeded` error pauses that account's downloads for 12 h.

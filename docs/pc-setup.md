@@ -38,6 +38,11 @@ The unit file is `deploy/vidshrink-serve.service`; copy it to
 came up with `systemctl --user status vidshrink-serve` and `journalctl --user -u
 vidshrink-serve -f`.
 
+`vidshrink serve --host <address>` binds the service to one interface. The unit
+file's default is `0.0.0.0` (all of them). Prefer the server's LAN IP: add
+`--host <LAN IP>` to `ExecStart` in the unit file, then `systemctl --user
+daemon-reload` and restart it.
+
 The service listens on port 8765. **Keep it LAN-only** — it binds `0.0.0.0` so
 every device on the LAN can reach it, but do not port-forward 8765 (or anything
 else needed to reach it) from your router. It is not designed to be exposed to

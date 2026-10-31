@@ -11,7 +11,7 @@
 | `transfer.py` | The server worker's background download and upload threads. |
 | `encode.py` | ffmpeg command lines for x265 (server and cloud) and NVENC (PC), and the stream mapping (FLAC for PCM, SRT for mov_text/eia_608). |
 | `verify.py` | Output checks: codec, duration (within 1 s, or 0.05% on long files), streams (audio before subtitles, as written; an undetermined language may gain a tag), full decode with no errors beyond the source's own copied-audio errors, minimum saving. |
-| `jobs.py` | The job service (`JobStore`, HTTP server, `JobClient`): leases, heartbeats, reports, budgets, alerts. |
+| `jobs.py` | The job service (`JobStore`, HTTP server, `JobClient`): leases, heartbeats, upload permits, reports, budgets, alerts. |
 | `pc_worker.py` | The remote worker used by both the PC (NVENC) and the cloud VM (x265): download, encode, verify and upload stage threads and a batch heartbeat. |
 | `local_queue.py` | The remote worker's local job queue and its marker files on disk. |
 | `tray.py` | Windows tray app around `pc_worker`. |
@@ -38,7 +38,19 @@ side exits: skipped, not_worth_it, failed, probe_failed, gone
   - A finished encode (`ready`) is kept and uploaded.
   - An encode interrupted mid-way goes back to `downloaded` and counts as an
     interruption. It starts again from the beginning of the file.
-- **Attempts.** A file that fails twice (`max_attempts`) is parked as `failed`.
+- **One server worker per database.** `vidshrink run` holds a lock on `<db_path>.lock`
+  (`state.lock`), whatever `--workdir`. A second one exits.
+- **Swap.** The server sets `original_trashed` on the row right before it trashes the
+  original. If the original is later missing, the tmp file replaces it only when the
+  flag is set. Otherwise the tmp is kept and the row shows "swap: needs attention".
+  If a swap fails while the original is still there, the server removes the tmp.
+- **Attempts.** A file that fails twice (`max_attempts`) is parked as `failed`. If a
+  scanned file differs from its download ("changed since scan") twice in a row with
+  the same listing, the second time costs an attempt and the row is parked as
+  `failed`. A real change on Drive resets attempts.
+- **Drive errors before a download.** Checking the target is retried. If it keeps
+  failing the row stays `queued` with no attempt used, but it counts toward the
+  server's "5 failures in a row" stop.
 
 ## Pipelining
 
@@ -108,14 +120,18 @@ size ratios. Its CPU is different, so it learns its own speeds.
 
 | Budget | Limit per Pacific day | Charged when |
 |---|---|---|
-| uploads (main account) | 700 GB | a result is uploaded (server, PC or cloud) |
-| downloads, main account | 500 GB (shared with Plex) | the server downloads, or a worker without its own account |
+| uploads (main account) | 700 GB | the server uploads, or a remote worker reports `uploaded`. A remote worker asks `POST /upload-permit` before uploading, which checks the budget but charges nothing. |
+| downloads, main account | 500 GB (shared with Plex) | a download starts (server, or a worker without its own account), even if it later fails; after a crash the row is charged again |
 | downloads, PC account | no cap | the PC claims a job (recorded only) |
 | downloads, cloud account | no cap | the cloud worker claims a job (recorded only) |
 
 - Status shows the uncapped accounts as "X GB (no cap)".
 - A `downloadQuotaExceeded` from an account blocks that account's budget for 12 h.
-- An upload rate-limit error blocks uploads for everyone for 6 h.
+- Drive's daily upload cap (`uploadLimitExceeded`) blocks uploads for everyone for 6 h.
+  A short-term throttle (`userRateLimitExceeded`) is retried with backoff and blocks
+  nothing.
+- The server skips a candidate that is too big for what is left of today's download
+  budget and takes a smaller one.
 
 ## Job service API
 
@@ -126,17 +142,25 @@ JSON.
 | Endpoint | Body | Answer |
 |---|---|---|
 | `GET /health` | none | `{"ok": true}` |
-| `POST /claim` | `worker`, `encoder` (`nvenc`/`x265-cloud`), `download_account` (`main`/`pc`/`cloud`), `resume`, optional `free_bytes` (int), `max_hours` (float) | `{"job": {...} or null, "retry_after": s, "download_used": n, "download_limit": n}`. The job carries `expected_hours`. |
+| `POST /claim` | `worker`, `encoder` (`nvenc`/`x265-cloud`; anything else is a 400, here and on `/resume`), `download_account` (`main`/`pc`/`cloud`), `resume`, optional `free_bytes` (int), `max_hours` (float) | `{"job": {...} or null, "retry_after": s, "download_used": n, "download_limit": n}`. The job carries `expected_hours`. |
 | `POST /heartbeat` | `ids` (list; a single `id` still works), `worker`, `download_account` | `{"cancel": [ids], ...}`. Sent every 60 s; renews every id listed. |
 | `POST /resume` | `worker`, `encoder`, `download_account`, `jobs`: a list of `{id, size, modtime, reserve_secs}` | `{"resumed": [ids], "refused": [ids]}` |
 | `POST /report` | `id`, `worker`, `outcome` (`uploaded`, `downloaded`, `upload_paused`, `failed`, `not_worth_it`, `changed`, `download_quota`, `upload_limited`), plus `out_size`, `out_md5`, `encode_secs` for `uploaded` and `reserve_secs` for `downloaded` | `{"ok": true}`; 409 if the lease was lost |
 | `POST /release` | `id`, `worker` | `{"ok": true}`; the job goes back to `queued` with no attempt used |
+| `POST /upload-permit` | `id`, `worker`, `out_size` | `{"ok": true}` or `{"ok": false, "retry_after": s}`; 409 if the lease was lost. Charges nothing; the `uploaded` report still does. |
 | `POST /alert` | `worker`, `message` | `{"ok": true}`; shown in `vidshrink status` until that worker's next successful claim |
 
 - **`downloaded`.** The worker holds the whole original. The lease becomes a
   reservation of `reserve_secs` (at most 30 days).
 - **`upload_paused`.** The worker hit Drive's upload limit and keeps its encoded file.
   The job keeps its lease and reservation, and uploads are blocked for everyone.
+- **Upload permit.** A worker asks before every upload. On "no" it keeps the file and
+  the lease, reports nothing and waits `retry_after` (at least 1 s). A 404 (an older
+  server) means upload anyway. A lost lease drops the job. Another server error pauses
+  uploads for `idle_secs`, then it asks again.
+- **Refused upload.** An `uploaded` report whose `out_size` doesn't show the 20%
+  saving parks the row as `failed` ("upload shows no saving: ..."), removes its tmp
+  and charges nothing.
 - **Lease expiry.** A lease with no heartbeat for 30 min expires. The server deletes
   any tmp file the worker left and puts the job back in the queue.
 - **Resume.** After a worker restarts, it offers its finished downloads and encodes
@@ -171,6 +195,8 @@ JSON.
 | `queue_upload_gb` | 25 | 25 |
 | `reserve_days` | 7 | 1 |
 
+- `encoder` must be `nvenc` or `x265-cloud`; the config is rejected at load time
+  otherwise.
 - `queue_disk_gb`, `queue_hours` and `queue_upload_gb` limit how much work a worker prefetches. See
   Pipelining.
 - `reserve_days` is how long a finished download stays reserved for the worker.

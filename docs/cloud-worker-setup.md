@@ -110,6 +110,12 @@ It should answer with the health JSON. `vidshrink-serve` already binds `0.0.0.0:
 which includes the Tailscale interface, so nothing changes on the server. Once this works
 you can restrict SSH in the firewall to the tailnet.
 
+If every cloud worker comes through an SSH tunnel (Option A), bind the service to
+`127.0.0.1` (`vidshrink serve --host 127.0.0.1`), unless the PC also uses it over the
+LAN; then use the server's LAN IP. The unit file's default is `0.0.0.0`. Tailscale
+(Option B) needs an address on the tailnet interface, so keep `0.0.0.0` or bind to
+the server's tailnet IP.
+
 ## 3. Tools on the VM
 
 ### ffmpeg
@@ -187,11 +193,18 @@ authorization.
 
 Create both remotes on the VM with `rclone config`, with the client ID and secret above:
 
-- `gdrive`: type `drive`, scope full access. Log in as the **main** account. Set the
+- `gdrive`: type `drive`. Log in as the **main** account. Choose scope `drive.file`
+  (see the recommendation below). Set the
   root so it points at the same Drive root as the server's `gdrive:` (copy non-secret
   options such as `root_folder_id` from the server's config; not its token).
 - `gdrive-cloud`: type `drive`, scope `drive.readonly`, and in the advanced options
   `shared_with_me = true`. Log in as the **download** account.
+
+**Recommended: scope `drive.file` for the upload remote.** With it, Google itself
+limits the token to files that this worker created, so a stolen VM token can't read or
+change the rest of the library. Pick the scope when the remote is authorized; changing
+it later means reconnecting. Do the same for the PC's upload remote. The server's own
+`gdrive:` keeps full access, since it swaps and trashes originals.
 
 The VM has no browser, so do the login through a port forward from a device that has
 one (a PC, or a phone running Termux):
