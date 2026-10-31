@@ -1015,6 +1015,8 @@ class PCWorker:
             self._check(cancel)
             self.log(f"uploading {out_size / 1e9:.1f} GB "
                      f"({1 - out_size / job['size']:.0%} smaller)")
+            if not self._upload_permitted(lj, out_size):
+                return
             uploading = True
             self._retry(lambda: self.rclone.upload(out, tmp, cancel=cancel), cancel)
             if self._retry(lambda: self.rclone.md5(tmp), cancel) != md5:
@@ -1034,6 +1036,30 @@ class PCWorker:
             else:
                 self._job_error(lj, e, tmp=tmp, md5=md5, uploading=uploading,
                                 remote=self.rclone.remote)
+
+    def _upload_permitted(self, lj: LocalJob, out_size: int) -> bool:
+        """Ask the server whether today's upload budget allows this upload. If not,
+        pause our uploads until it resets and put the job back (the server already
+        knows its budget is used, so there is nothing to report). LeaseLost
+        propagates to the stage's error handling; a server without the endpoint
+        (404) is an older one, so upload anyway."""
+        try:
+            permit = self._retry_job_call(lambda: self.client.upload_permit(
+                lj.id, self.cfg.worker_name, out_size))
+        except JobServiceError as e:
+            if e.status != 404:
+                raise
+            self.log("the server has no upload permit; uploading without asking")
+            return True
+        if permit["ok"]:
+            return True
+        retry_after = float(permit["retry_after"])
+        self.log(f"upload budget used up; uploads paused for {retry_after / 3600:.1f} h, "
+                 f"keeping {lj.job['path']}")
+        self._uploads_paused_until = time.monotonic() + retry_after
+        if self._set_state(lj, "verified"):
+            self._push(self._to_upload, lj, front=True)
+        return False
 
     def _keep_unreported(self, lj: LocalJob, out_size: int, md5: str, secs: float) -> None:
         """The upload is done but the server hasn't confirmed the report: keep the

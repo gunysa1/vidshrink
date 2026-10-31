@@ -810,3 +810,35 @@ def test_claim_clears_stale_reservation(conn, store):
     conn.execute("UPDATE videos SET reserve_secs=? WHERE id=?", (7 * DAY, vid))
     store.claim("pc")
     assert db.get(conn, vid)["reserve_secs"] is None
+
+
+def test_upload_permit_refused_when_budget_used_up(conn, cfg, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.uploads.add(cfg.daily_upload_limit - 10)
+    r = store.upload_permit(vid, "pc", 100)
+    assert r["ok"] is False and r["retry_after"] > 0
+    store.uploads.add(-(cfg.daily_upload_limit - 10))
+    assert store.upload_permit(vid, "pc", 100) == {"ok": True}
+    assert store.uploads.used() == 0  # a permit charges nothing
+
+
+def test_upload_permit_needs_the_lease(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    with pytest.raises(LeaseLost):
+        store.upload_permit(vid, "other", 100)
+
+
+def test_upload_permit_rejects_empty_output(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    with pytest.raises(ValueError):
+        store.upload_permit(vid, "pc", 0)
+
+
+def test_report_uploaded_without_permit_still_accepted(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "uploaded", out_size=100, out_md5="0" * 32, encode_secs=1.0)
+    assert db.get(conn, vid)["stage"] == "remote_ready"

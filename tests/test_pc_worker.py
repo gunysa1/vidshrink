@@ -377,6 +377,59 @@ def test_throttled_upload_retries_instead_of_pausing(conn, setup, monkeypatch):
         t.join(15)
 
 
+def test_upload_waits_when_permit_refused(conn, setup, monkeypatch):
+    root, pc, store = setup
+    orig_permit = pc.client.upload_permit
+    orig_upload = pc.rclone.upload
+    asked, uploads, outcomes = [], [], []
+
+    def permit(job_id, worker, out_size):
+        asked.append(out_size)
+        if len(asked) == 1:
+            return {"ok": False, "retry_after": 1}
+        return orig_permit(job_id, worker, out_size)
+
+    def upload(local, path, cancel=None):
+        assert len(asked) >= 2  # not before the second answer
+        uploads.append(path)
+        return orig_upload(local, path, cancel=cancel)
+
+    orig_report = pc.client.report
+
+    def spy(job_id, worker, outcome, **data):
+        outcomes.append(outcome)
+        return orig_report(job_id, worker, outcome, **data)
+
+    monkeypatch.setattr(pc.client, "upload_permit", permit)
+    monkeypatch.setattr(pc.rclone, "upload", upload)
+    monkeypatch.setattr(pc.client, "report", spy)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready", timeout=60)
+        assert len(asked) >= 2 and uploads
+        assert "upload_paused" not in outcomes and "uploaded" in outcomes
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
+def test_upload_proceeds_when_permit_endpoint_missing(conn, setup, monkeypatch):
+    root, pc, store = setup
+
+    def missing(job_id, worker, out_size):
+        raise JobServiceError("not found", status=404)
+
+    monkeypatch.setattr(pc.client, "upload_permit", missing)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready", timeout=60)
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
 def test_stop_after_during_upload_pause_keeps_encoded_reserved(conn, setup, monkeypatch):
     root, pc, store = setup
 

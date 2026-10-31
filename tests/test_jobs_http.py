@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from vidshrink import db
+from vidshrink.budget import Budget
 from vidshrink import jobs as jobs_mod
 from vidshrink.jobs import (JobClient, JobServiceError, JobStore, LeaseLost,
                             load_or_create_token, make_server, REQUEST_TIMEOUT_SECS)
@@ -369,3 +370,19 @@ def test_old_client_single_heartbeat_unchanged(conn, clocked_service):
     assert r["cancel"] is False
     assert db.get(conn, vid)["lease_until"] == clock.t + 1800
     assert db.get(conn, vid)["reserve_secs"] is None
+
+
+def test_upload_permit_roundtrip(conn, cfg, job_service):
+    vid = add(conn, "a.mkv")
+    c = JobClient(job_service.url, job_service.token)
+    c.claim("pc")
+    assert c.upload_permit(vid, "pc", 100) == {"ok": True}
+    other = db.connect(cfg.db_path)
+    try:
+        Budget(other, cfg.daily_upload_limit).add(cfg.daily_upload_limit)
+    finally:
+        other.close()
+    r = c.upload_permit(vid, "pc", 100)
+    assert r["ok"] is False and r["retry_after"] > 0
+    with pytest.raises(LeaseLost):  # a 409
+        c.upload_permit(vid, "someone-else", 100)

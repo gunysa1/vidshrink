@@ -400,6 +400,18 @@ class JobStore:
                                         "reserve_secs": None})
         self.log(f"{worker} released: {row['path']}")
 
+    def upload_permit(self, job_id: int, worker: str, out_size: int) -> dict:
+        """May worker start uploading out_size bytes now? Charges nothing: the
+        "uploaded" report does. Checked right before each upload, since a remote
+        worker may upload long after the claim checked the budget."""
+        if out_size <= 0:
+            raise ValueError("out_size must be positive")
+        self._seen(worker, self._row_encoder(job_id))
+        self._leased_by(job_id, worker, self.now())
+        if self.uploads.allows(out_size):
+            return {"ok": True}
+        return {"ok": False, "retry_after": self.uploads.seconds_until_reset()}
+
     def _requeue_if_still_expired(self, job_id: int, now: float) -> bool:
         """Guarded requeue of a lease that looked expired as of `now`. False if the
         lease was renewed (or the row moved on) since whoever is calling this read the
@@ -577,6 +589,9 @@ def make_server(store: JobStore, token: str, host: str, port: int) -> HTTPServer
                 elif self.path == "/release":
                     store.release(int(body["id"]), body["worker"])
                     self._send(200, {"ok": True})
+                elif self.path == "/upload-permit":
+                    self._send(200, store.upload_permit(int(body["id"]), body["worker"],
+                                                        int(body["out_size"])))
                 else:
                     self._send(404, {"error": "not found"})
             except LeaseLost as e:
@@ -649,3 +664,7 @@ class JobClient:
 
     def release(self, job_id: int, worker: str) -> None:
         self._call("POST", "/release", {"id": job_id, "worker": worker})
+
+    def upload_permit(self, job_id: int, worker: str, out_size: int) -> dict:
+        return self._call("POST", "/upload-permit", {"id": job_id, "worker": worker,
+                                                      "out_size": out_size})
