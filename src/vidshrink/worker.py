@@ -460,8 +460,16 @@ class Worker:
         try:
             if self._src(vid).stat().st_size != row["size"]:
                 self._cleanup(vid)
+                # A scan resets attempts when Drive's listing really changed, so only
+                # a repeat with the same listing (size never matches) reaches the cap.
+                attempts = row["attempts"] + 1
+                if attempts >= self.cfg.max_attempts:
+                    db.mark(self.conn, vid, "failed", attempts=attempts,
+                            reason="size on Drive differs from the download again")
+                    self.log(f"size differs from the download again, giving up: {path}")
+                    return False
                 db.mark(self.conn, vid, "unprobed", reason="changed since scan",
-                        probe_json=None, score=None)
+                        attempts=attempts, probe_json=None, score=None)
                 self.log(f"changed since scan, will re-probe: {path}")
                 return False
         except OSError as e:

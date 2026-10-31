@@ -374,9 +374,17 @@ class JobStore:
                 self._mark_leased_or_raise(job_id, worker, now, "not_worth_it", {
                     "reason": str(data.get("reason", ""))[:500], **clear})
             elif outcome == "changed":
-                self._mark_leased_or_raise(job_id, worker, now, "unprobed", {
-                    "reason": "changed since scan", "probe_json": None, "score": None,
-                    **clear})
+                # upsert_listing resets attempts when Drive's listing really changed,
+                # so only a repeat with the same listing reaches the cap.
+                attempts = row["attempts"] + 1
+                if attempts >= self.cfg.max_attempts:
+                    self._mark_leased_or_raise(job_id, worker, now, "failed", {
+                        "attempts": attempts,
+                        "reason": "size on Drive differs from the download again", **clear})
+                else:
+                    self._mark_leased_or_raise(job_id, worker, now, "unprobed", {
+                        "attempts": attempts, "reason": "changed since scan",
+                        "probe_json": None, "score": None, **clear})
             elif outcome == "download_quota":
                 self._download_budget(download_account).block(self.cfg.download_block_secs)
                 self._mark_leased_or_raise(job_id, worker, now, "queued", clear)

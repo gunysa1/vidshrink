@@ -352,6 +352,22 @@ def test_prepare_requeues_file_changed_since_scan(conn, cfg, env):
     assert list(cfg.workdir.glob("*.src")) == [] and list(cfg.workdir.glob("*.mkv")) == []
 
 
+def test_changed_twice_is_failed(conn, cfg, env):
+    root, worker = env
+    worker.cfg.workdir.mkdir(parents=True, exist_ok=True)
+    with open(root / "Movies" / "a.mkv", "ab") as f:
+        f.write(b"x" * 10)
+    prepare(worker, db.get_by_path(conn, "Movies/a.mkv"))
+    r = db.get_by_path(conn, "Movies/a.mkv")
+    assert (r["stage"], r["attempts"], r["reason"]) == ("unprobed", 1, "changed since scan")
+    db.mark(conn, r["id"], "queued", attempts=worker.cfg.max_attempts - 1)
+    prepare(worker, db.get(conn, r["id"]))
+    r = db.get(conn, r["id"])
+    assert (r["stage"], r["reason"]) == \
+        ("failed", "size on Drive differs from the download again")
+    assert list(cfg.workdir.glob("*.src")) == []
+
+
 def test_failed_swap_is_retried_during_the_run(conn, cfg, env, monkeypatch):
     root, worker = env
     from vidshrink.rclone import RcloneError

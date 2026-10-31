@@ -230,6 +230,21 @@ def test_report_not_worth_it_changed_and_quota(conn, store):
     assert store.downloads.blocked()
 
 
+def test_changed_twice_is_failed(conn, store):
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    store.report(vid, "pc", "changed")
+    row = db.get(conn, vid)
+    assert (row["stage"], row["attempts"], row["reason"]) == ("unprobed", 1, "changed since scan")
+    db.save_probe(conn, "a.mkv", BASE.to_json())  # the re-probe after the first change
+    db.mark(conn, vid, "queued", score=1.0, attempts=store.cfg.max_attempts - 1)
+    store.claim("pc")
+    store.report(vid, "pc", "changed")
+    row = db.get(conn, vid)
+    assert (row["stage"], row["reason"], row["worker"], row["lease_until"]) == \
+        ("failed", "size on Drive differs from the download again", None, None)
+
+
 def test_report_upload_limited_blocks_uploads_and_requeues(conn, store):
     vid = add(conn, "a.mkv")
     store.claim("pc")
