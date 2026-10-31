@@ -183,6 +183,19 @@ def test_report_uploaded_too_large_is_failed_and_tmp_removed(conn, cfg, store):
     assert store.uploads.used() == used
 
 
+def test_report_uploaded_too_large_lease_lost_deletes_nothing(conn, cfg, store):
+    root = Path(cfg.remote.rstrip("/"))
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    (root / "a.vidshrink-tmp.mkv").write_bytes(b"not yours")
+    size = db.get(conn, vid)["size"]
+    with pytest.raises(LeaseLost):
+        store.report(vid, "other", "uploaded", out_size=int(size * 0.9), out_md5="a" * 32,
+                     encode_secs=1.0)
+    assert (root / "a.vidshrink-tmp.mkv").exists()
+    assert db.get(conn, vid)["stage"] == "leased"
+
+
 def test_report_uploaded_is_idempotent_on_retry(conn, store):
     """A PC that retries an ambiguous "uploaded" report (the first commit succeeded
     server-side but the response was lost) must not get LeaseLost and must not be

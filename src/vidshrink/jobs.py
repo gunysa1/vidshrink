@@ -315,6 +315,7 @@ class JobStore:
                **data) -> None:
         self._seen(worker, self._row_encoder(job_id))
         now = self.now()
+        refused = refused_tmp = None
         with db.transaction(self.conn):
             if outcome == "uploaded":
                 # Idempotent: if a PC's earlier "uploaded" attempt actually committed
@@ -364,22 +365,17 @@ class JobStore:
                         "attempts": self.cfg.max_attempts,
                         "reason": f"upload shows no saving: {out_size} of {row['size']}",
                         **clear})
-                    tmp = tmp_path(row["path"])
-                    try:
-                        if self.rclone.exists(tmp):
-                            self.rclone.delete(tmp)
-                    except RcloneError as e:
-                        self.log(f"{tmp} could not be removed: {e}")
-                    self.log(f"{worker} uploaded no saving ({out_size} of {row['size']}), "
-                             f"refused: {row['path']}")
-                    return
-                self._mark_leased_or_raise(job_id, worker, now, "remote_ready", {
-                    "out_size": out_size, "out_md5": out_md5,
-                    "encode_secs": float(data["encode_secs"]), "reason": None,
-                    # Keep `worker` (don't clear it) so a retried duplicate report of
-                    # this same success can still be recognized as idempotent above.
-                    "worker": worker, "lease_until": None, "reserve_secs": None})
-                self.uploads.add(out_size)
+                    refused = (f"{worker} uploaded no saving ({out_size} of {row['size']}), "
+                               f"refused: {row['path']}")
+                    refused_tmp = tmp_path(row["path"])
+                else:
+                    self._mark_leased_or_raise(job_id, worker, now, "remote_ready", {
+                        "out_size": out_size, "out_md5": out_md5,
+                        "encode_secs": float(data["encode_secs"]), "reason": None,
+                        # Keep `worker` (don't clear it) so a retried duplicate report of
+                        # this same success can still be recognized as idempotent above.
+                        "worker": worker, "lease_until": None, "reserve_secs": None})
+                    self.uploads.add(out_size)
             elif outcome == "failed":
                 attempts = row["attempts"] + 1
                 stage = "failed" if attempts >= self.cfg.max_attempts else "queued"
@@ -416,6 +412,15 @@ class JobStore:
                 self.log(f"{worker} hit Drive's upload limit; uploads paused for everyone")
             else:
                 raise ValueError(f"unknown outcome {outcome!r}")
+        if refused:
+            # After the commit: two Drive calls must not hold sqlite's write lock.
+            try:
+                if self.rclone.exists(refused_tmp):
+                    self.rclone.delete(refused_tmp)
+            except RcloneError as e:
+                self.log(f"{refused_tmp} could not be removed: {e}")
+            self.log(refused)
+            return
         self.log(f"{worker} reported {outcome}: {row['path']}")
 
     def release(self, job_id: int, worker: str) -> None:
