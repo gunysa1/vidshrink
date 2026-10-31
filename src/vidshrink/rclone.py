@@ -47,7 +47,8 @@ class RcloneError(Exception):
 
     @property
     def throttled(self) -> bool:
-        return any(m in self.stderr for m in THROTTLE_MARKERS)
+        # The daily cap's stderr carries userRateLimitExceeded too; it is not a retry.
+        return not self.upload_limit and any(m in self.stderr for m in THROTTLE_MARKERS)
 
     @property
     def download_quota(self) -> bool:

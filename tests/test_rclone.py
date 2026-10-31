@@ -89,6 +89,12 @@ def test_throttled_detection():
     assert not RcloneError(1, "connection reset").throttled
 
 
+def test_daily_cap_stderr_is_upload_limit_not_throttled():
+    e = RcloneError(1, "ERROR : gdrive root: Received upload limit error: googleapi: "
+                       "Error 403: User rate limit exceeded., userRateLimitExceeded")
+    assert e.upload_limit and not e.throttled
+
+
 def test_with_retries_retries_then_succeeds():
     calls, sleeps = [], []
 
