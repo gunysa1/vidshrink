@@ -165,6 +165,24 @@ def test_report_uploaded(conn, store):
     assert store.uploads.used() == 2_000_000_000
 
 
+def test_report_uploaded_too_large_is_failed_and_tmp_removed(conn, cfg, store):
+    """The worker checks the saving itself; an upload that doesn't show it is a buggy
+    or hostile worker: refuse it, drop its tmp, charge nothing."""
+    root = Path(cfg.remote.rstrip("/"))
+    vid = add(conn, "a.mkv")
+    store.claim("pc")
+    (root / "a.vidshrink-tmp.mkv").write_bytes(b"too big")
+    used = store.uploads.used()
+    size = db.get(conn, vid)["size"]
+    store.report(vid, "pc", "uploaded", out_size=int(size * 0.9), out_md5="a" * 32,
+                 encode_secs=1.0)
+    row = db.get(conn, vid)
+    assert row["stage"] == "failed" and row["reason"].startswith("upload shows no saving")
+    assert (row["attempts"], row["worker"], row["lease_until"]) == (cfg.max_attempts, None, None)
+    assert not (root / "a.vidshrink-tmp.mkv").exists()
+    assert store.uploads.used() == used
+
+
 def test_report_uploaded_is_idempotent_on_retry(conn, store):
     """A PC that retries an ambiguous "uploaded" report (the first commit succeeded
     server-side but the response was lost) must not get LeaseLost and must not be

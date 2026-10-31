@@ -357,6 +357,22 @@ class JobStore:
                 if out_size <= 0 or not is_valid_md5(out_md5):
                     raise ValueError(
                         f"invalid uploaded report: out_size={out_size} out_md5={out_md5!r}")
+                if out_size > row["size"] * (1 - self.cfg.min_saving):
+                    # The worker verifies the saving before uploading, so this can only
+                    # be a buggy or hostile one: refuse it, and don't retry the job.
+                    self._mark_leased_or_raise(job_id, worker, now, "failed", {
+                        "attempts": self.cfg.max_attempts,
+                        "reason": f"upload shows no saving: {out_size} of {row['size']}",
+                        **clear})
+                    tmp = tmp_path(row["path"])
+                    try:
+                        if self.rclone.exists(tmp):
+                            self.rclone.delete(tmp)
+                    except RcloneError as e:
+                        self.log(f"{tmp} could not be removed: {e}")
+                    self.log(f"{worker} uploaded no saving ({out_size} of {row['size']}), "
+                             f"refused: {row['path']}")
+                    return
                 self._mark_leased_or_raise(job_id, worker, now, "remote_ready", {
                     "out_size": out_size, "out_md5": out_md5,
                     "encode_secs": float(data["encode_secs"]), "reason": None,
