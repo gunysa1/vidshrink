@@ -34,13 +34,13 @@ class DiskTooSmall(Exception):
 
 
 @contextmanager
-def _lock(workdir: Path):
-    workdir.mkdir(parents=True, exist_ok=True)
-    with open(workdir / ".lock", "w") as f:
+def _lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise AlreadyRunning(str(workdir)) from None
+            raise AlreadyRunning(str(lock_path)) from None
         yield
 
 
@@ -295,7 +295,8 @@ class Worker:
     def run(self, limit: int | None = None, dry_run: bool = False) -> int:
         self._check_tools()
         self._dry_run = dry_run
-        with _lock(self.cfg.workdir):
+        self.cfg.workdir.mkdir(parents=True, exist_ok=True)
+        with _lock(self.cfg.db_path.with_suffix(".lock")):  # per database, not per workdir
             done = self.recover(dry_run)
             self.failures = 0
             try:

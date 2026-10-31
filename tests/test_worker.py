@@ -187,9 +187,21 @@ def test_throttled_md5_check_retries_and_does_not_block(conn, env, monkeypatch):
 def test_lock_prevents_second_worker(env):
     _, worker = env
     from vidshrink.worker import _lock
-    with _lock(worker.cfg.workdir):
+    with _lock(worker.cfg.db_path.with_suffix(".lock")):
         with pytest.raises(AlreadyRunning):
             worker.run()
+
+
+def test_two_workdirs_one_db_cannot_run_together(env, tmp_path):
+    from dataclasses import replace
+    from vidshrink.worker import _lock
+    _, worker = env
+    other = replace(worker.cfg, workdir=tmp_path / "other-workdir")
+    rival = Worker(worker.conn, worker.rclone, other, worker.budget,
+                   sleep=lambda s: None, log=lambda s: None)
+    with _lock(worker.cfg.db_path.with_suffix(".lock")):
+        with pytest.raises(AlreadyRunning):
+            rival.run()
 
 
 def test_target_name_taken(conn, cfg, env):
