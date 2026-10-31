@@ -76,9 +76,17 @@ def test_errors_raise(rc, tmp_path):
         rc.download("missing.mkv", tmp_path / "x")
 
 
-def test_rate_limited_detection():
-    assert RcloneError(1, "googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded").rate_limited
-    assert not RcloneError(1, "connection reset").rate_limited
+def test_upload_limit_detection():
+    e = RcloneError(1, "... 403: uploadLimitExceeded ...")
+    assert e.upload_limit and not e.throttled
+    assert RcloneError(1, "Received upload limit error").upload_limit
+    assert not RcloneError(1, "connection reset").upload_limit
+
+
+def test_throttled_detection():
+    e = RcloneError(1, "... 403: userRateLimitExceeded, User rate limit exceeded ...")
+    assert e.throttled and not e.upload_limit
+    assert not RcloneError(1, "connection reset").throttled
 
 
 def test_with_retries_retries_then_succeeds():
@@ -102,12 +110,22 @@ def test_with_retries_gives_up():
         with_retries(fn, attempts=3, base_delay=0, sleep=lambda s: None)
 
 
-def test_with_retries_does_not_retry_rate_limit():
+def test_with_retries_retries_throttled_but_not_upload_limit():
     calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RcloneError(1, "userRateLimitExceeded")
+        return "ok"
+
+    assert with_retries(flaky, 3, 0, sleep=lambda s: None) == "ok"
+    assert len(calls) == 2
+    calls.clear()
 
     def fn():
         calls.append(1)
-        raise RcloneError(1, "userRateLimitExceeded")
+        raise RcloneError(1, "uploadLimitExceeded")
 
     with pytest.raises(RcloneError):
         with_retries(fn, attempts=5, base_delay=0, sleep=lambda s: None)
@@ -120,14 +138,14 @@ def test_serve_http(rc):
         assert urllib.request.urlopen(url).read() == b"x" * 1000
 
 
-def test_stop_on_upload_limit_error_is_rate_limited():
+def test_stop_on_upload_limit_error_is_upload_limit():
     # What --drive-stop-on-upload-limit logs (rclone 1.60 backend/drive) before giving up.
     stderr = ("ERROR : gdrive root: Received upload limit error: googleapi: Error 403: "
               "User rate limit exceeded., userRateLimitExceeded\n"
               "ERROR : Fatal error received - not attempting retries\n")
-    assert RcloneError(1, stderr).rate_limited
-    assert RcloneError(1, "ERROR : x: Received upload limit error: googleapi: Error 403").rate_limited
-    assert not RcloneError(1, "ERROR : Fatal error received - not attempting retries").rate_limited
+    assert RcloneError(1, stderr).upload_limit
+    assert RcloneError(1, "ERROR : x: Received upload limit error: googleapi: Error 403").upload_limit
+    assert not RcloneError(1, "ERROR : Fatal error received - not attempting retries").upload_limit
 
 
 def test_default_rclone_args_are_pinned_and_accepted(tmp_path):
@@ -142,7 +160,7 @@ def test_default_rclone_args_are_pinned_and_accepted(tmp_path):
 def test_download_quota_detection():
     err = RcloneError(1, "googleapi: Error 403: The download quota for this file has been "
                          "exceeded., downloadQuotaExceeded")
-    assert err.download_quota and not err.rate_limited
+    assert err.download_quota and not err.upload_limit and not err.throttled
     assert not RcloneError(1, "connection reset").download_quota
 
 

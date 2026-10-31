@@ -549,7 +549,7 @@ class Worker:
                 raise error
             remote_md5 = self.rclone.md5(tmp)
         except RcloneError as e:
-            if e.rate_limited:
+            if e.upload_limit:
                 self.budget.block(self.cfg.rate_limit_block_secs)
                 db.mark(self.conn, vid, "ready")
                 self.log("Drive upload limit hit; blocking uploads")

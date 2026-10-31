@@ -315,8 +315,8 @@ def test_upload_limited_keeps_encoded_files(conn, setup, monkeypatch):
 
     def limited(local, path, cancel=None):
         uploads.append(path)
-        raise RcloneError(1, "googleapi: Error 403: User rate limit exceeded.,"
-                          " userRateLimitExceeded")
+        raise RcloneError(1, "googleapi: Error 403: The daily upload limit has been "
+                          "reached., uploadLimitExceeded")
 
     outcomes = []
     orig_report = pc.client.report
@@ -344,12 +344,45 @@ def test_upload_limited_keeps_encoded_files(conn, setup, monkeypatch):
         t.join(15)
 
 
+def test_throttled_upload_retries_instead_of_pausing(conn, setup, monkeypatch):
+    # Google's short-term per-user rate limit is a retry, not the daily cap.
+    root, pc, store = setup
+    orig_upload = pc.rclone.upload
+    calls, outcomes = [], []
+
+    def flaky(local, path, cancel=None):
+        calls.append(path)
+        if len(calls) == 1:
+            raise RcloneError(1, "googleapi: Error 403: User rate limit exceeded.,"
+                              " userRateLimitExceeded")
+        return orig_upload(local, path, cancel=cancel)
+
+    orig_report = pc.client.report
+
+    def spy(job_id, worker, outcome, **data):
+        outcomes.append(outcome)
+        return orig_report(job_id, worker, outcome, **data)
+
+    monkeypatch.setattr(pc.rclone, "upload", flaky)
+    monkeypatch.setattr(pc.client, "report", spy)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    t = run_in_thread(pc)
+    try:
+        assert wait_for(lambda: db.get(conn, vid)["stage"] == "remote_ready")
+        assert "uploaded" in outcomes and "upload_paused" not in outcomes
+        assert not store.uploads.blocked()
+        assert len(calls) >= 2
+    finally:
+        pc.stop(now=True)
+        t.join(15)
+
+
 def test_stop_after_during_upload_pause_keeps_encoded_reserved(conn, setup, monkeypatch):
     root, pc, store = setup
 
     def limited(local, path, cancel=None):
-        raise RcloneError(1, "googleapi: Error 403: User rate limit exceeded.,"
-                          " userRateLimitExceeded")
+        raise RcloneError(1, "googleapi: Error 403: The daily upload limit has been reached.,"
+                          " uploadLimitExceeded")
 
     released = []
     orig_release = pc.client.release
@@ -811,7 +844,7 @@ def test_poison_job_reported_failed_on_second_unexpected_error(conn, setup, monk
     assert not t.is_alive()
 
 
-def test_rate_limited_download_is_transient_not_upload_limited(conn, setup, monkeypatch):
+def test_throttled_download_is_transient_not_upload_limited(conn, setup, monkeypatch):
     root, pc, store = setup
     pc.cfg.idle_secs = 0.1  # fast backoff for the test
 

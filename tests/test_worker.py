@@ -143,7 +143,7 @@ def test_rate_limit_blocks_uploads(conn, env, monkeypatch):
     from vidshrink.rclone import RcloneError
 
     def limited(local, path, **kw):
-        raise RcloneError(1, "userRateLimitExceeded")
+        raise RcloneError(1, "uploadLimitExceeded")
 
     monkeypatch.setattr(worker.rclone, "upload", limited)
     worker.sleep = lambda s: (_ for _ in ()).throw(KeyboardInterrupt)
@@ -151,6 +151,28 @@ def test_rate_limit_blocks_uploads(conn, env, monkeypatch):
         worker.run()
     assert not worker.budget.allows(1)
     assert db.rows_in(conn, "ready")
+
+
+def test_throttled_md5_check_retries_and_does_not_block(conn, env, monkeypatch):
+    # Google's short-term per-user rate limit on the post-upload md5 check is a
+    # retry, not the daily cap: uploads stay unblocked and the row is swapped.
+    root, worker = env
+    from vidshrink.rclone import RcloneError
+    orig_md5 = worker.rclone.md5
+    calls = []
+
+    def flaky(path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise RcloneError(1, "userRateLimitExceeded")
+        return orig_md5(path)
+
+    monkeypatch.setattr(worker.rclone, "md5", flaky)
+    assert worker.run() == 2
+    assert worker.budget.allows(1)
+    assert len(calls) >= 2
+    assert not db.rows_in(conn, "ready") and not db.rows_in(conn, "failed")
+    assert len(db.rows_in(conn, "done")) == 2
 
 
 def test_lock_prevents_second_worker(env):

@@ -1028,7 +1028,7 @@ class PCWorker:
                 return
             self._forget(lj)
         except Exception as e:
-            if (isinstance(e, RcloneError) and e.rate_limited and uploading
+            if (isinstance(e, RcloneError) and e.upload_limit and uploading
                     and not e.auth_failed):
                 self._pause_uploads(lj, tmp, md5)
             else:
@@ -1149,12 +1149,12 @@ class PCWorker:
                     f"for the remote, then Start again): {e}",
                     alert=f"Drive login failed for {remote}; re-authorize that rclone "
                           f"remote, then restart the worker: {e}") from e
-            if e.rate_limited:
+            if e.throttled:
                 # Surprising on a download (the limit is normally hit on upload),
                 # but still not this video's fault: release and back off like any
                 # other transient blip, without burning an attempt or touching any
                 # tmp (nothing was uploaded yet).
-                self.log(f"rate limited during download (unexpected); releasing "
+                self.log(f"throttled during download (unexpected); releasing "
                          f"and backing off: {job['path']}")
                 self._abandon(job, None, None)
                 self._forget(lj)
@@ -1211,7 +1211,7 @@ class PCWorker:
             try:
                 return fn()
             except RcloneError as e:
-                if (e.rate_limited or e.download_quota or e.auth_failed
+                if (e.upload_limit or e.download_quota or e.auth_failed
                         or i == self.cfg.retry_attempts - 1):
                     raise
                 delay = self.cfg.retry_base_delay * 2 ** i + random.uniform(

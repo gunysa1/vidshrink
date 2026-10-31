@@ -23,10 +23,12 @@ DOWNLOAD_QUOTA_MARKER = "downloadQuotaExceeded"
 # The remote's Drive login is dead (expired/revoked refresh token): no retry helps;
 # it needs `rclone config reconnect <remote>:`.
 AUTH_MARKERS = ("invalid_grant", "couldn't fetch token", "Token has been expired or revoked")
+# Drive's daily upload cap: no retry helps, uploads must stop for hours.
 # "Received upload limit error" is what rclone 1.60 logs when --drive-stop-on-upload-limit
 # turns Drive's daily-limit 403 into a fatal error.
-RATE_LIMIT_MARKERS = ("userRateLimitExceeded", "uploadLimitExceeded", "User rate limit exceeded",
-                      "Received upload limit error")
+UPLOAD_LIMIT_MARKERS = ("uploadLimitExceeded", "Received upload limit error")
+# Google's short-term per-user rate limit: a retry after a backoff clears it.
+THROTTLE_MARKERS = ("userRateLimitExceeded", "User rate limit exceeded", "rateLimitExceeded")
 
 
 class TransferCancelled(Exception):
@@ -40,8 +42,12 @@ class RcloneError(Exception):
         self.stderr = stderr
 
     @property
-    def rate_limited(self) -> bool:
-        return any(m in self.stderr for m in RATE_LIMIT_MARKERS)
+    def upload_limit(self) -> bool:
+        return any(m in self.stderr for m in UPLOAD_LIMIT_MARKERS)
+
+    @property
+    def throttled(self) -> bool:
+        return any(m in self.stderr for m in THROTTLE_MARKERS)
 
     @property
     def download_quota(self) -> bool:
@@ -144,7 +150,7 @@ def with_retries(fn: Callable[[], T], attempts: int, base_delay: float,
         try:
             return fn()
         except RcloneError as e:
-            if e.rate_limited or e.download_quota or e.auth_failed or i == attempts - 1:
+            if e.upload_limit or e.download_quota or e.auth_failed or i == attempts - 1:
                 raise
             sleep(base_delay * 2 ** i + random.uniform(0, base_delay))
     raise AssertionError("unreachable")
