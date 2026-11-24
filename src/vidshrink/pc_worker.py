@@ -193,6 +193,10 @@ class _LocalFault(Exception):
 EncodeFn = Callable[[Path, Path, Probe, Path, threading.Event], float]
 
 
+# Missing files in a row whose library check itself failed before the worker
+# stops with an alert, rather than releasing and backing off forever.
+MAX_CHECK_FAILURES = 3
+
 # Local states of a held job that is waiting in a stage's queue rather than being
 # worked on: a server cancel can drop it at once, since no stage owns it.
 _IDLE_STATES = ("downloaded", "encoded", "verified", "uploaded")
@@ -277,6 +281,7 @@ class PCWorker:
         self._uploads_paused_until = 0.0  # time.monotonic() deadline
         self._fault_exc: _LocalFault | None = None
         self._claim_not_before = 0.0  # time.monotonic(); see _back_off_claims
+        self._check_failures = 0  # library checks in a row that errored
         # Consecutive unexpected (catch-all) errors per job id, in memory: a job that
         # keeps raising something we didn't anticipate gets released once, then
         # reported failed (poison-job guard) rather than released forever.
@@ -828,6 +833,7 @@ class PCWorker:
                 self._forget(lj)
                 return
             self._write_marker(downloaded, job["size"])
+            self._check_failures = 0
         except Exception as e:
             self._job_error(lj, e, remote=self.download_rclone.remote, downloading=True)
             return
@@ -1166,7 +1172,14 @@ class PCWorker:
                     alert=f"Drive login failed for {remote}; re-authorize that rclone "
                           f"remote, then restart the worker: {e}") from e
             if downloading and e.not_found:
-                visible = self._library_visible(job["path"])
+                try:
+                    visible = self.download_rclone.top_folder_visible(job["path"])
+                except RcloneError as check_error:
+                    if check_error.auth_failed:
+                        # The login died between the download and the check.
+                        return self._job_error(lj, check_error, remote=remote)
+                    self.log(f"library check failed: {check_error}")
+                    visible = None
                 if visible is False:
                     # The library itself is out of this login's sight (e.g. no
                     # longer shared with it): every job would fail the same way,
@@ -1182,13 +1195,24 @@ class PCWorker:
                               f"restart the worker") from e
                 if visible is None:
                     # Can't tell whether the file or the login is at fault: don't
-                    # burn an attempt; release and back off like a transient blip.
-                    self.log(f"missing file and the library check failed; releasing "
-                             f"and backing off: {job['path']}")
+                    # burn an attempt; release and back off like a transient blip,
+                    # and stop with an alert if it keeps happening.
                     self._abandon(job, None, None)
                     self._forget(lj)
+                    self._check_failures += 1
+                    if self._check_failures >= MAX_CHECK_FAILURES:
+                        raise _LocalFault(
+                            f"missing files and the library check through {remote} "
+                            f"failed {self._check_failures} times in a row: {e}",
+                            alert=f"Can't check the library through {remote}: "
+                                  f"{self._check_failures} missing files in a row and "
+                                  f"the check failed each time; check that remote, "
+                                  f"then restart the worker") from e
+                    self.log(f"missing file and the library check failed; releasing "
+                             f"and backing off: {job['path']}")
                     self._back_off_claims()
                     return
+                self._check_failures = 0
             if e.throttled and uploading:
                 # Google's per-user rate limit outlasted _retry on the upload or
                 # its md5 check: the encode is finished, so keep it and the lease
@@ -1231,15 +1255,6 @@ class PCWorker:
         else:
             raise e
         self._forget(lj)
-
-    def _library_visible(self, path: str) -> bool | None:
-        """Whether path's top folder is visible through the download login; None
-        when the check itself fails."""
-        try:
-            return self.download_rclone.top_folder_visible(path)
-        except RcloneError as e:
-            self.log(f"library check failed: {e}")
-            return None
 
     def _keep_on_stop(self, lj: LocalJob, tmp: str | None, md5: str | None) -> bool:
         """A stop (not a server cancel) interrupted a job whose download had

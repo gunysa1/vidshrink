@@ -148,6 +148,8 @@ class Rclone:
     def top_folder_visible(self, path: str) -> bool:
         """Whether path's first folder (e.g. "TV") is at this remote's root. False
         when the library is out of this login's sight, e.g. no longer shared."""
+        if "/" not in path:
+            return True  # a file at the root: no folder to check
         top = path.split("/", 1)[0]
         try:
             out = self._run("lsjson", "--dirs-only", "--no-mimetype", "--max-depth", "1",

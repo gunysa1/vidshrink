@@ -262,5 +262,6 @@ def test_top_folder_visible(rc, tmp_path):
     assert rc.top_folder_visible("Movies/A [1080p]/a.mkv")
     assert rc.top_folder_visible("Movies/A [1080p]/nope.mkv")  # only the top folder counts
     assert not rc.top_folder_visible("TV/Show/s01e01.mkv")
+    assert rc.top_folder_visible("a.mkv")  # a file at the root: no folder to check
     # A remote whose root itself is gone sees nothing.
     assert not Rclone(str(tmp_path / "no-such-root") + "/").top_folder_visible("Movies/a.mkv")

@@ -2033,6 +2033,37 @@ def test_library_check_error_releases_without_failing_or_stopping(tmp_path, monk
     assert len(client.claims) == 2  # it went back to claiming: not stopped
 
 
+def test_dead_login_during_the_library_check_alerts_as_a_dead_login(tmp_path, monkeypatch):
+    job = dict(JOB, size=10, probe=_probe().__dict__)
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    client = FakeClient(claim=lambda: {"job": job}, heartbeat=lambda: {"cancel": False})
+    pc = fake_pc(tmp_path, client=client, remote=FakeRemote(), heartbeat_secs=0.02,
+                 retry_base_delay=0.0)
+    pc.download_rclone = _LostShare(check_error=RcloneError(
+        1, "couldn't fetch token: invalid_grant: maybe token expired?"))
+    pc.run()
+    assert pc.state == "stopped"
+    assert client.released == [7] and client.reports == []
+    assert len(client.alerts) == 1
+    assert client.alerts[0][1].startswith("Drive login failed for gdrive-cloud:;")
+
+
+def test_library_check_failing_three_times_in_a_row_alerts_and_stops(tmp_path, monkeypatch):
+    """A check that keeps failing would otherwise release and back off forever."""
+    job = dict(JOB, size=10, probe=_probe().__dict__)
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    client = FakeClient(claim=lambda: {"job": job}, heartbeat=lambda: {"cancel": False})
+    pc = fake_pc(tmp_path, client=client, remote=FakeRemote(), heartbeat_secs=0.02,
+                 idle_secs=0.05, retry_base_delay=0.0)
+    pc.download_rclone = _LostShare(check_error=RcloneError(1, "connection reset"))
+    pc.run()
+    assert pc.state == "stopped"
+    assert client.released == [7, 7, 7] and client.reports == []
+    assert len(client.claims) == 3
+    assert len(client.alerts) == 1
+    assert "gdrive-cloud:" in client.alerts[0][1] and "check" in client.alerts[0][1]
+
+
 def test_empty_bwlimit_adds_no_flag():
     from vidshrink.pc_worker import pc_download_rclone, pc_rclone
     for make in (pc_rclone, pc_download_rclone):
