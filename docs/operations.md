@@ -122,6 +122,7 @@ Common reasons:
 |---|---|
 | `Drive login failed for <remote>` | On that machine, run `rclone config reconnect <remote>`, then restart the worker. |
 | `Local fault, worker stopped: …` | Fix the cause (disk space, permissions, a missing ffmpeg), then restart the worker. |
+| `Library folder TV/ is not visible through <remote>` | That machine's download login can no longer see the library, usually because the folder was un-shared from that account. Share Movies and TV with it again (deep folders can take a few minutes to show up), then restart the worker. The job it was on is released without using an attempt. A single missing file in a visible library still fails as before. |
 
 An alert clears on that worker's next successful claim.
 

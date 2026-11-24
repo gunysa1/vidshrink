@@ -815,6 +815,33 @@ def test_drive_login_failure_releases_and_stops(conn, setup, monkeypatch):
     assert calls["n"] == 1  # no pointless retries of a dead login
 
 
+def test_library_out_of_sight_releases_and_stops(conn, setup):
+    """The library folder vanishing from the download login (e.g. no longer
+    shared with it) fails every file the same way: release the job without using
+    an attempt and stop, instead of failing the whole queue one file at a time."""
+    root, pc, store = setup
+    (root / "Movies").rename(root / "Movies-unshared")
+    t = run_in_thread(pc)
+    t.join(30)
+    assert not t.is_alive()
+    assert pc.state == "stopped"
+    row = db.get_by_path(conn, "Movies/a.mkv")
+    assert (row["stage"], row["attempts"]) == ("queued", 0)
+
+
+def test_one_missing_file_still_fails_its_row(conn, setup):
+    """A file gone from a visible library (e.g. replaced by an upgrade) is that
+    file's problem: it fails as before and the worker keeps going."""
+    root, pc, store = setup
+    (root / "Movies" / "a.mkv").unlink()
+    t = run_in_thread(pc)
+    vid = db.get_by_path(conn, "Movies/a.mkv")["id"]
+    assert wait_for(lambda: db.get(conn, vid)["stage"] == "failed")
+    assert pc.state != "stopped"  # it kept going (idle: nothing else queued)
+    pc.stop(now=True)
+    t.join(30)
+
+
 def test_unexpected_exception_in_job_releases_and_continues(conn, setup, monkeypatch):
     root, pc, store = setup
     calls = {"n": 0}
@@ -1946,6 +1973,64 @@ def test_auth_alert_names_the_download_remote(tmp_path, monkeypatch):
     pc.run()
     assert len(client.alerts) == 1
     assert client.alerts[0][1].startswith("Drive login failed for gdrive-cloud:;")
+
+
+class _LostShare(FakeRemote):
+    """A download login that no longer sees the library."""
+
+    def __init__(self, visible=(), check_error=None):
+        super().__init__()
+        self.remote = "gdrive-cloud:"
+        self.visible = set(visible)
+        self.check_error = check_error
+
+    def download(self, path, dest, cancel=None):
+        raise RcloneError(3, "ERROR : error listing: directory not found")
+
+    def top_folder_visible(self, path):
+        if self.check_error:
+            raise self.check_error
+        return path.split("/", 1)[0] in self.visible
+
+
+def test_library_out_of_sight_alerts_with_the_remote_and_folder(tmp_path, monkeypatch):
+    job = dict(JOB, size=10, probe=_probe().__dict__)
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    client = FakeClient(claim=lambda: {"job": job}, heartbeat=lambda: {"cancel": False})
+    pc = fake_pc(tmp_path, client=client, remote=FakeRemote(), heartbeat_secs=0.02,
+                 retry_base_delay=0.0)
+    pc.download_rclone = _LostShare()
+    pc.run()
+    assert pc.state == "stopped"
+    assert client.released == [7] and client.reports == []
+    assert len(client.claims) == 1
+    assert len(client.alerts) == 1
+    message = client.alerts[0][1]
+    assert "gdrive-cloud:" in message and "Movies/" in message and "shared" in message
+
+
+def test_library_check_error_releases_without_failing_or_stopping(tmp_path, monkeypatch):
+    """When the visibility check itself fails, the worker can't tell whose problem
+    it is: release (no attempt), back off, keep running."""
+    job = dict(JOB, size=10, probe=_probe().__dict__)
+    monkeypatch.setattr(shutil, "which", lambda name, **k: "/bin/" + name)
+    pc = None
+
+    def claim():
+        if len(client.claims) > 1:
+            pc.stop(now=True)
+            return {"job": None}
+        return {"job": job}
+
+    client = FakeClient(claim=claim, heartbeat=lambda: {"cancel": False})
+    pc = fake_pc(tmp_path, client=client, remote=FakeRemote(), heartbeat_secs=0.02,
+                 idle_secs=0.05, retry_base_delay=0.0)
+    pc.download_rclone = _LostShare(check_error=RcloneError(1, "connection reset"))
+    pc.run()
+    assert client.released == [7]
+    assert client.reports == []
+    assert client.alerts == []
+    assert len(client.claims) == 2  # it went back to claiming: not stopped
 
 
 def test_empty_bwlimit_adds_no_flag():

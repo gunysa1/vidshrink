@@ -247,3 +247,20 @@ def test_with_retries_does_not_retry_download_quota():
     with pytest.raises(RcloneError):
         with_retries(fn, attempts=5, base_delay=0, sleep=lambda s: None)
     assert len(calls) == 1
+
+
+def test_not_found_flag():
+    assert RcloneError(3, "anything").not_found  # rclone: directory not found
+    assert RcloneError(4, "anything").not_found  # rclone: file not found
+    assert RcloneError(1, "ERROR : error listing: directory not found").not_found
+    assert RcloneError(1, "Failed to copy: object not found").not_found
+    assert not RcloneError(1, "couldn't fetch token: invalid_grant").not_found
+    assert not RcloneError(7, "userRateLimitExceeded").not_found
+
+
+def test_top_folder_visible(rc, tmp_path):
+    assert rc.top_folder_visible("Movies/A [1080p]/a.mkv")
+    assert rc.top_folder_visible("Movies/A [1080p]/nope.mkv")  # only the top folder counts
+    assert not rc.top_folder_visible("TV/Show/s01e01.mkv")
+    # A remote whose root itself is gone sees nothing.
+    assert not Rclone(str(tmp_path / "no-such-root") + "/").top_folder_visible("Movies/a.mkv")

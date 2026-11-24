@@ -829,7 +829,7 @@ class PCWorker:
                 return
             self._write_marker(downloaded, job["size"])
         except Exception as e:
-            self._job_error(lj, e, remote=self.download_rclone.remote)
+            self._job_error(lj, e, remote=self.download_rclone.remote, downloading=True)
             return
         self._report_downloaded(lj)
 
@@ -1144,7 +1144,7 @@ class PCWorker:
     # --- per-job outcomes -------------------------------------------------------
     def _job_error(self, lj: LocalJob, e: Exception, *, tmp: str | None = None,
                    md5: str | None = None, uploading: bool = False,
-                   remote: str = "") -> None:
+                   remote: str = "", downloading: bool = False) -> None:
         """What a stage does with an exception from one job, as the one-job worker
         always did. Raises _LocalFault to stop every stage; re-raises anything
         unanticipated for the poison-job guard."""
@@ -1165,6 +1165,30 @@ class PCWorker:
                     f"for the remote, then Start again): {e}",
                     alert=f"Drive login failed for {remote}; re-authorize that rclone "
                           f"remote, then restart the worker: {e}") from e
+            if downloading and e.not_found:
+                visible = self._library_visible(job["path"])
+                if visible is False:
+                    # The library itself is out of this login's sight (e.g. no
+                    # longer shared with it): every job would fail the same way,
+                    # so release this one (no attempt used) and stop until fixed.
+                    self._abandon(job, None, None)
+                    self._forget(lj)
+                    top = job["path"].split("/", 1)[0]
+                    raise _LocalFault(
+                        f"{top}/ is not visible through {remote} (is the library still "
+                        f"shared with that account?); fix access, then Start again: {e}",
+                        alert=f"Library folder {top}/ is not visible through {remote}; "
+                              f"check it is still shared with that account, then "
+                              f"restart the worker") from e
+                if visible is None:
+                    # Can't tell whether the file or the login is at fault: don't
+                    # burn an attempt; release and back off like a transient blip.
+                    self.log(f"missing file and the library check failed; releasing "
+                             f"and backing off: {job['path']}")
+                    self._abandon(job, None, None)
+                    self._forget(lj)
+                    self._back_off_claims()
+                    return
             if e.throttled and uploading:
                 # Google's per-user rate limit outlasted _retry on the upload or
                 # its md5 check: the encode is finished, so keep it and the lease
@@ -1207,6 +1231,15 @@ class PCWorker:
         else:
             raise e
         self._forget(lj)
+
+    def _library_visible(self, path: str) -> bool | None:
+        """Whether path's top folder is visible through the download login; None
+        when the check itself fails."""
+        try:
+            return self.download_rclone.top_folder_visible(path)
+        except RcloneError as e:
+            self.log(f"library check failed: {e}")
+            return None
 
     def _keep_on_stop(self, lj: LocalJob, tmp: str | None, md5: str | None) -> bool:
         """A stop (not a server cancel) interrupted a job whose download had

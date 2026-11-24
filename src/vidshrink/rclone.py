@@ -29,6 +29,10 @@ AUTH_MARKERS = ("invalid_grant", "couldn't fetch token", "Token has been expired
 UPLOAD_LIMIT_MARKERS = ("uploadLimitExceeded", "Received upload limit error")
 # Google's short-term per-user rate limit: a retry after a backoff clears it.
 THROTTLE_MARKERS = ("userRateLimitExceeded", "User rate limit exceeded", "rateLimitExceeded")
+# rclone's exit codes 3 (directory not found) and 4 (file not found), and their
+# messages: the path isn't there, or this login can't see it.
+NOT_FOUND_CODES = (3, 4)
+NOT_FOUND_MARKERS = ("directory not found", "object not found", "file not found")
 
 
 class TransferCancelled(Exception):
@@ -57,6 +61,10 @@ class RcloneError(Exception):
     @property
     def auth_failed(self) -> bool:
         return any(m in self.stderr for m in AUTH_MARKERS)
+
+    @property
+    def not_found(self) -> bool:
+        return self.code in NOT_FOUND_CODES or any(m in self.stderr for m in NOT_FOUND_MARKERS)
 
 
 class Rclone:
@@ -136,6 +144,19 @@ class Rclone:
                 return []
             raise
         return [e for e in json.loads(out) if e["Name"] == name]
+
+    def top_folder_visible(self, path: str) -> bool:
+        """Whether path's first folder (e.g. "TV") is at this remote's root. False
+        when the library is out of this login's sight, e.g. no longer shared."""
+        top = path.split("/", 1)[0]
+        try:
+            out = self._run("lsjson", "--dirs-only", "--no-mimetype", "--max-depth", "1",
+                            self.remote)
+        except RcloneError as e:
+            if e.not_found:
+                return False
+            raise
+        return any(e["Name"] == top for e in json.loads(out))
 
     def exists(self, path: str) -> bool:
         return bool(self.entries(path))
